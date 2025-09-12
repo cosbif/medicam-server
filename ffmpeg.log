@@ -9,7 +9,7 @@ ffmpeg version 7.1.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the F
   libswscale      8.  3.100 /  8.  3.100
   libswresample   5.  3.100 /  5.  3.100
   libpostproc    58.  3.100 / 58.  3.100
-[dshow @ 000001464f717280] Could not find video device with name [AT025] among source devices of type video.
-[in#0 @ 000001464f716f00] Error opening input: I/O error
+[dshow @ 000001e37ab372c0] Could not run graph (sometimes caused by a device already in use by other application)
+[in#0 @ 000001e37ab36f00] Error opening input: I/O error
 Error opening input file video=AT025.
 Error opening input files: I/O error

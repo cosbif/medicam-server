@@ -10,6 +10,7 @@ import time
 from app import utils
 
 ffmpeg_process = None
+hls_process = None
 
 # Настройки по умолчанию (можно менять через API)
 camera_settings = {
@@ -136,21 +137,6 @@ def generate_frames(resolution="1280x720", fps="30"):
     finally:
         process.kill()
 
-def generate_hls_stream():
-    command = [
-        "ffmpeg",
-        "-f", "v4l2",
-        "-i", "/dev/video0",
-        "-s", "640x480",
-        "-c:v", "libx264",
-        "-f", "hls",
-        "-hls_time", "2",
-        "-hls_list_size", "3",
-        "-hls_flags", "delete_segments",
-        "stream.m3u8"
-    ]
-    subprocess.Popen(command)
-    return "stream.m3u8"
 
 
 def fake_stream():
@@ -173,3 +159,71 @@ def update_settings(resolution: str = None, fps: str = None):
     if fps:
         camera_settings["fps"] = fps
     return camera_settings
+
+#HLS
+
+def start_hls_stream():
+    """Запускает ffmpeg для генерации HLS-потока (480p)"""
+    global hls_process
+
+    stream_dir = os.path.abspath("stream")
+    os.makedirs(stream_dir, exist_ok=True)
+
+    playlist_path = os.path.join(stream_dir, "stream.m3u8")
+    segment_pattern = os.path.join(stream_dir, "stream%03d.ts")
+
+    if hls_process and hls_process.poll() is None:
+        return "/stream/stream.m3u8"  # уже работает
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f", "v4l2" if os.name != "nt" else "dshow",
+        "-i", "/dev/video0" if os.name != "nt" else "video=AT025",
+        "-s", "640x480",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "5",
+        "-hls_flags", "delete_segments+omit_endlist",
+        "-hls_segment_filename", segment_pattern,
+        "-hls_base_url", "/stream/",
+        playlist_path
+    ]
+
+    print("▶ Запускаю ffmpeg для HLS:", " ".join(command))
+    log_file = open("ffmpeg_hls.log", "w")
+    hls_process = subprocess.Popen(command, stdout=log_file, stderr=log_file)
+
+    # Ждём, пока появится плейлист
+    for _ in range(10):  # максимум 10 × 0.5 сек = 5 сек
+        if os.path.exists(playlist_path):
+            break
+        time.sleep(0.5)
+
+    return "/stream/stream.m3u8"
+
+
+
+def stop_hls_stream():
+    """Останавливает ffmpeg и чистит папку со стримом"""
+    global hls_process
+
+    if hls_process and hls_process.poll() is None:
+        print("Останавливаю ffmpeg...")
+        hls_process.kill()
+        hls_process.wait()  # дождаться завершения
+
+    hls_process = None
+
+    # Чистим старые сегменты и плейлист
+    stream_dir = os.path.abspath("stream")
+    if os.path.exists(stream_dir):
+        for file in os.listdir(stream_dir):
+            file_path = os.path.join(stream_dir, file)
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"⚠ Не удалось удалить {file_path}: {e}")

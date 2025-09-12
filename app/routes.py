@@ -7,6 +7,8 @@ from fastapi.responses import StreamingResponse
 import shutil
 import platform
 import subprocess
+from fastapi.staticfiles import StaticFiles
+from fastapi import Request
 
 router = APIRouter()
 
@@ -44,22 +46,15 @@ async def delete_video(filename: str):
     os.remove(filepath)
     return {"status": "deleted", "file": filename}
 
-@router.get("/stream")
-async def stream_video():
-    """Отдаем реальный поток с камеры в 480p для предпросмотра"""
-    return StreamingResponse(
-        camera.generate_frames(resolution="640x480", fps="15"),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
 
 @router.get("/storage")
 async def get_storage_info():
     """Возвращает информацию о SD-карте"""
     total, used, free = shutil.disk_usage(".")
     return {
-        "total_gb": round(total / (1024**3), 2),
-        "used_gb": round(used / (1024**3), 2),
-        "free_gb": round(free / (1024**3), 2)
+        "total": round(total / (1024**3), 2),
+        "used": round(used / (1024**3), 2),
+        "free": round(free / (1024**3), 2)
     }
 
 @router.get("/settings")
@@ -112,3 +107,24 @@ async def connect_wifi(ssid: str, password: str):
 async def disconnect_bluetooth():
     """Заглушка отключения Bluetooth"""
     return {"status": "Bluetooth disconnected"}
+
+@router.get("/hls")
+async def hls_stream():
+    """Запускаем ffmpeg и отдаем путь к HLS плейлисту"""
+    playlist = camera.generate_hls_stream()
+    if not os.path.exists(playlist):
+        raise HTTPException(status_code=500, detail="HLS stream not generated")
+    return {"playlist": f"/{playlist}"}
+
+@router.get("/hls/start")
+async def start_hls(request: Request):
+    """Запускает ffmpeg и возвращает URL плейлиста"""
+    playlist = camera.start_hls_stream()
+    base_url = str(request.base_url).rstrip("/")
+    return {"url": f"{base_url}/stream/stream.m3u8"}
+    
+
+@router.get("/hls/stop")
+async def stop_hls():
+    camera.stop_hls_stream()
+    return {"status": "stopped"}
