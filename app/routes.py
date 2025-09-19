@@ -1,17 +1,16 @@
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
-from app import camera
-from app import utils
+from fastapi import APIRouter, HTTPException, Form
+from fastapi.responses import FileResponse, StreamingResponse, Response
+from app import camera, utils
 import os
-from fastapi.responses import StreamingResponse
 import shutil
 import platform
 import subprocess
-from fastapi.staticfiles import StaticFiles
-from fastapi import Request
 
 router = APIRouter()
 
+# -------------------
+# 📼 Запись
+# -------------------
 @router.post("/start")
 async def start_recording():
     return camera.start_recording()
@@ -19,10 +18,23 @@ async def start_recording():
 @router.post("/stop")
 async def stop_recording():
     return camera.stop_recording()
-
+    
+# -------------------
+# 🎞 Управление видео
+# -------------------
 @router.get("/videos")
 async def list_videos():
-    return {"videos": camera.list_videos()}
+    videos = utils.list_videos()
+    video_info = []
+    for f in videos:
+        path = utils.get_video_path(f)
+        meta = utils.get_video_metadata(path)
+        video_info.append({
+            "filename": f,
+            "size_mb": round(os.path.getsize(path) / (1024*1024), 2),
+            **meta
+        })
+    return {"videos": video_info}
 
 @router.get("/videos/{filename}")
 async def get_video(filename: str):
@@ -46,25 +58,47 @@ async def delete_video(filename: str):
     os.remove(filepath)
     return {"status": "deleted", "file": filename}
 
+@router.delete("/videos/clear")
+async def clear_all_videos():
+    folder = "videos"
+    deleted = []
+    if os.path.exists(folder):
+        for f in os.listdir(folder):
+            path = os.path.join(folder, f)
+            os.remove(path)
+            deleted.append(f)
+    return {"status": "all_deleted", "files": deleted}
 
+# -------------------
+# 💾 Хранилище
+# -------------------
 @router.get("/storage")
 async def get_storage_info():
-    """Возвращает информацию о SD-карте"""
     total, used, free = shutil.disk_usage(".")
+    free_gb = round(free / (1024 ** 3), 2)
     return {
-        "total": round(total / (1024**3), 2),
-        "used": round(used / (1024**3), 2),
-        "free": round(free / (1024**3), 2)
+        "total": round(total / (1024 ** 3), 2),
+        "used": round(used / (1024 ** 3), 2),
+        "free": free_gb,
+        "low_space": free_gb < 1,
     }
 
+# -------------------
+# ⚙️ Настройки камеры
+# -------------------
 @router.get("/settings")
 async def get_settings():
     return camera.get_settings()
 
 @router.post("/settings")
-async def update_settings(resolution: str = None, fps: str = None):
+async def update_settings(
+    resolution: str = Form(None),
+    fps: str = Form(None)):
     return camera.update_settings(resolution, fps)
 
+# -------------------
+# 📡 Wi-Fi
+# -------------------
 @router.get("/wifi")
 async def list_wifi():
     system = platform.system()
@@ -95,36 +129,15 @@ async def list_wifi():
 
     except Exception as e:
         print(f"Ошибка при сканировании Wi-Fi: {e}")
-        return {"networks": []}   # 👈 теперь всегда возвращаем список
+        return {"networks": []}
 
 @router.post("/wifi/connect")
 async def connect_wifi(ssid: str, password: str):
-    """Подключение к Wi-Fi (пока только заглушка, реально будет работать на Raspberry)"""
-    # TODO: здесь можно будет добавить вызов nmcli dev wifi connect
     return {"status": f"Connected to {ssid}"}
 
+# -------------------
+# 🔵 Bluetooth (заглушка)
+# -------------------
 @router.post("/bluetooth/disconnect")
 async def disconnect_bluetooth():
-    """Заглушка отключения Bluetooth"""
     return {"status": "Bluetooth disconnected"}
-
-@router.get("/hls")
-async def hls_stream():
-    """Запускаем ffmpeg и отдаем путь к HLS плейлисту"""
-    playlist = camera.generate_hls_stream()
-    if not os.path.exists(playlist):
-        raise HTTPException(status_code=500, detail="HLS stream not generated")
-    return {"playlist": f"/{playlist}"}
-
-@router.get("/hls/start")
-async def start_hls(request: Request):
-    """Запускает ffmpeg и возвращает URL плейлиста"""
-    playlist = camera.start_hls_stream()
-    base_url = str(request.base_url).rstrip("/")
-    return {"url": f"{base_url}/stream/stream.m3u8"}
-    
-
-@router.get("/hls/stop")
-async def stop_hls():
-    camera.stop_hls_stream()
-    return {"status": "stopped"}
