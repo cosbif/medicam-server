@@ -2,4 +2,4 @@ fastapi
 uvicorn
 python-multipart
 aiofiles
-pybluez
+bleak
