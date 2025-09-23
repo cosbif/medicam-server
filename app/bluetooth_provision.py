@@ -1,157 +1,101 @@
-#!/usr/bin/env python3
-"""
-Bluetooth SPP server for Wi-Fi provisioning.
-
-Protocol (JSON lines):
-- {"cmd":"PING"}
-- {"cmd":"SCAN_WIFI"}
-- {"cmd":"CONNECT_WIFI","ssid":"MySSID","password":"mypw"}
-Responses are JSON objects followed by newline.
-"""
-
+import asyncio
 import json
 import subprocess
-import traceback
-import sys
-import time
-from app import utils
+from pathlib import Path
+from bleak.backends.peripheral import BleakPeripheral
 
-# PyBluez:
-from bluetooth import BluetoothSocket, RFCOMM, PORT_ANY, advertise_service, SERIAL_PORT_CLASS, SERIAL_PORT_PROFILE
+# UUID для сервиса и характеристик (можно сгенерировать через uuidgen)
+SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
+CMD_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
+RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
-SERVICE_NAME = "MedicamProvision"
-UUID = "00001101-0000-1000-8000-00805F9B34FB"  # SPP UUID
+PROVISION_FILE = Path("/home/radxa/medicam-server/provision.json")
 
-def scan_wifi():
-    """Возвращает список сетей через nmcli."""
-    try:
-        # формат: SSID:SIGNAL
-        cmd = ["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi"]
-        out = subprocess.check_output(cmd, text=True, errors="ignore")
-        nets = []
-        seen = set()
-        for line in out.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split(":", 1)
-            ssid = parts[0].strip()
-            signal = parts[1].strip() if len(parts) > 1 else ""
-            if ssid and ssid not in seen:
-                nets.append({"ssid": ssid, "signal": signal})
-                seen.add(ssid)
-        return {"networks": nets}
-    except Exception as e:
-        return {"error": str(e)}
 
-def connect_wifi(ssid: str, password: str, timeout: int = 30):
-    """Пытается подключиться к Wi-Fi через nmcli. Возвращает dict с результатом."""
-    try:
-        # nmcli может потребовать привилегий; обычно работает от пользователя с NetworkManager.
-        if password:
-            cmd = ["nmcli", "dev", "wifi", "connect", ssid, "password", password]
-        else:
-            cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
-        success = proc.returncode == 0
-        out = proc.stdout.strip()
-        err = proc.stderr.strip()
-        result = {
-            "success": success,
-            "stdout": out,
-            "stderr": err
-        }
-        if success:
-            # пометим provisioned и запишем basic info
-            # читаем local IP (если есть)
-            try:
-                ip = subprocess.check_output(["hostname", "-I"], text=True).strip().split()[0]
-            except Exception:
-                ip = ""
-            utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-        return result
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+class ProvisionPeripheral(BleakPeripheral):
+    def __init__(self):
+        super().__init__(SERVICE_UUID, "MedicamProvision")
 
-def handle_client(client_sock):
-    try:
-        # читаем до первой новой строки
-        data = b""
-        client_sock.settimeout(60)
-        while True:
-            chunk = client_sock.recv(1024)
-            if not chunk:
-                break
-            data += chunk
-            if b"\n" in chunk:
-                break
-        if not data:
-            return
-        msg = data.decode("utf-8", errors="ignore").strip()
-        # ожидаем JSON
+        self.command_char = self.add_characteristic(CMD_CHAR_UUID, ["write"])
+        self.response_char = self.add_characteristic(RESP_CHAR_UUID, ["read", "notify"])
+
+        self.command_char.set_write_callback(self.on_command)
+
+    async def on_command(self, value: bytearray):
         try:
-            payload = json.loads(msg)
-        except Exception:
-            # если не json, отправим ошибку
-            resp = {"error": "invalid_json", "received": msg}
-            client_sock.send((json.dumps(resp) + "\n").encode("utf-8"))
-            return
+            data = json.loads(value.decode())
+            print(f"Got command: {data}")
+            cmd = data.get("cmd")
 
-        cmd = payload.get("cmd", "").upper()
-        if cmd == "PING":
-            client_sock.send((json.dumps({"status": "OK"}) + "\n").encode("utf-8"))
-        elif cmd == "SCAN_WIFI":
-            resp = scan_wifi()
-            client_sock.send((json.dumps(resp) + "\n").encode("utf-8"))
-        elif cmd == "CONNECT_WIFI":
-            ssid = payload.get("ssid", "")
-            password = payload.get("password", "")
-            if not ssid:
-                client_sock.send((json.dumps({"success": False, "error": "missing_ssid"}) + "\n").encode("utf-8"))
+            if cmd == "PING":
+                response = {"status": "OK"}
+
+            elif cmd == "SCAN_WIFI":
+                response = {"networks": self.scan_wifi()}
+
+            elif cmd == "CONNECT_WIFI":
+                ssid = data.get("ssid")
+                password = data.get("password")
+                success = self.connect_wifi(ssid, password)
+                if success:
+                    self.write_provisioned()
+                    response = {"status": "connected"}
+                else:
+                    response = {"status": "failed"}
+
             else:
-                resp = connect_wifi(ssid, password)
-                client_sock.send((json.dumps(resp) + "\n").encode("utf-8"))
-        elif cmd == "STATUS":
-            client_sock.send((json.dumps({"provisioned": utils.is_provisioned(), "info": utils.get_provision_info()}) + "\n").encode("utf-8"))
-        else:
-            client_sock.send((json.dumps({"error": "unknown_cmd", "cmd": cmd}) + "\n").encode("utf-8"))
-    except Exception:
-        tb = traceback.format_exc()
-        try:
-            client_sock.send((json.dumps({"error": "exception", "trace": tb}) + "\n").encode("utf-8"))
-        except Exception:
-            pass
-    finally:
-        try:
-            client_sock.close()
-        except Exception:
-            pass
+                response = {"error": "unknown_command"}
 
-def run_server():
-    server_sock = BluetoothSocket(RFCOMM)
-    server_sock.bind(("", PORT_ANY))
-    server_sock.listen(1)
-    port = server_sock.getsockname()[1]
-    advertise_service(server_sock, SERVICE_NAME,
-                      service_id=UUID,
-                      service_classes=[UUID, SERIAL_PORT_CLASS],
-                      profiles=[SERIAL_PORT_PROFILE])
-    print(f"Bluetooth provisioning server started on RFCOMM port {port}")
-    try:
-        while True:
-            try:
-                client_sock, client_info = server_sock.accept()
-                print(f"Accepted connection from {client_info}")
-                handle_client(client_sock)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"Error accepting/handling client: {e}")
-                time.sleep(1)
-    finally:
+        except Exception as e:
+            response = {"error": str(e)}
+
+        resp_json = json.dumps(response).encode()
+        await self.response_char.write_value(resp_json, True)  # notify
+
+    def scan_wifi(self):
         try:
-            server_sock.close()
-        except Exception:
-            pass
+            result = subprocess.run(
+                ["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi"],
+                capture_output=True, text=True, check=True
+            )
+            networks = []
+            for line in result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    networks.append({"ssid": parts[0], "signal": int(parts[1])})
+            return networks
+        except Exception as e:
+            print(f"scan_wifi error: {e}")
+            return []
+
+    def connect_wifi(self, ssid, password):
+        try:
+            subprocess.run(
+                ["nmcli", "dev", "wifi", "connect", ssid, "password", password],
+                check=True
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"connect_wifi error: {e}")
+            return False
+
+    def write_provisioned(self):
+        try:
+            data = {"provisioned": True}
+            PROVISION_FILE.write_text(json.dumps(data))
+            print("Provisioning complete: provision.json updated")
+        except Exception as e:
+            print(f"write_provisioned error: {e}")
+
+
+async def main():
+    peripheral = ProvisionPeripheral()
+    await peripheral.start()
+    print("Provisioning BLE service started")
+    await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
-    run_server()
+    asyncio.run(main())
