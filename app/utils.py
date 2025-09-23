@@ -1,6 +1,9 @@
 import os
 import subprocess
 from datetime import datetime
+import json
+
+PROVISION_FILE = "provision.json"
 
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
@@ -40,3 +43,50 @@ def get_video_metadata(filepath: str):
         }
     except Exception as e:
         return {"error": str(e)}
+    
+def _provision_path():
+    # файл хранится рядом с папкой app (текущая рабочая директория — app)
+    return os.path.join(os.getcwd(), PROVISION_FILE)
+
+def is_provisioned() -> bool:
+    """Возвращает True если устройство provisioned (подключено к Wi-Fi и помечено)."""
+    path = _provision_path()
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "r") as f:
+            data = json.load(f)
+        return bool(data.get("provisioned", False))
+    except Exception:
+        return False
+
+def set_provisioned(value: bool, info: dict | None = None):
+    """Записывает статус provisioned и доп.инфо (ssid, ip, timestamp)."""
+    path = _provision_path()
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["provisioned"] = bool(value)
+    if info:
+        data.setdefault("info", {}).update(info)
+    # добавим timestamp
+    from datetime import datetime
+    data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+def get_provision_info() -> dict:
+    """Возвращает словарь с инфо (ssid, ip и т.п.) или пустой словарь."""
+    path = _provision_path()
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data.get("info", {}) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
