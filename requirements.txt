@@ -3,3 +3,4 @@ uvicorn
 python-multipart
 aiofiles
 bleak
+2016b22bb20d886e2ebd134d9a33a4063a32ffd8
