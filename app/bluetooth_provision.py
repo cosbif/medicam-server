@@ -15,7 +15,7 @@ class ProvisionService:
         self.response_value = b'{}'
 
         # создаём периферию
-        self.periph = peripheral.Peripheral(local_name="MedicamProvision")
+        self.periph = peripheral.Peripheral(adapter_address=None, local_name="MedicamProvision")
 
         # добавляем сервис
         self.periph.add_service(SERVICE_UUID)
