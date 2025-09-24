@@ -20,7 +20,7 @@ class ProvisionService:
         self.periph = peripheral.Peripheral(adapter_address=adapter_addr, local_name="MedicamProvision")
 
         # добавляем сервис
-        self.periph.add_service(SERVICE_UUID)
+        self.periph.add_service(SERVICE_UUID, primary=True)
 
         # характеристика для команд (write)
         self.periph.add_characteristic(
