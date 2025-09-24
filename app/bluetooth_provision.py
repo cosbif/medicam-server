@@ -1,7 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
-from bluezero import peripheral
+from bluezero import adapter, peripheral
 
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 CMD_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
@@ -14,8 +14,10 @@ class ProvisionService:
     def __init__(self):
         self.response_value = b'{}'
 
+
         # создаём периферию
-        self.periph = peripheral.Peripheral(adapter_address=None, local_name="MedicamProvision")
+        adapter_addr = list(adapter.Adapter.available())[0].address
+        self.periph = peripheral.Peripheral(adapter_address=adapter_addr, local_name="MedicamProvision")
 
         # добавляем сервис
         self.periph.add_service(SERVICE_UUID)
