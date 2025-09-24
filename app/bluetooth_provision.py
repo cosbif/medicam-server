@@ -12,31 +12,32 @@ PROVISION_FILE = Path("/home/radxa/medicam-server/provision.json")
 
 class ProvisionService:
     def __init__(self):
-        self.response_value = []
-
-        # Создаём BLE-сервис
-        self.service = peripheral.Service(SERVICE_UUID)
+        self.response_value = b'{}'
 
         # Характеристика для команд
         self.cmd_char = peripheral.Characteristic(
-            self.service,
-            CMD_CHAR_UUID,
-            ['write'],
+            uuid=CMD_CHAR_UUID,
+            flags=['write'],
             write_callback=self.on_command
         )
 
         # Характеристика для ответа
         self.resp_char = peripheral.Characteristic(
-            self.service,
-            RESP_CHAR_UUID,
-            ['read', 'notify'],
+            uuid=RESP_CHAR_UUID,
+            flags=['read', 'notify'],
             read_callback=self.on_read_response
         )
 
-        # BLE-периферия
+        # BLE-периферия (сервис с двумя характеристиками)
         self.peripheral = peripheral.Peripheral(
-            [self.service],
-            local_name="MedicamProvision"
+            adapter_addr=None,  # автоматически выбрать Bluetooth-адаптер
+            local_name="MedicamProvision",
+            services=[
+                {
+                    'uuid': SERVICE_UUID,
+                    'characteristics': [self.cmd_char, self.resp_char]
+                }
+            ]
         )
 
     # Колбэк на чтение ответа
@@ -73,8 +74,8 @@ class ProvisionService:
             response = {"error": str(e)}
 
         resp_json = json.dumps(response).encode()
-        self.response_value = list(resp_json)
-        self.resp_char.send_notify(self.response_value)
+        self.response_value = resp_json
+        self.resp_char.send_notify(resp_json)
 
     def scan_wifi(self):
         try:
