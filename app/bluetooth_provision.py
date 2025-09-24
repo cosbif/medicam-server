@@ -1,10 +1,8 @@
-import asyncio
 import json
 import subprocess
 from pathlib import Path
-from bleak.backends.peripheral import BleakPeripheral
+from bluezero import peripheral
 
-# UUID для сервиса и характеристик (можно сгенерировать через uuidgen)
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 CMD_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
 RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
@@ -12,18 +10,43 @@ RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
 PROVISION_FILE = Path("/home/radxa/medicam-server/provision.json")
 
 
-class ProvisionPeripheral(BleakPeripheral):
+class ProvisionService:
     def __init__(self):
-        super().__init__(SERVICE_UUID, "MedicamProvision")
+        self.response_value = []
 
-        self.command_char = self.add_characteristic(CMD_CHAR_UUID, ["write"])
-        self.response_char = self.add_characteristic(RESP_CHAR_UUID, ["read", "notify"])
+        # Создаём BLE-сервис
+        self.service = peripheral.Service(SERVICE_UUID)
 
-        self.command_char.set_write_callback(self.on_command)
+        # Характеристика для команд
+        self.cmd_char = peripheral.Characteristic(
+            self.service,
+            CMD_CHAR_UUID,
+            ['write'],
+            write_callback=self.on_command
+        )
 
-    async def on_command(self, value: bytearray):
+        # Характеристика для ответа
+        self.resp_char = peripheral.Characteristic(
+            self.service,
+            RESP_CHAR_UUID,
+            ['read', 'notify'],
+            read_callback=self.on_read_response
+        )
+
+        # BLE-периферия
+        self.peripheral = peripheral.Peripheral(
+            [self.service],
+            local_name="MedicamProvision"
+        )
+
+    # Колбэк на чтение ответа
+    def on_read_response(self):
+        return self.response_value
+
+    # Колбэк на команду
+    def on_command(self, value, options):
         try:
-            data = json.loads(value.decode())
+            data = json.loads(bytearray(value).decode())
             print(f"Got command: {data}")
             cmd = data.get("cmd")
 
@@ -50,7 +73,8 @@ class ProvisionPeripheral(BleakPeripheral):
             response = {"error": str(e)}
 
         resp_json = json.dumps(response).encode()
-        await self.response_char.write_value(resp_json, True)  # notify
+        self.response_value = list(resp_json)
+        self.resp_char.send_notify(self.response_value)
 
     def scan_wifi(self):
         try:
@@ -89,13 +113,10 @@ class ProvisionPeripheral(BleakPeripheral):
         except Exception as e:
             print(f"write_provisioned error: {e}")
 
-
-async def main():
-    peripheral = ProvisionPeripheral()
-    await peripheral.start()
-    print("Provisioning BLE service started")
-    await asyncio.Event().wait()
+    def run(self):
+        print("Starting BLE Provisioning Service...")
+        self.peripheral.publish()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    ProvisionService().run()
