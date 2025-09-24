@@ -15,7 +15,7 @@ class ProvisionService:
         self.response_value = b'{}'
 
         # создаём периферию
-        self.periph = peripheral.Peripheral(adapter_addr=None, local_name="MedicamProvision")
+        self.periph = peripheral.Peripheral(local_name="MedicamProvision")
 
         # добавляем сервис
         self.periph.add_service(SERVICE_UUID)
@@ -29,7 +29,7 @@ class ProvisionService:
         )
 
         # характеристика для ответа (read+notify)
-        self.periph.add_characteristic(
+        self.resp_char = self.periph.add_characteristic(
             service_uuid=SERVICE_UUID,
             uuid=RESP_CHAR_UUID,
             flags=['read', 'notify'],
