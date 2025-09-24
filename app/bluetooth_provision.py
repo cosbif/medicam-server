@@ -14,30 +14,26 @@ class ProvisionService:
     def __init__(self):
         self.response_value = b'{}'
 
-        # Характеристика для команд
-        self.cmd_char = peripheral.Characteristic(
+        # создаём периферию
+        self.periph = peripheral.Peripheral(adapter_addr=None, local_name="MedicamProvision")
+
+        # добавляем сервис
+        self.periph.add_service(SERVICE_UUID)
+
+        # характеристика для команд (write)
+        self.periph.add_characteristic(
+            service_uuid=SERVICE_UUID,
             uuid=CMD_CHAR_UUID,
             flags=['write'],
             write_callback=self.on_command
         )
 
-        # Характеристика для ответа
-        self.resp_char = peripheral.Characteristic(
+        # характеристика для ответа (read+notify)
+        self.periph.add_characteristic(
+            service_uuid=SERVICE_UUID,
             uuid=RESP_CHAR_UUID,
             flags=['read', 'notify'],
             read_callback=self.on_read_response
-        )
-
-        # BLE-периферия (сервис с двумя характеристиками)
-        self.peripheral = peripheral.Peripheral(
-            adapter_addr=None,  # автоматически выбрать Bluetooth-адаптер
-            local_name="MedicamProvision",
-            services=[
-                {
-                    'uuid': SERVICE_UUID,
-                    'characteristics': [self.cmd_char, self.resp_char]
-                }
-            ]
         )
 
     # Колбэк на чтение ответа
