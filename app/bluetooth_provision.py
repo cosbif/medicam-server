@@ -68,7 +68,7 @@ class ProvisionService:
             try:
                 print(f"Trying adapter: {a}")
                 # Попробуем создать peripheral с очередным кандидатом
-                self.periph = peripheral.Peripheral(adapter_address=a, local_name="MedicamProvision")
+                self.periph = peripheral.Peripheral(adapter_address=a, local_name="MedicamProvision", object_path="/ukBaz/medicam")
                 print(f"Peripheral created with adapter: {a}")
                 break
             except Exception as e:
