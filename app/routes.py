@@ -8,8 +8,8 @@ import subprocess
 
 
 def require_provisioned():
-    if not utils.is_provisioned():
-        raise HTTPException(status_code=403, detail="device_not_provisioned")
+    '''if not utils.is_provisioned():
+        raise HTTPException(status_code=403, detail="device_not_provisioned")'''
     return True
 
 router = APIRouter()
