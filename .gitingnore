@@ -4,3 +4,4 @@ medicam-venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
+app/__pycache__/
