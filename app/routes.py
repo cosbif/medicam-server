@@ -1,5 +1,5 @@
-from fastapi import APIRouter, HTTPException, Form, Depends
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Form, Depends, Request
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from app import camera, utils
 import os
 import shutil
@@ -43,11 +43,45 @@ async def list_videos(_ok: bool = Depends(require_provisioned)):
     return {"videos": video_info}
 
 @router.get("/videos/{filename}")
-async def get_video(filename: str, _ok: bool = Depends(require_provisioned)):
+async def get_video(filename: str, request: Request, _ok: bool = Depends(require_provisioned)):
     filepath = utils.get_video_path(filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
-    return StreamingResponse(utils.iterfile(filepath), media_type="video/mp4")
+
+    file_size = os.path.getsize(filepath)
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Пример: Range: bytes=0-1023
+        range_value = range_header.strip().lower().replace("bytes=", "")
+        start, end = range_value.split("-") if "-" in range_value else (0, "")
+        start = int(start) if start else 0
+        end = int(end) if end else file_size - 1
+        end = min(end, file_size - 1)
+
+        with open(filepath, "rb") as f:
+            f.seek(start)
+            data = f.read(end - start + 1)
+
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(end - start + 1),
+            "Content-Type": "video/mp4",
+        }
+        return Response(content=data, status_code=206, headers=headers)
+
+    # Без Range-запроса (например Android)
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(file_size),
+        "Content-Type": "video/mp4",
+    }
+    return Response(content=data, headers=headers)
+
 
 @router.get("/download/{filename}")
 async def download_video(filename: str, _ok: bool = Depends(require_provisioned)):
