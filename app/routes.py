@@ -162,6 +162,22 @@ async def connect_wifi(ssid: str = Form(...), password: str = Form(None)):
             return {"status": "error", "stdout": stdout, "stderr": stderr}
     except Exception as e:
         return {"status": "error", "details": str(e)}
+    
+@router.get("/wifi/status")
+async def wifi_status():
+    try:
+        state = subprocess.check_output(["nmcli", "-t", "-f", "STATE", "g"], text=True).strip()
+        connected = "connected" in state.lower()
+        ssid = ""
+        if connected:
+            ssid = subprocess.check_output(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], text=True)
+            for line in ssid.splitlines():
+                if line.startswith("yes:"):
+                    ssid = line.split(":", 1)[1]
+                    break
+        return {"connected": connected, "ssid": ssid}
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
 
 # -------------------
 # 🔵 Bluetooth (заглушка)
