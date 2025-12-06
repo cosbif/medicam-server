@@ -13,7 +13,6 @@ if str(project_root) not in sys.path:
 
 from app import utils
 
-# Попробуем импортировать bluezero; если его нет — скрипт всё равно аккуратно упадёт
 try:
     from bluezero import peripheral
 except Exception as e:
@@ -26,112 +25,126 @@ RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
 PROVISION_FILE = utils._provision_path()
 
-# ========================
-# === TEST MODE FLAG =====
-# ========================
-TEST_MODE = True  # Временно игнорируем Wi-Fi для тестирования BLE
+TEST_MODE = True  # временный флаг для отладки BLE
+
+
+# ===============================
+# === FIX: корректные MAC-адрес ==
+# ===============================
+def get_adapter_mac():
+    """
+    Возвращает MAC адрес адаптера hci0.
+    Bluezero требует MAC, а не имя интерфейса!
+    """
+    try:
+        # Самый надёжный способ (есть всегда)
+        addr_path = Path("/sys/class/bluetooth/hci0/address")
+        if addr_path.exists():
+            mac = addr_path.read_text().strip()
+            if mac:
+                return mac
+    except Exception:
+        pass
+
+    # Fallback через hciconfig
+    try:
+        out = subprocess.check_output(["hciconfig"], text=True)
+        for line in out.splitlines():
+            if "BD Address" in line:
+                parts = line.split()
+                for p in parts:
+                    if ":" in p and len(p.split(":")) == 6:
+                        return p
+    except Exception:
+        pass
+
+    return None  # важно вернуть None, если не нашли
+
 
 def is_wifi_connected() -> bool:
-    """Проверяем, есть ли активное подключение к Wi-Fi."""
     if TEST_MODE:
-        return False  # Игнорируем Wi-Fi, чтобы BLE запускался
+        return False
     try:
-        status = subprocess.check_output(["nmcli", "-t", "-f", "STATE", "g"], text=True).strip()
+        status = subprocess.check_output(
+            ["nmcli", "-t", "-f", "STATE", "g"],
+            text=True
+        ).strip()
         return "connected" in status.lower()
     except Exception as e:
         print(f"[WARN] Wi-Fi check failed: {e}")
         return False
 
-def get_adapter_name_or_mac():
-    """Пытаемся определить рабочий адаптер. Возвращаем MAC (если удалось) или 'hci0'."""
-    # Попробуем получить MAC через hciconfig
-    try:
-        out = subprocess.check_output(["hciconfig"], text=True)
-        # пример строки: "hci0:   Type: Primary  Bus: USB"
-        # затем строка "BD Address: XX:XX:XX:XX:XX:XX"
-        lines = out.splitlines()
-        mac = None
-        for i, ln in enumerate(lines):
-            if ln.startswith("hci"):
-                # ищем BD Address в последующих строках
-                for j in range(i, min(i+4, len(lines))):
-                    if "BD Address" in lines[j]:
-                        parts = lines[j].split()
-                        for p in parts:
-                            if ":" in p and len(p.split(":")) == 6:
-                                mac = p.strip()
-                                return mac
-        # fallback
-        return "hci0"
-    except Exception:
-        return "hci0"
 
 class ProvisionService:
     def __init__(self):
         if peripheral is None:
             raise RuntimeError("bluezero.peripheral is not available")
 
-        # === Создаём Peripheral корректно ===
-        # Только так, никаких adapter_name/addr
+        # ===========================
+        # === FIX: получаем MAC ====
+        # ===========================
+        mac = get_adapter_mac()
+        if not mac:
+            raise RuntimeError(
+                "Bluetooth adapter MAC not found. BLE cannot start.\n"
+                "Check: hciconfig / bluetoothctl / system logs"
+            )
+
+        print(f"[BLE] Using adapter MAC: {mac}")
+
+        # ===========================
+        # === FIX: создаём Peripheral
+        # ===========================
         self.periph = peripheral.Peripheral(
-            adapter_address="hci0",
+            adapter_address=mac,
             local_name="MedicamProvision"
         )
-        print("[BLE] Peripheral created using adapter 'hci0'")
 
-        # === Добавляем сервис (требуется numeric srv_id) ===
+        print("[BLE] Peripheral created via bluezero")
+
+        # === Сервис ===
         SRV_ID = 1
-        self.periph.add_service(
-            SRV_ID,
-            SERVICE_UUID,
-            True  # primary
-        )
+        self.periph.add_service(SRV_ID, SERVICE_UUID, True)
 
-        # === Добавляем командную характеристику (write) ===
-        CMD_CHR_ID = 1
+        # === Write команда ===
         self.periph.add_characteristic(
             srv_id=SRV_ID,
-            chr_id=CMD_CHR_ID,
+            chr_id=1,
             uuid=CMD_CHAR_UUID,
-            value=[],                 # начальное значение
-            notifying=False,          # для write notify=False
-            flags=["write"],          # строго "write"
+            value=[],
+            notifying=False,
+            flags=["write"],
             read_callback=None,
             write_callback=self.on_command
         )
 
-        # === Добавляем характеристику ответа (read + notify) ===
-        RESP_CHR_ID = 2
+        # === Ответная характеристика ===
         self.periph.add_characteristic(
             srv_id=SRV_ID,
-            chr_id=RESP_CHR_ID,
+            chr_id=2,
             uuid=RESP_CHAR_UUID,
-            value=[],                 # начальное значение
+            value=[],
             notifying=False,
             flags=["read", "notify"],
-            read_callback=lambda: list(self.response_value),
+            read_callback=self.on_read_response,
             write_callback=None,
             notify_callback=None
         )
 
-        # сохраняем ID для дальнейшей отправки уведомлений
         self.srv_id = SRV_ID
-        self.resp_chr_id = RESP_CHR_ID
-
+        self.resp_chr_id = 2
         self.response_value = b'{}'
 
 
+    # === BLE methods ===
     def on_read_response(self):
-        return self.response_value
+        return list(self.response_value)
 
     def _send_response(self, response_dict):
         self.response_value = json.dumps(response_dict).encode()
-    
-        # На выход должен уходить список int, не bytes
         value_list = list(self.response_value)
-    
+
         try:
-            # Ищем характеристику ответа
             for ch in self.periph.characteristics:
                 if ch.uuid == RESP_CHAR_UUID:
                     ch.set_value(value_list)
@@ -152,23 +165,15 @@ class ProvisionService:
                 response = {"status": "OK"}
 
             elif cmd == "SCAN_WIFI":
-                nets = self.scan_wifi()
-                response = {"networks": nets}
+                response = {"networks": self.scan_wifi()}
 
             elif cmd == "CONNECT_WIFI":
                 ssid = data.get("ssid")
                 password = data.get("password")
-                success = self.connect_wifi(ssid, password)
-                if success:
-                    # после подключения получим ip
-                    ip = ""
-                    try:
-                        ip_out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
-                        import re
-                        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
-                        ip = m.group(1) if m else ""
-                    except Exception:
-                        ip = ""
+                ok = self.connect_wifi(ssid, password)
+
+                if ok:
+                    ip = utils.get_ip_address()
                     utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
                     response = {"status": "connected", "ip": ip}
                 else:
@@ -182,30 +187,27 @@ class ProvisionService:
 
         self._send_response(response)
 
+
+    # === Wi-Fi ===
     def scan_wifi(self):
-        """Возвращаем только сильные сигналы (>50)."""
         try:
             result = subprocess.run(
                 ["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi"],
-                capture_output=True, text=True, check=True
+                capture_output=True,
+                text=True,
+                check=True
             )
             seen = set()
             networks = []
-            for line in result.stdout.strip().splitlines():
+            for line in result.stdout.splitlines():
                 if not line:
                     continue
-                parts = line.split(":", 1)
-                if len(parts) != 2:
-                    continue
-                ssid, signal_str = parts
+                ssid, signal_str = line.split(":", 1)
                 ssid = ssid.strip()
                 if not ssid or ssid in seen:
                     continue
                 seen.add(ssid)
-                try:
-                    signal = int(signal_str)
-                except ValueError:
-                    signal = 0
+                signal = int(signal_str) if signal_str.isdigit() else 0
                 if signal >= 50:
                     networks.append({"ssid": ssid, "signal": signal})
             return sorted(networks, key=lambda x: -x["signal"])
@@ -216,19 +218,21 @@ class ProvisionService:
     def connect_wifi(self, ssid, password):
         try:
             if password:
-                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid, "password", password], check=True, timeout=60)
+                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid,
+                                "password", password], check=True, timeout=60)
             else:
-                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid], check=True, timeout=60)
+                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid],
+                               check=True, timeout=60)
             return True
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             print(f"[ERR] connect_wifi: {e}")
             return False
-        except Exception as e:
-            print(f"[ERR] connect_wifi unexpected: {e}")
-            return False
 
+
+    # === Main Loop ===
     def run(self):
         print("[BLE] Starting provisioning service...")
+
         try:
             self.periph.publish()
         except Exception as e:
@@ -237,9 +241,8 @@ class ProvisionService:
 
         try:
             while True:
-                # если Wi-Fi стал подключён — прекращаем провижн
                 if is_wifi_connected():
-                    print("[BLE] Detected Wi-Fi connected -> stopping BLE provisioning")
+                    print("[BLE] Wi-Fi connected -> stopping BLE")
                     break
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -252,15 +255,12 @@ class ProvisionService:
             print("[BLE] Stopping service...")
             self.periph.unpublish()
         except Exception as e:
-            print(f"[WARN] BLE stop failed: {e}")
+            print("[WARN] BLE stop failed:", e)
 
 
 if __name__ == "__main__":
-    if not TEST_MODE and is_wifi_connected():
-        print("[BLE] Wi-Fi connected — BLE provisioning disabled.")
-    else:
-        print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
-        try:
-            ProvisionService().run()
-        except Exception as e:
-            print(f"[FATAL] BLE provisioning failed to start: {e}")
+    print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
+    try:
+        ProvisionService().run()
+    except Exception as e:
+        print(f"[FATAL] BLE provisioning failed to start: {e}")
