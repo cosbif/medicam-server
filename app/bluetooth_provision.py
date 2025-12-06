@@ -233,12 +233,24 @@ class ProvisionService:
             print("[WARN] notify failed (fallback):", e)
 
     def on_command(self, value, options):
+        self._cmd_buffer = bytearray()
         try:
-            # value может быть list[int] или bytes
+            # value может приходить кусками — добавляем в буфер
             if isinstance(value, (bytes, bytearray)):
-                raw = bytes(value)
+                self._cmd_buffer.extend(value)
             else:
-                raw = bytes(bytearray(value))
+                self._cmd_buffer.extend(bytearray(value))
+
+            # JSON по BLE приходит как текст UTF-8.
+            # Проверим, закончился ли JSON (последняя } )
+            if self._cmd_buffer and self._cmd_buffer[-1] != ord('}'):
+                # не полный JSON — ждем
+                return
+
+            # получили полный JSON
+            raw = bytes(self._cmd_buffer)
+            self._cmd_buffer.clear()
+
             data = json.loads(raw.decode())
             cmd = data.get("cmd")
             print("[BLE] Command:", cmd)
@@ -247,7 +259,6 @@ class ProvisionService:
                 response = {"status": "OK"}
 
             elif cmd == "SCAN_WIFI":
-                # получаем список сетей, но ограничиваем размер результата для BLE
                 nets = self.scan_wifi()
                 response = {"networks": nets}
 
@@ -255,18 +266,7 @@ class ProvisionService:
                 ssid = data.get("ssid")
                 password = data.get("password")
                 ok = self.connect_wifi(ssid, password)
-
-                if ok:
-                    # безопасный способ получить ip
-                    ip = ""
-                    try:
-                        ip = self._get_first_ipv4()
-                    except Exception:
-                        ip = ""
-                    utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-                    response = {"status": "connected", "ip": ip}
-                else:
-                    response = {"status": "failed"}
+                response = {"status": "connected"} if ok else {"status": "failed"}
 
             else:
                 response = {"error": "unknown_command"}
