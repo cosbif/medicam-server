@@ -1,11 +1,10 @@
 from fastapi import APIRouter, HTTPException, Form, Depends, Request
-from fastapi.responses import FileResponse, StreamingResponse, Response
+from fastapi.responses import FileResponse, Response
 from app import camera, utils
 import os
 import shutil
 import platform
 import subprocess
-
 
 def require_provisioned():
     '''if not utils.is_provisioned():
@@ -133,8 +132,8 @@ async def get_settings(_ok: bool = Depends(require_provisioned)):
 @router.post("/settings")
 async def update_settings(
     resolution: str = Form(None),
-    fps: str = Form(None),):
-    _ok: bool = Depends(require_provisioned)
+    fps: str = Form(None),
+    _ok: bool = Depends(require_provisioned)):
     return camera.update_settings(resolution, fps)
 
 # -------------------
@@ -185,9 +184,12 @@ async def connect_wifi(ssid: str = Form(...), password: str = Form(None)):
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
         if success:
-            # определим ip (если есть)
+            # определим ip (если есть) — сначала ищем первый глобальный IPv4
             try:
-                ip = subprocess.check_output(["hostname", "-I"], text=True).strip().split()[0]
+                ip_out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
+                import re
+                m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+                ip = m.group(1) if m else ""
             except Exception:
                 ip = ""
             utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
@@ -204,8 +206,8 @@ async def wifi_status():
         connected = "connected" in state.lower()
         ssid = ""
         if connected:
-            ssid = subprocess.check_output(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], text=True)
-            for line in ssid.splitlines():
+            ssid_lines = subprocess.check_output(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], text=True)
+            for line in ssid_lines.splitlines():
                 if line.startswith("yes:"):
                     ssid = line.split(":", 1)[1]
                     break

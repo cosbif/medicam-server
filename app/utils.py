@@ -2,8 +2,9 @@ import os
 import subprocess
 from datetime import datetime
 import json
+from pathlib import Path
 
-PROVISION_FILE = "provision.json"
+PROVISION_FILENAME = "provision.json"
 
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
@@ -25,34 +26,48 @@ def list_videos():
 
 def get_video_metadata(filepath: str):
     try:
+        # получаем JSON-вывод ffprobe для устойчивого парсинга
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,r_frame_rate",
             "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-of", "json",
             filepath
         ]
-        result = subprocess.check_output(cmd, text=True).splitlines()
-        width, height, fps_raw, duration = result
-        fps = eval(fps_raw) if "/" in fps_raw else float(fps_raw)
+        import json as _json
+        result = subprocess.check_output(cmd, text=True)
+        data = _json.loads(result)
+
+        stream = data.get("streams", [{}])[0]
+        fmt = data.get("format", {})
+
+        width = stream.get("width")
+        height = stream.get("height")
+        r_frame_rate = stream.get("r_frame_rate", "0/1")
+        nums = r_frame_rate.split("/")
+        fps = float(nums[0]) / float(nums[1]) if len(nums) == 2 and float(nums[1]) != 0 else 0.0
+
+        duration = float(fmt.get("duration", 0.0))
+
         return {
-            "resolution": f"{width}x{height}",
+            "resolution": f"{width}x{height}" if width and height else "",
             "fps": round(fps, 2),
-            "duration": round(float(duration), 2)
+            "duration": round(duration, 2)
         }
     except Exception as e:
         return {"error": str(e)}
     
 def _provision_path():
-    # файл хранится рядом с папкой app (текущая рабочая директория — app)
-    return os.path.join(os.getcwd(), PROVISION_FILE)
+    # файл хранится в корне проекта (один уровень выше app/)
+    project_root = Path(__file__).resolve().parents[1]
+    return project_root / PROVISION_FILENAME
 
 def is_provisioned() -> bool:
     """Возвращает True если устройство provisioned (подключено к Wi-Fi и помечено)."""
     path = _provision_path()
     try:
-        if not os.path.exists(path):
+        if not path.exists():
             return False
         with open(path, "r") as f:
             data = json.load(f)
@@ -64,7 +79,7 @@ def set_provisioned(value: bool, info: dict | None = None):
     """Записывает статус provisioned и доп.инфо (ssid, ip, timestamp)."""
     path = _provision_path()
     data = {}
-    if os.path.exists(path):
+    if path.exists():
         try:
             with open(path, "r") as f:
                 data = json.load(f)
@@ -83,7 +98,7 @@ def get_provision_info() -> dict:
     """Возвращает словарь с инфо (ssid, ip и т.п.) или пустой словарь."""
     path = _provision_path()
     try:
-        if not os.path.exists(path):
+        if not path.exists():
             return {}
         with open(path, "r") as f:
             data = json.load(f)

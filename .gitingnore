@@ -1,7 +1,0 @@
-medicam-venv/
-
-# Python cache
-__pycache__/
-**/__pycache__/
-*.py[cod]
-app/__pycache__/
