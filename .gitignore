@@ -1,0 +1,11 @@
+# virtualenv
+medicam-venv/
+venv/
+.env
+# python cache
+__pycache__/
+*.py[cod]
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
