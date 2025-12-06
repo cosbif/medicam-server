@@ -68,83 +68,85 @@ def get_adapter_name_or_mac():
 
 class ProvisionService:
     def __init__(self):
-        self.response_value = b'{}'
-        self.periph = None
-        self.resp_char = None
-
         if peripheral is None:
             raise RuntimeError("bluezero.peripheral is not available")
 
-        adapter_candidate = get_adapter_name_or_mac()
-        print(f"[BLE] Adapter candidate: {adapter_candidate}")
-
-        # Попытки инициализировать peripheral с разными аргументами (в зависимости от API/версии)
-        tried = []
-        created = False
-        for attempt in range(2):
-            try:
-                if ":" in adapter_candidate:
-                    # возможно ожидается adapter_addr (MAC)
-                    self.periph = peripheral.Peripheral(adapter_addr=adapter_candidate,
-                                                        local_name="MedicamProvision")
-                else:
-                    # возможно ожидается adapter_name
-                    self.periph = peripheral.Peripheral(adapter_name=adapter_candidate,
-                                                        local_name="MedicamProvision")
-                print(f"[BLE] Peripheral created with {adapter_candidate}")
-                created = True
-                break
-            except TypeError as te:
-                # аргумент не подходит — попробуем альтернативный ключ
-                tried.append(str(te))
-                # попробуем другой формат: если была mac, попробуем hci0, и наоборот
-                adapter_candidate = "hci0" if adapter_candidate != "hci0" else get_adapter_name_or_mac()
-            except Exception as e:
-                tried.append(str(e))
-                adapter_candidate = "hci0"
-
-        if not created or not self.periph:
-            raise RuntimeError(f"No valid BLE adapter found. Attempts: {tried}")
-
-        # Добавляем сервис и характеристики
-        self.periph.add_service(SERVICE_UUID, True)
-        self.periph.add_characteristic(SERVICE_UUID, CMD_CHAR_UUID, ['write'], write_callback=self.on_command)
-        self.resp_char = self.periph.add_characteristic(
-            SERVICE_UUID, RESP_CHAR_UUID, ['read', 'notify'], read_callback=self.on_read_response
+        # === Создаём Peripheral корректно ===
+        # Только так, никаких adapter_name/addr
+        self.periph = peripheral.Peripheral(
+            adapter_address="hci0",
+            local_name="MedicamProvision"
         )
+        print("[BLE] Peripheral created using adapter 'hci0'")
+
+        # === Добавляем сервис (требуется numeric srv_id) ===
+        SRV_ID = 1
+        self.periph.add_service(
+            SRV_ID,
+            SERVICE_UUID,
+            True  # primary
+        )
+
+        # === Добавляем командную характеристику (write) ===
+        CMD_CHR_ID = 1
+        self.periph.add_characteristic(
+            srv_id=SRV_ID,
+            chr_id=CMD_CHR_ID,
+            uuid=CMD_CHAR_UUID,
+            value=[],                 # начальное значение
+            notifying=False,          # для write notify=False
+            flags=["write"],          # строго "write"
+            read_callback=None,
+            write_callback=self.on_command
+        )
+
+        # === Добавляем характеристику ответа (read + notify) ===
+        RESP_CHR_ID = 2
+        self.periph.add_characteristic(
+            srv_id=SRV_ID,
+            chr_id=RESP_CHR_ID,
+            uuid=RESP_CHAR_UUID,
+            value=[],                 # начальное значение
+            notifying=False,
+            flags=["read", "notify"],
+            read_callback=lambda: list(self.response_value),
+            write_callback=None,
+            notify_callback=None
+        )
+
+        # сохраняем ID для дальнейшей отправки уведомлений
+        self.srv_id = SRV_ID
+        self.resp_chr_id = RESP_CHR_ID
+
+        self.response_value = b'{}'
+
 
     def on_read_response(self):
         return self.response_value
 
-    def _send_response(self, response_dict: dict):
+    def _send_response(self, response_dict):
+        self.response_value = json.dumps(response_dict).encode()
+    
+        # На выход должен уходить список int, не bytes
+        value_list = list(self.response_value)
+    
         try:
-            self.response_value = json.dumps(response_dict).encode()
-            # попытка уведомления (notify)
-            try:
-                # некоторые версии bluezero используют notify() или send_notify()
-                if hasattr(self.resp_char, "send_notify"):
-                    self.resp_char.send_notify(self.response_value)
-                elif hasattr(self.resp_char, "notify"):
-                    self.resp_char.notify(self.response_value)
-                else:
-                    # просто обновим значение — клиент может читать
-                    pass
-            except Exception as e:
-                print(f"[WARN] notify failed: {e}")
+            # Ищем характеристику ответа
+            for ch in self.periph.characteristics:
+                if ch.uuid == RESP_CHAR_UUID:
+                    ch.set_value(value_list)
+                    if ch.notifying:
+                        ch.send_notify()
+                    break
         except Exception as e:
-            print(f"[ERR] _send_response: {e}")
+            print("[WARN] notify failed:", e)
 
     def on_command(self, value, options):
         try:
-            # value может быть байт-последовательностью или list(int)
-            if isinstance(value, (bytes, bytearray)):
-                raw = bytes(value)
-            else:
-                # возможно list of ints
-                raw = bytes(bytearray(value))
+            raw = bytes(value)
             data = json.loads(raw.decode())
             cmd = data.get("cmd")
-            print(f"[BLE] Command received: {cmd}")
+            print("[BLE] Command:", cmd)
 
             if cmd == "PING":
                 response = {"status": "OK"}
