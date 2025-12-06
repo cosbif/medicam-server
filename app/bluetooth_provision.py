@@ -26,8 +26,15 @@ RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
 PROVISION_FILE = utils._provision_path()
 
+# ========================
+# === TEST MODE FLAG =====
+# ========================
+TEST_MODE = True  # Временно игнорируем Wi-Fi для тестирования BLE
+
 def is_wifi_connected() -> bool:
     """Проверяем, есть ли активное подключение к Wi-Fi."""
+    if TEST_MODE:
+        return False  # Игнорируем Wi-Fi, чтобы BLE запускался
     try:
         status = subprocess.check_output(["nmcli", "-t", "-f", "STATE", "g"], text=True).strip()
         return "connected" in status.lower()
@@ -247,9 +254,10 @@ class ProvisionService:
 
 
 if __name__ == "__main__":
-    if is_wifi_connected():
+    if not TEST_MODE and is_wifi_connected():
         print("[BLE] Wi-Fi connected — BLE provisioning disabled.")
     else:
+        print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
         try:
             ProvisionService().run()
         except Exception as e:
