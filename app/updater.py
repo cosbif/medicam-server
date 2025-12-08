@@ -3,7 +3,7 @@ import subprocess
 import os
 from pathlib import Path
 
-#1#
+#5#
 
 # ----------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------
 
@@ -83,7 +83,7 @@ def apply_update():
     # !!! НАЗВАНИЕ СЕРВИСА УКАЖИ СВОЁ !!!
     service_name = "medicam.service"
 
-    restart = _run(["sudo", "systemctl", "restart", service_name])
+    restart = _run(["sudo", "/bin/systemctl", "restart", service_name])
     if not restart["ok"]:
         return {"ok": False, "step": "restart", **restart}
 
