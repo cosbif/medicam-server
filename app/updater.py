@@ -83,7 +83,7 @@ def apply_update():
     # !!! НАЗВАНИЕ СЕРВИСА УКАЖИ СВОЁ !!!
     service_name = "medicam.service"
 
-    restart = _run(["systemd-run", "--quiet", "--on-active=1", "/bin/systemctl", "restart", service_name])
+    restart = _run(["sudo", "-E", "/bin/systemctl", "restart", service_name])
 
     if not restart["ok"]:
         return {"ok": False, "step": "restart", **restart}
