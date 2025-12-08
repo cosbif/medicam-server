@@ -3,7 +3,7 @@ import subprocess
 import os
 from pathlib import Path
 
-#drwjbk#
+#1#
 
 # ----------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------
 
