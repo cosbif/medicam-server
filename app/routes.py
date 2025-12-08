@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, Form, Depends, Request
 from fastapi.responses import FileResponse, Response
-from app import camera, utils
+from app import camera, utils, updater
 import os
 import shutil
 import platform
 import subprocess
+from app import updater
 
 def require_provisioned():
     '''if not utils.is_provisioned():
@@ -230,3 +231,26 @@ async def provision_reset():
     # сбросим статус (например для теста)
     utils.set_provisioned(False, {})
     return {"status": "reset"}
+
+# -------------------
+# 🔄 OTA UPDATE (git pull)
+# -------------------
+
+@router.get("/update/check")
+async def update_check(_ok: bool = Depends(require_provisioned)):
+    """
+    Возвращает текущий и удалённый git commit.
+    """
+    return updater.check_for_update()
+
+
+@router.post("/update/apply")
+async def update_apply(_ok: bool = Depends(require_provisioned)):
+    """
+    Выполняет git pull (fetch + reset) и перезапуск сервиса.
+    """
+    result = updater.apply_update()
+    if not result["ok"]:
+        raise HTTPException(status_code=500, detail=result)
+
+    return result
