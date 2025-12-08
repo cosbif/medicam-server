@@ -154,6 +154,7 @@ class ProvisionService:
         self.response_value = b'{}'
         # lock to protect response_value between threads
         self._resp_lock = threading.Lock()
+        # buffer for fragmented incoming writes (persistent across calls)
         self._cmd_buffer = bytearray()
 
     # ---------------------------
@@ -261,73 +262,67 @@ class ProvisionService:
     # ---------------------------
     # Command handler (fast return)
     # ---------------------------
-        def on_command(self, value, options):
-            """
-            Принимаем куски данных (value может быть bytes или list(int)).
-            Накапливаем в self._cmd_buffer и пытаемся распарсить JSON.
-            Если JSON некорректен из-за неполноты — ждём следующего вызова.
-            Если JSON распарсен успешно — обрабатываем команду.
-            """
+    def on_command(self, value, options):
+        """
+        Принимаем куски данных (value может быть bytes или list(int)).
+        Накапливаем в self._cmd_buffer и пытаемся распарсить JSON.
+        Если JSON некорректен из-за неполноты — ждём следующего вызова.
+        Если JSON распарсен успешно — обрабатываем команду.
+        """
+        try:
+            # Получаем байты из value
+            if isinstance(value, (bytes, bytearray)):
+                chunk = bytes(value)
+            else:
+                chunk = bytes(bytearray(value))
+
+            # Добавляем фрагмент в общий буфер
+            if chunk:
+                self._cmd_buffer.extend(chunk)
+
+            # Попытка распарсить содержимое буфера как JSON
             try:
-                # Получаем байты из value
-                if isinstance(value, (bytes, bytearray)):
-                    chunk = bytes(value)
-                else:
-                    chunk = bytes(bytearray(value))
+                text = self._cmd_buffer.decode()
+            except UnicodeDecodeError:
+                # Если ещё не полный UTF-8 фрагмент — ждём продолжения
+                return
 
-                # Добавляем фрагмент в общий буфер
-                if chunk:
-                    self._cmd_buffer.extend(chunk)
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as jde:
+                # Неполный JSON — ждём следующих фрагментов
+                return
 
-                # Попытка распарсить содержимое буфера как JSON
-                try:
-                    text = self._cmd_buffer.decode()
-                except UnicodeDecodeError:
-                    # Если ещё не полный UTF-8 фрагмент — ждём продолжения
-                    return
+            # Если дошли сюда — JSON успешно распарсен
+            # Очищаем буфер (готовы принимать следующий JSON)
+            self._cmd_buffer.clear()
 
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError as jde:
-                    # Если ошибка парсинга — возможно неполный JSON -> ждём следующих фрагментов.
-                    # Но если ошибка явная (напр. unexpected token) — логируем.
-                    # Попробуем детектить "unterminated" — но safest: ждём.
-                    # Логируем коротко для дебага и возвращаемся (ждём продолжения).
-                    # Не очищаем буфер.
-                    # Отмечаем что данные пришли — для отладки:
-                    # print("[DEBUG] JSONDecodeError, waiting more data:", str(jde))
-                    return
+            cmd = data.get("cmd")
+            print("[BLE] Command:", cmd)
 
-                # Если дошли сюда — JSON успешно распарсен
-                # Очищаем буфер (готовы принимать следующий JSON)
-                self._cmd_buffer.clear()
+            if cmd == "PING":
+                self._set_response({"status": "OK"})
+                return
 
-                cmd = data.get("cmd")
-                print("[BLE] Command:", cmd)
+            if cmd == "SCAN_WIFI":
+                t = threading.Thread(target=self._worker_scan_wifi, daemon=True)
+                t.start()
+                self._set_response({"status": "started_scan"})
+                return
 
-                if cmd == "PING":
-                    self._set_response({"status": "OK"})
-                    return
+            if cmd == "CONNECT_WIFI":
+                ssid = data.get("ssid")
+                password = data.get("password")
+                t = threading.Thread(target=self._worker_connect_wifi, args=(ssid, password), daemon=True)
+                t.start()
+                self._set_response({"status": "connecting"})
+                return
 
-                if cmd == "SCAN_WIFI":
-                    t = threading.Thread(target=self._worker_scan_wifi, daemon=True)
-                    t.start()
-                    self._set_response({"status": "started_scan"})
-                    return
-
-                if cmd == "CONNECT_WIFI":
-                    ssid = data.get("ssid")
-                    password = data.get("password")
-                    t = threading.Thread(target=self._worker_connect_wifi, args=(ssid, password), daemon=True)
-                    t.start()
-                    self._set_response({"status": "connecting"})
-                    return
-
-                # unknown
-                self._set_response({"error": "unknown_command"})
-            except Exception as e:
-                print("[ERR] on_command top-level:", e, traceback.format_exc())
-                self._set_response({"error": str(e)})
+            # unknown
+            self._set_response({"error": "unknown_command"})
+        except Exception as e:
+            print("[ERR] on_command top-level:", e, traceback.format_exc())
+            self._set_response({"error": str(e)})
 
     # ---------------------------
     # Wi-Fi helpers (unchanged, non-blocking now moved to worker)
