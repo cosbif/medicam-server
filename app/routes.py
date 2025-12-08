@@ -5,7 +5,7 @@ import os
 import shutil
 import platform
 import subprocess
-from app import updater
+from app.updater import check_for_update, apply_update
 
 def require_provisioned():
     '''if not utils.is_provisioned():
