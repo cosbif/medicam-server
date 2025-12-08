@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 import os
 import sys
+import threading
+import traceback
 
 # подключаем project root, чтобы импортировать app.utils
 project_root = Path(__file__).resolve().parents[1]
@@ -27,15 +29,10 @@ PROVISION_FILE = utils._provision_path()
 
 TEST_MODE = True  # временный флаг для отладки BLE
 
-
-# ===============================
-# === FIX: корректные MAC-адрес ==
-# ===============================
+# ---------------------------
+# Helper: adapter MAC
+# ---------------------------
 def get_adapter_mac():
-    """
-    Возвращает MAC адрес адаптера hci0.
-    Bluezero требует MAC, а не имя интерфейса!
-    """
     try:
         addr_path = Path("/sys/class/bluetooth/hci0/address")
         if addr_path.exists():
@@ -56,8 +53,7 @@ def get_adapter_mac():
     except Exception:
         pass
 
-    return None  # важно вернуть None, если не нашли
-
+    return None
 
 def is_wifi_connected() -> bool:
     if TEST_MODE:
@@ -72,7 +68,9 @@ def is_wifi_connected() -> bool:
         print(f"[WARN] Wi-Fi check failed: {e}")
         return False
 
-
+# ---------------------------
+# Provision service class
+# ---------------------------
 class ProvisionService:
     def __init__(self):
         if peripheral is None:
@@ -87,7 +85,6 @@ class ProvisionService:
 
         print(f"[BLE] Using adapter MAC: {mac}")
 
-        # создаём Peripheral
         self.periph = peripheral.Peripheral(
             adapter_address=mac,
             local_name="MedicamProvision"
@@ -95,13 +92,10 @@ class ProvisionService:
 
         print("[BLE] Peripheral created via bluezero")
 
-        # Добавляем сервис и характеристики; сохраняем объекты характер.
         SRV_ID = 1
         self.periph.add_service(SRV_ID, SERVICE_UUID, True)
 
         # Command characteristic (write)
-        # Возвращаем объект, если bluezero возвращает его (но add_characteristic
-        # у bluezero иногда возвращает None — поэтому мы не завязываемся полностью на возврат)
         try:
             self.cmd_char = self.periph.add_characteristic(
                 srv_id=SRV_ID,
@@ -114,7 +108,7 @@ class ProvisionService:
                 write_callback=self.on_command
             )
         except TypeError:
-            # старые/разные сигнатуры библиотеки
+            # fallback for different bluezero versions
             self.periph.add_characteristic(
                 srv_id=SRV_ID,
                 chr_id=1,
@@ -127,7 +121,7 @@ class ProvisionService:
             )
             self.cmd_char = None
 
-        # Response characteristic (read + notify) — сохраним ссылку, если possible
+        # Response characteristic (read + notify)
         try:
             resp = self.periph.add_characteristic(
                 srv_id=SRV_ID,
@@ -142,7 +136,6 @@ class ProvisionService:
             )
             self.resp_char = resp
         except TypeError:
-            # альтернативная сигнатура
             self.periph.add_characteristic(
                 srv_id=SRV_ID,
                 chr_id=2,
@@ -159,129 +152,167 @@ class ProvisionService:
         self.srv_id = SRV_ID
         self.resp_chr_id = 2
         self.response_value = b'{}'
+        # lock to protect response_value between threads
+        self._resp_lock = threading.Lock()
 
-    # === BLE methods ===
+    # ---------------------------
+    # Read callback for RESP
+    # ---------------------------
     def on_read_response(self):
-        # Bluezero expects list of ints as value
-        return list(self.response_value)
+        with self._resp_lock:
+            return list(self.response_value)
 
-    def _send_response(self, response_dict):
+    # ---------------------------
+    # Internal: set response and try notify (non-blocking)
+    # ---------------------------
+    def _set_response(self, response_dict):
         """
-        Устанавливаем value и пытаемся отправить notify через объект resp_char.
-        Если resp_char неизвестен, просто логируем и позволяем клиенту делать Read.
+        Устанавливает response_value. Пытаться отправить notify,
+        но не блокировать основной поток — ошибки логируем.
         """
-        self.response_value = json.dumps(response_dict).encode()
-        value_list = list(self.response_value)
+        try:
+            payload = json.dumps(response_dict).encode()
+        except Exception:
+            payload = str(response_dict).encode()
 
-        # Если у нас есть прямой объект характеристики — используем его
-        if self.resp_char is not None:
-            try:
-                # set_value — стандартный метод у bluezero Characteristic
-                if hasattr(self.resp_char, "set_value"):
-                    self.resp_char.set_value(value_list)
-                else:
-                    # если нет set_value, пробуем установить через periph API
+        value_list = list(payload)
+        with self._resp_lock:
+            self.response_value = payload
+
+        # Попытка установить value и послать notify — всё в try/except
+        try:
+            if self.resp_char is not None:
+                # try to use direct API
+                try:
+                    if hasattr(self.resp_char, "set_value"):
+                        self.resp_char.set_value(value_list)
+                except Exception:
+                    # fallback: try peripheral helper
                     try:
-                        self.periph.set_characteristic_value(self.srv_id, self.resp_chr_id, value_list)
+                        if hasattr(self.periph, "set_characteristic_value"):
+                            self.periph.set_characteristic_value(self.srv_id, self.resp_chr_id, value_list)
                     except Exception:
                         pass
 
-                # Попытка уведомления (несколько возможных имен методов)
-                if getattr(self.resp_char, "notifying", False):
-                    # уже notifying
-                    try:
-                        if hasattr(self.resp_char, "send_notify"):
-                            self.resp_char.send_notify()
-                        elif hasattr(self.resp_char, "notify"):
-                            self.resp_char.notify()
-                    except Exception as e:
-                        print("[WARN] notify methods failed:", e)
-                else:
-                    # Попытка вызвать notify в любом случае (если поддерживается)
-                    try:
-                        if hasattr(self.resp_char, "send_notify"):
-                            self.resp_char.send_notify()
-                        elif hasattr(self.resp_char, "notify"):
-                            self.resp_char.notify()
-                    except Exception as e:
-                        # если уведомление невозможно — просто логируем
-                        print("[WARN] notify failed (notifying unsupported):", e)
-
-                return
-            except Exception as e:
-                print("[WARN] notify failed (resp_char block):", e)
-
-        # fallback: пробуем пройти по списку характеристик и установить значение,
-        # но не полагаться на атрибуты которых может не быть
-        try:
-            for ch in getattr(self.periph, "characteristics", []) or []:
+                # try to notify if supported
                 try:
-                    # пробуем установить значение, если есть метод set_value
-                    if hasattr(ch, "set_value"):
-                        ch.set_value(value_list)
-                        # если у неё notifying — пробуем notify
-                        if getattr(ch, "notifying", False):
-                            if hasattr(ch, "send_notify"):
-                                ch.send_notify()
-                            elif hasattr(ch, "notify"):
-                                ch.notify()
-                        # не ломаем цикл — мы установили значение
-                        break
-                except Exception:
-                    continue
-        except Exception as e:
-            print("[WARN] notify failed (fallback):", e)
-
-    def on_command(self, value, options):
-        self._cmd_buffer = bytearray()
-        try:
-            # value может приходить кусками — добавляем в буфер
-            if isinstance(value, (bytes, bytearray)):
-                self._cmd_buffer.extend(value)
+                    if getattr(self.resp_char, "notifying", False):
+                        if hasattr(self.resp_char, "send_notify"):
+                            self.resp_char.send_notify()
+                        elif hasattr(self.resp_char, "notify"):
+                            self.resp_char.notify()
+                except Exception as e:
+                    print("[WARN] notify attempt failed:", e)
             else:
-                self._cmd_buffer.extend(bytearray(value))
+                # fallback: iterate over periph.characteristics and set first matching
+                for ch in getattr(self.periph, "characteristics", []) or []:
+                    try:
+                        if getattr(ch, "uuid", None) == RESP_CHAR_UUID and hasattr(ch, "set_value"):
+                            ch.set_value(value_list)
+                            # try notify
+                            try:
+                                if getattr(ch, "notifying", False):
+                                    if hasattr(ch, "send_notify"):
+                                        ch.send_notify()
+                                    elif hasattr(ch, "notify"):
+                                        ch.notify()
+                            except Exception:
+                                pass
+                            break
+                    except Exception:
+                        continue
+        except Exception as e:
+            print("[WARN] _set_response notify block error:", e)
 
-            # JSON по BLE приходит как текст UTF-8.
-            # Проверим, закончился ли JSON (последняя } )
-            if self._cmd_buffer and self._cmd_buffer[-1] != ord('}'):
-                # не полный JSON — ждем
+    # ---------------------------
+    # Long-running workers
+    # ---------------------------
+    def _worker_scan_wifi(self):
+        try:
+            networks = self.scan_wifi()
+            self._set_response({"networks": networks})
+            print("[BLE] SCAN_WIFI finished, networks count:", len(networks))
+        except Exception as e:
+            print("[ERR] worker_scan_wifi:", e, traceback.format_exc())
+            self._set_response({"error": str(e)})
+
+    def _worker_connect_wifi(self, ssid, password):
+        try:
+            ok = self.connect_wifi(ssid, password)
+            ip = ""
+            if ok:
+                # get first ip
+                try:
+                    out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
+                    import re
+                    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+                    ip = m.group(1) if m else ""
+                except Exception:
+                    ip = ""
+                utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
+                self._set_response({"status": "connected", "ip": ip})
+            else:
+                self._set_response({"status": "failed"})
+        except Exception as e:
+            print("[ERR] worker_connect_wifi:", e, traceback.format_exc())
+            self._set_response({"error": str(e)})
+
+    # ---------------------------
+    # Command handler (fast return)
+    # ---------------------------
+    def on_command(self, value, options):
+        """
+        Очень лёгкий обработчик: разбираем JSON, и если команда быстрая (PING)
+        — отдаем ответ сразу; если долгие операции — стартуем background thread
+        и возвращаем быстрый ACK.
+        """
+        try:
+            # value может быть bytes либо list of ints
+            if isinstance(value, (bytes, bytearray)):
+                raw = bytes(value)
+            else:
+                raw = bytes(bytearray(value))
+            try:
+                data = json.loads(raw.decode())
+            except Exception:
+                # если не распарсилось — просто игнорируем
+                print("[WARN] malformed JSON in on_command")
                 return
 
-            # получили полный JSON
-            raw = bytes(self._cmd_buffer)
-            self._cmd_buffer.clear()
-
-            data = json.loads(raw.decode())
             cmd = data.get("cmd")
             print("[BLE] Command:", cmd)
 
             if cmd == "PING":
-                response = {"status": "OK"}
+                # быстрый ответ
+                self._set_response({"status": "OK"})
+                return
 
-            elif cmd == "SCAN_WIFI":
-                nets = self.scan_wifi()
-                response = {"networks": nets}
+            if cmd == "SCAN_WIFI":
+                # стартуем фоновый worker
+                t = threading.Thread(target=self._worker_scan_wifi, daemon=True)
+                t.start()
+                # быстрый ack
+                self._set_response({"status": "started_scan"})
+                return
 
-            elif cmd == "CONNECT_WIFI":
+            if cmd == "CONNECT_WIFI":
                 ssid = data.get("ssid")
                 password = data.get("password")
-                ok = self.connect_wifi(ssid, password)
-                response = {"status": "connected"} if ok else {"status": "failed"}
+                t = threading.Thread(target=self._worker_connect_wifi, args=(ssid, password), daemon=True)
+                t.start()
+                self._set_response({"status": "connecting"})
+                return
 
-            else:
-                response = {"error": "unknown_command"}
-
+            # unknown
+            self._set_response({"error": "unknown_command"})
         except Exception as e:
-            response = {"error": str(e)}
+            print("[ERR] on_command top-level:", e, traceback.format_exc())
+            self._set_response({"error": str(e)})
 
-        self._send_response(response)
-
-    # === Wi-Fi ===
+    # ---------------------------
+    # Wi-Fi helpers (unchanged, non-blocking now moved to worker)
+    # ---------------------------
     def scan_wifi(self):
-        """
-        Возвращаем топ N сетей с безопасной длиной SSID.
-        Это снижает размер JSON и уменьшает вероятность проблем с BLE MTU.
-        """
         try:
             result = subprocess.run(
                 ["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi"],
@@ -306,14 +337,11 @@ class ProvisionService:
                     signal = int(signal_str) if signal_str.isdigit() else 0
                 except Exception:
                     signal = 0
-                # отбрасываем слабые
                 if signal >= 30:
-                    # обрезаем ssid до 64 символов для безопасности
                     safe_ssid = ssid[:64]
                     networks.append({"ssid": safe_ssid, "signal": signal})
-            # сортируем и ограничиваем количество результатов
             networks = sorted(networks, key=lambda x: -x["signal"])
-            return networks[:10]  # максимум 10 сетей
+            return networks[:10]
         except Exception as e:
             print(f"[ERR] scan_wifi: {e}")
             return []
@@ -331,16 +359,9 @@ class ProvisionService:
             print(f"[ERR] connect_wifi: {e}")
             return False
 
-    def _get_first_ipv4(self):
-        try:
-            out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
-            import re
-            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-            return m.group(1) if m else ""
-        except Exception:
-            return ""
-
-    # === Main Loop ===
+    # ---------------------------
+    # Main loop
+    # ---------------------------
     def run(self):
         print("[BLE] Starting provisioning service...")
 
@@ -367,7 +388,6 @@ class ProvisionService:
             self.periph.unpublish()
         except Exception as e:
             print("[WARN] BLE stop failed:", e)
-
 
 if __name__ == "__main__":
     print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
