@@ -103,7 +103,7 @@ class ProvisionService:
                 uuid=CMD_CHAR_UUID,
                 value=[],
                 notifying=False,
-                flags=["write"],
+                flags=["write-without-response", "write"],
                 read_callback=None,
                 write_callback=self.on_command
             )
@@ -115,7 +115,7 @@ class ProvisionService:
                 uuid=CMD_CHAR_UUID,
                 value=[],
                 notifying=False,
-                flags=["write"],
+                flags=["write-without-response", "write"],
                 read_callback=None,
                 write_callback=self.on_command
             )
@@ -262,7 +262,7 @@ class ProvisionService:
     # ---------------------------
     # Command handler (fast return)
     # ---------------------------
-    def on_command(self, value, options):
+    def on_command(self, value, options=None):
         """
         Принимаем куски данных (value может быть bytes или list(int)).
         Накапливаем в self._cmd_buffer и пытаемся распарсить JSON.
