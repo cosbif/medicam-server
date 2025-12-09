@@ -83,7 +83,13 @@ def apply_update():
     # !!! НАЗВАНИЕ СЕРВИСА УКАЖИ СВОЁ !!!
     service_name = "medicam.service"
 
-    restart = _run(["sudo", "/bin/bash", "/home/radxa/medicam-server/restart_service.sh"])
+    restart = _run([
+        "sudo", 
+        "/usr/bin/systemd-run",
+        "--unit", "medicam-restart",
+        "--property=Type=oneshot",
+        "/bin/bash", "/home/radxa/medicam-server/restart_service.sh"
+    ])
 
     if not restart["ok"]:
         return {"ok": False, "step": "restart", **restart}
