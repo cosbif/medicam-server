@@ -65,31 +65,45 @@ def check_for_update():
 
 # ----------- APPLY UPDATE -----------
 
+def log_debug(text: str):
+    try:
+        with open("/home/radxa/medicam-server/update_debug.log", "a") as f:
+            f.write(text + "\n")
+    except:
+        pass
+
+
 def apply_update():
-    """
-    git fetch → git reset → restart service
-    """
+    log_debug("===== APPLY UPDATE START =====")
+
     # 1. fetch
     fetch = _run(["git", "fetch"])
+    log_debug(f"FETCH: {fetch}")
     if not fetch["ok"]:
         return {"ok": False, "step": "fetch", **fetch}
 
     # 2. reset
     reset = _run(["git", "reset", "--hard", "origin/main"])
+    log_debug(f"RESET: {reset}")
     if not reset["ok"]:
         return {"ok": False, "step": "reset", **reset}
 
-    # 3. restart systemd service
-    # !!! НАЗВАНИЕ СЕРВИСА УКАЖИ СВОЁ !!!
-    service_name = "medicam.service"
-
+    # 3. restart via systemd-run
+    log_debug("Attempting restart...")
     restart = _run([
-        "sudo", 
+        "sudo",
         "/usr/bin/systemd-run",
         "--unit", "medicam-restart",
         "--property=Type=oneshot",
         "/bin/bash", "/home/radxa/medicam-server/restart_service.sh"
     ])
+    log_debug(f"RESTART RESULT: {restart}")
+
+    # Extra: run journalctl for restart job
+    journal = _run(["journalctl", "-u", "medicam-restart", "--no-pager", "--since", "5 minutes ago"])
+    log_debug(f"JOURNAL OUTPUT: {journal}")
+
+    log_debug("===== APPLY UPDATE END =====")
 
     if not restart["ok"]:
         return {"ok": False, "step": "restart", **restart}
