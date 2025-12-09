@@ -90,13 +90,7 @@ def apply_update():
 
     # 3. restart via systemd-run
     log_debug("Attempting restart...")
-    restart = _run([
-        "sudo",
-        "/usr/bin/systemd-run",
-        "--unit", "medicam-restart",
-        "--property=Type=oneshot",
-        "/bin/bash", "/home/radxa/medicam-server/restart_service.sh"
-    ])
+    restart = _run(["sudo", "/bin/systemctl", "start", "restart-medicam.service"])
     log_debug(f"RESTART RESULT: {restart}")
 
     # Extra: run journalctl for restart job
