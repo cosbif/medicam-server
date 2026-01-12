@@ -3,7 +3,7 @@ import subprocess
 import os
 from pathlib import Path
 
-#17#
+#18#
 
 # ----------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------
 
