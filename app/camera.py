@@ -1,3 +1,5 @@
+'''app/camera.py'''
+from fastapi import HTTPException
 import subprocess
 import platform
 import os
@@ -9,9 +11,19 @@ ffmpeg_process = None
 SETTINGS_FILE = "camera_settings.json"
 
 camera_settings = {
-    "resolution": "1920x1080",
+    "resolution": "FHD",
     "fps": "30"
 }
+
+SUPPORTED_RESOLUTIONS = {
+    "SD": "640x360",
+    "HD": "1280x720",
+    "FHD": "1920x1080",
+    "2K": "2688x1512",
+    "4K": "3840x2160",
+}
+
+
 
 if os.path.exists(SETTINGS_FILE):
     try:
@@ -28,6 +40,14 @@ def start_recording():
 
     if ffmpeg_process is not None:
         return {"status": "already_recording"}
+    
+    resolution_key = camera_settings.get("resolution", "FHD")
+    video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
+
+    if not video_size:
+        # fallback + лог
+        print(f"[WARN] Unsupported resolution preset: {resolution_key}, fallback to FHD")
+        video_size = SUPPORTED_RESOLUTIONS["FHD"]
 
     system = platform.system()
     output_file = utils.get_output_filename()
@@ -38,7 +58,7 @@ def start_recording():
             "-y",
             "-f", "dshow",
             "-framerate", camera_settings["fps"],
-            "-video_size", camera_settings["resolution"],
+            "-video_size", video_size,
             "-vcodec", "mjpeg",
             "-i", "video=AT025",
             "-c:v", "libx264",
@@ -54,7 +74,7 @@ def start_recording():
             "-y",
             "-f", "v4l2",
             "-framerate", camera_settings["fps"],
-            "-video_size", camera_settings["resolution"],
+            "-video_size", video_size,
             "-input_format", "mjpeg",
             "-i", "/dev/video0",
             "-c:v", "libx264",
@@ -98,9 +118,17 @@ def get_settings():
 
 def update_settings(resolution: str = None, fps: str = None):
     if resolution:
+        if resolution not in SUPPORTED_RESOLUTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported resolution preset: {resolution}"
+            )
         camera_settings["resolution"] = resolution
+
     if fps:
         camera_settings["fps"] = fps
+
     with open(SETTINGS_FILE, "w") as f:
         json.dump(camera_settings, f)
+
     return camera_settings

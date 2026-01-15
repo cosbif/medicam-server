@@ -1,3 +1,4 @@
+'''app/routes.py'''
 from fastapi import APIRouter, HTTPException, Form, Depends, Request
 from fastapi.responses import FileResponse, Response
 from app import camera, utils, updater
@@ -113,7 +114,7 @@ async def clear_all_videos(_ok: bool = Depends(require_provisioned)):
 # 💾 Хранилище
 # -------------------
 @router.get("/storage")
-async def get_storage_info(_ok: bool = Depends(require_provisioned)):
+async def get_storage_info():
     total, used, free = shutil.disk_usage(".")
     free_gb = round(free / (1024 ** 3), 2)
     return {
@@ -127,7 +128,7 @@ async def get_storage_info(_ok: bool = Depends(require_provisioned)):
 # ⚙️ Настройки камеры
 # -------------------
 @router.get("/settings")
-async def get_settings(_ok: bool = Depends(require_provisioned)):
+async def get_settings():
     return camera.get_settings()
 
 @router.post("/settings")
@@ -136,6 +137,7 @@ async def update_settings(
     fps: str = Form(None),
     _ok: bool = Depends(require_provisioned)):
     return camera.update_settings(resolution, fps)
+
 
 # -------------------
 # 📡 Wi-Fi
