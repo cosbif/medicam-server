@@ -69,9 +69,8 @@ def start_recording():
         ]
 
     elif system == "Linux":
-        FFMPEG_BIN = "/usr/local/bin/ffmpeg"
         command = [
-            FFMPEG_BIN,
+            "ffmpeg",
             "-y",
             "-f", "v4l2",
             "-framerate", camera_settings["fps"],
@@ -88,11 +87,8 @@ def start_recording():
         return {"status": f"Unsupported OS: {system}"}
 
     try:
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = "/usr/local/lib"
-
         log_file = open("ffmpeg.log", "w")
-        ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_file, stderr=log_file, env=env)
+        ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_file, stderr=log_file)
         return {"status": "recording_started", "file": output_file}
     except Exception as e:
         ffmpeg_process = None
