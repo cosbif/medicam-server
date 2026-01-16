@@ -77,7 +77,12 @@ def start_recording():
             "-video_size", video_size,
             "-input_format", "mjpeg",
             "-i", "/dev/video0",
-            "-c:v", "copy",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+            "-g", "60",
+            "-bf", "2",
             "-movflags", "+faststart",
             output_file
         ]
