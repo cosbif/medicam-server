@@ -77,7 +77,7 @@ def start_recording():
             "-video_size", video_size,
             "-input_format", "mjpeg",
             "-i", "/dev/video0",
-            "-c:v", "h264_v4lrequest",
+            "-c:v", "h264_v4l2request",
             "-pix_fmt", "nv12",
             "-b:v", "20M",
             "-maxrate", "25M",
