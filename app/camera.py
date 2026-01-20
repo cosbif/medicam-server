@@ -74,17 +74,15 @@ def start_recording():
             "-y",
     
             "-f", "v4l2",
+            "-input_format", "mjpeg",
             "-framerate", camera_settings["fps"],
             "-video_size", video_size,
-            "-input_format", "mjpeg",
             "-i", "/dev/video0",
 
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-profile:v", "high",
+            "-preset", "ultrafast",
+            "-crf", "28",
             "-pix_fmt", "yuv420p",
-            "-g", "60",
-            "-bf", "2",
 
             "-movflags", "+faststart",
             output_file
