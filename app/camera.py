@@ -78,19 +78,10 @@ def start_recording():
             "-video_size", video_size,
             "-input_format", "mjpeg",
             "-i", "/dev/video0",
-    
-            "-c:v", "h264_v4l2m2m",
-            "-pix_fmt", "nv12",
-    
-            "-b:v", "20M",
-            "-maxrate", "25M",
-            "-bufsize", "50M",
-            "-g", "60",
-    
+            "-c:v", "copy",
             "-movflags", "+faststart",
             output_file
         ]
-
 
     else:
         return {"status": f"Unsupported OS: {system}"}
