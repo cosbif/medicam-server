@@ -27,7 +27,11 @@ RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
 PROVISION_FILE = utils._provision_path()
 
-TEST_MODE = True  # временный флаг для отладки BLE
+TEST_MODE = os.getenv("MEDICAM_BLE_TEST_MODE", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # ---------------------------
 # Helper: adapter MAC
@@ -167,11 +171,17 @@ class ProvisionService:
     # ---------------------------
     # Internal: set response and try notify (non-blocking)
     # ---------------------------
-    def _set_response(self, response_dict):
+    def _set_response(self, response_dict, request_id=None):
         """
         Устанавливает response_value. Пытаться отправить notify,
         но не блокировать основной поток — ошибки логируем.
         """
+        if request_id is not None:
+            response_dict = {
+                **response_dict,
+                "request_id": request_id,
+            }
+
         try:
             payload = json.dumps(response_dict).encode()
         except Exception:
@@ -229,16 +239,16 @@ class ProvisionService:
     # ---------------------------
     # Long-running workers
     # ---------------------------
-    def _worker_scan_wifi(self):
+    def _worker_scan_wifi(self, request_id=None):
         try:
             networks = self.scan_wifi()
-            self._set_response({"networks": networks})
+            self._set_response({"networks": networks}, request_id=request_id)
             print("[BLE] SCAN_WIFI finished, networks count:", len(networks))
         except Exception as e:
             print("[ERR] worker_scan_wifi:", e, traceback.format_exc())
-            self._set_response({"error": str(e)})
+            self._set_response({"error": str(e)}, request_id=request_id)
 
-    def _worker_connect_wifi(self, ssid, password):
+    def _worker_connect_wifi(self, ssid, password, request_id=None):
         try:
             ok = self.connect_wifi(ssid, password)
             ip = ""
@@ -252,12 +262,15 @@ class ProvisionService:
                 except Exception:
                     ip = ""
                 utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-                self._set_response({"status": "connected", "ip": ip})
+                self._set_response(
+                    {"status": "connected", "ip": ip},
+                    request_id=request_id,
+                )
             else:
-                self._set_response({"status": "failed"})
+                self._set_response({"status": "failed"}, request_id=request_id)
         except Exception as e:
             print("[ERR] worker_connect_wifi:", e, traceback.format_exc())
-            self._set_response({"error": str(e)})
+            self._set_response({"error": str(e)}, request_id=request_id)
 
     # ---------------------------
     # Command handler (fast return)
@@ -298,28 +311,47 @@ class ProvisionService:
             self._cmd_buffer.clear()
 
             cmd = data.get("cmd")
+            request_id = data.get("request_id")
             print("[BLE] Command:", cmd)
 
             if cmd == "PING":
-                self._set_response({"status": "OK"})
+                self._set_response({"status": "OK"}, request_id=request_id)
                 return
 
             if cmd == "SCAN_WIFI":
-                t = threading.Thread(target=self._worker_scan_wifi, daemon=True)
+                t = threading.Thread(
+                    target=self._worker_scan_wifi,
+                    kwargs={"request_id": request_id},
+                    daemon=True,
+                )
                 t.start()
-                self._set_response({"status": "started_scan"})
+                self._set_response(
+                    {"status": "started_scan"},
+                    request_id=request_id,
+                )
                 return
 
             if cmd == "CONNECT_WIFI":
                 ssid = data.get("ssid")
                 password = data.get("password")
-                t = threading.Thread(target=self._worker_connect_wifi, args=(ssid, password), daemon=True)
+                t = threading.Thread(
+                    target=self._worker_connect_wifi,
+                    args=(ssid, password),
+                    kwargs={"request_id": request_id},
+                    daemon=True,
+                )
                 t.start()
-                self._set_response({"status": "connecting"})
+                self._set_response(
+                    {"status": "connecting"},
+                    request_id=request_id,
+                )
                 return
 
             # unknown
-            self._set_response({"error": "unknown_command"})
+            self._set_response(
+                {"error": "unknown_command"},
+                request_id=request_id,
+            )
         except Exception as e:
             print("[ERR] on_command top-level:", e, traceback.format_exc())
             self._set_response({"error": str(e)})
@@ -405,7 +437,8 @@ class ProvisionService:
             print("[WARN] BLE stop failed:", e)
 
 if __name__ == "__main__":
-    print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
+    if TEST_MODE:
+        print("[BLE] TEST MODE ACTIVE — ignoring Wi-Fi status")
     try:
         ProvisionService().run()
     except Exception as e:

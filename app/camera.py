@@ -23,12 +23,36 @@ SUPPORTED_RESOLUTIONS = {
     "4K": "3840x2160",
 }
 
+LEGACY_RESOLUTION_MAP = {
+    value: key for key, value in SUPPORTED_RESOLUTIONS.items()
+}
+
+SUPPORTED_FPS = {"30", "60"}
+
+
+def _normalize_settings(settings: dict | None):
+    settings = settings or {}
+
+    resolution = str(settings.get("resolution", camera_settings["resolution"]))
+    resolution = LEGACY_RESOLUTION_MAP.get(resolution, resolution)
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        resolution = "FHD"
+
+    fps = str(settings.get("fps", camera_settings["fps"]))
+    if fps not in SUPPORTED_FPS:
+        fps = "30"
+
+    return {
+        "resolution": resolution,
+        "fps": fps,
+    }
+
 
 
 if os.path.exists(SETTINGS_FILE):
     try:
         with open(SETTINGS_FILE, "r") as f:
-            camera_settings.update(json.load(f))
+            camera_settings.update(_normalize_settings(json.load(f)))
     except Exception:
         pass
 
@@ -121,6 +145,7 @@ def get_settings():
 
 def update_settings(resolution: str = None, fps: str = None):
     if resolution:
+        resolution = LEGACY_RESOLUTION_MAP.get(resolution, resolution)
         if resolution not in SUPPORTED_RESOLUTIONS:
             raise HTTPException(
                 status_code=400,
@@ -129,6 +154,12 @@ def update_settings(resolution: str = None, fps: str = None):
         camera_settings["resolution"] = resolution
 
     if fps:
+        fps = str(fps)
+        if fps not in SUPPORTED_FPS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported fps preset: {fps}"
+            )
         camera_settings["fps"] = fps
 
     with open(SETTINGS_FILE, "w") as f:

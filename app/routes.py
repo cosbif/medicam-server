@@ -5,6 +5,7 @@ from app import camera, utils, updater
 import os
 import shutil
 import platform
+import socket
 import subprocess
 from app.updater import check_for_update, apply_update
 
@@ -14,6 +15,15 @@ def require_provisioned():
     return True
 
 router = APIRouter()
+
+
+@router.get("/ping")
+async def ping():
+    return {
+        "status": "ok",
+        "service": "medicam",
+        "hostname": socket.gethostname(),
+    }
 
 # -------------------
 # 📼 Запись
