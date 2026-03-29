@@ -3,6 +3,7 @@ from fastapi import HTTPException
 import subprocess
 import platform
 import os
+import time
 from app import utils
 import json
 
@@ -75,29 +76,59 @@ def _probe_ffmpeg_encoders():
         return ""
 
 
-def _select_linux_encoder():
+def _probe_ffmpeg_version():
+    try:
+        return subprocess.check_output(
+            ["ffmpeg", "-version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to probe ffmpeg version: {e}")
+        return ""
+
+
+def _linux_encoder_candidates():
     global _linux_encoder_cache
 
-    if _linux_encoder_cache is not None:
-        return _linux_encoder_cache
-
     encoders_output = _probe_ffmpeg_encoders()
-    for encoder_name in ("h264_rkmpp", "h264_v4l2m2m"):
-        if encoder_name in encoders_output:
-            _linux_encoder_cache = encoder_name
-            print(f"[INFO] Using hardware encoder: {encoder_name}")
-            return _linux_encoder_cache
+    version_output = _probe_ffmpeg_version()
 
-    _linux_encoder_cache = "libx264"
-    print("[INFO] Hardware encoder not found, fallback to libx264")
-    return _linux_encoder_cache
+    candidates = []
+    if _linux_encoder_cache:
+        candidates.append(_linux_encoder_cache)
+
+    if "h264_rkmpp" in encoders_output or "--enable-rkmpp" in version_output:
+        candidates.append("h264_rkmpp")
+
+    if "h264_v4l2m2m" in encoders_output:
+        candidates.append("h264_v4l2m2m")
+
+    candidates.append("libx264")
+
+    deduped_candidates = []
+    for encoder_name in candidates:
+        if encoder_name not in deduped_candidates:
+            deduped_candidates.append(encoder_name)
+
+    return deduped_candidates
 
 
 def _linux_encoder_args(encoder_name: str, bitrate: str, bufsize: str):
-    if encoder_name in {"h264_rkmpp", "h264_v4l2m2m"}:
+    if encoder_name == "h264_rkmpp":
         return [
             "-vf", "format=nv12",
-            "-c:v", encoder_name,
+            "-c:v", "h264_rkmpp",
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
+            "-bufsize", bufsize,
+            "-g", "60",
+        ]
+
+    if encoder_name == "h264_v4l2m2m":
+        return [
+            "-vf", "format=nv12",
+            "-c:v", "h264_v4l2m2m",
             "-b:v", bitrate,
             "-maxrate", bitrate,
             "-bufsize", bufsize,
@@ -112,6 +143,69 @@ def _linux_encoder_args(encoder_name: str, bitrate: str, bufsize: str):
         "-pix_fmt", "yuv420p",
         "-g", "60",
     ]
+
+
+def _build_linux_command(video_size: str, fps: str, output_file: str,
+                         encoder_name: str, bitrate: str, bufsize: str):
+    return [
+        "ffmpeg",
+        "-y",
+        "-thread_queue_size", "1024",
+        "-f", "v4l2",
+        "-input_format", "mjpeg",
+        "-framerate", fps,
+        "-video_size", video_size,
+        "-i", "/dev/video0",
+        *_linux_encoder_args(encoder_name, bitrate, bufsize),
+        "-movflags", "+faststart",
+        output_file
+    ]
+
+
+def _start_linux_ffmpeg(video_size: str, fps: str, output_file: str,
+                        bitrate: str, bufsize: str):
+    global _linux_encoder_cache
+
+    attempted_encoders = []
+    log_file = open("ffmpeg.log", "w")
+
+    for encoder_name in _linux_encoder_candidates():
+        attempted_encoders.append(encoder_name)
+        command = _build_linux_command(
+            video_size,
+            fps,
+            output_file,
+            encoder_name,
+            bitrate,
+            bufsize,
+        )
+
+        log_file.write(f"[INFO] Trying encoder: {encoder_name}\n")
+        log_file.flush()
+        print(f"[INFO] Trying encoder: {encoder_name}")
+
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=log_file,
+            stderr=log_file,
+        )
+
+        time.sleep(1.5)
+        if process.poll() is None:
+            _linux_encoder_cache = encoder_name
+            return process, encoder_name
+
+        log_file.write(
+            f"[WARN] Encoder {encoder_name} exited immediately with code {process.returncode}\n"
+        )
+        log_file.flush()
+        print(
+            f"[WARN] Encoder {encoder_name} exited immediately with code {process.returncode}"
+        )
+
+    log_file.close()
+    return None, attempted_encoders
 
 
 
@@ -146,50 +240,56 @@ def start_recording():
     system = platform.system()
     output_file = utils.get_output_filename()
 
-    if system == "Windows":
-        command = [
-            "ffmpeg",
-            "-y",
-            "-f", "dshow",
-            "-framerate", camera_settings["fps"],
-            "-video_size", video_size,
-            "-vcodec", "mjpeg",
-            "-i", "video=AT025",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            output_file
-        ]
-
-    elif system == "Linux":
-        encoder_name = _select_linux_encoder()
-        command = [
-            "ffmpeg",
-            "-y",
-            "-thread_queue_size", "1024",
-    
-            "-f", "v4l2",
-            "-input_format", "mjpeg",
-            "-framerate", fps,
-            "-video_size", video_size,
-            "-i", "/dev/video0",
-            *_linux_encoder_args(encoder_name, bitrate, bufsize),
-
-            "-movflags", "+faststart",
-            output_file
-        ]
-
-    else:
-        return {"status": f"Unsupported OS: {system}"}
-
     try:
-        log_file = open("ffmpeg.log", "w")
-        ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_file, stderr=log_file)
+        if system == "Windows":
+            command = [
+                "ffmpeg",
+                "-y",
+                "-f", "dshow",
+                "-framerate", camera_settings["fps"],
+                "-video_size", video_size,
+                "-vcodec", "mjpeg",
+                "-i", "video=AT025",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                output_file
+            ]
+            log_file = open("ffmpeg.log", "w")
+            ffmpeg_process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=log_file,
+                stderr=log_file,
+            )
+            encoder_name = "libx264"
+
+        elif system == "Linux":
+            ffmpeg_process, encoder_result = _start_linux_ffmpeg(
+                video_size,
+                fps,
+                output_file,
+                bitrate,
+                bufsize,
+            )
+            if ffmpeg_process is None:
+                return {
+                    "status": "error",
+                    "details": (
+                        "Failed to start ffmpeg with encoders: "
+                        + ", ".join(encoder_result)
+                    ),
+                }
+            encoder_name = encoder_result
+
+        else:
+            return {"status": f"Unsupported OS: {system}"}
+
         return {
             "status": "recording_started",
             "file": output_file,
-            "encoder": encoder_name if system == "Linux" else "libx264",
+            "encoder": encoder_name,
             "bitrate": bitrate if system == "Linux" else None,
         }
     except Exception as e:
