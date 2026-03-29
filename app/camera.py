@@ -98,11 +98,14 @@ def _linux_encoder_candidates():
     if _linux_encoder_cache:
         candidates.append(_linux_encoder_cache)
 
-    if "h264_rkmpp" in encoders_output or "--enable-rkmpp" in version_output:
+    # На Radxa имеет смысл пробовать RKMPP даже если encoder не попал в
+    # список из-за кривой/смешанной сборки ffmpeg.
+    if "--enable-rkmpp" in version_output or "h264_rkmpp" in encoders_output:
         candidates.append("h264_rkmpp")
 
-    if "h264_v4l2m2m" in encoders_output:
-        candidates.append("h264_v4l2m2m")
+    # Легкий software fallback. Обычно заметно быстрее libx264 на слабом ARM.
+    if "mpeg4" in encoders_output or not encoders_output:
+        candidates.append("mpeg4")
 
     candidates.append("libx264")
 
@@ -125,13 +128,16 @@ def _linux_encoder_args(encoder_name: str, bitrate: str, bufsize: str):
             "-g", "60",
         ]
 
-    if encoder_name == "h264_v4l2m2m":
+    if encoder_name == "mpeg4":
         return [
-            "-vf", "format=nv12",
-            "-c:v", "h264_v4l2m2m",
+            "-c:v", "mpeg4",
             "-b:v", bitrate,
             "-maxrate", bitrate,
             "-bufsize", bufsize,
+            "-qmin", "3",
+            "-qmax", "8",
+            "-bf", "0",
+            "-pix_fmt", "yuv420p",
             "-g", "60",
         ]
 
@@ -168,8 +174,11 @@ def _start_linux_ffmpeg(video_size: str, fps: str, output_file: str,
 
     attempted_encoders = []
     log_file = open("ffmpeg.log", "w")
+    candidates = _linux_encoder_candidates()
+    log_file.write(f"[INFO] Encoder candidates: {', '.join(candidates)}\n")
+    log_file.flush()
 
-    for encoder_name in _linux_encoder_candidates():
+    for encoder_name in candidates:
         attempted_encoders.append(encoder_name)
         command = _build_linux_command(
             video_size,
