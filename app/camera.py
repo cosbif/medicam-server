@@ -29,6 +29,17 @@ LEGACY_RESOLUTION_MAP = {
 
 SUPPORTED_FPS = {"30", "60"}
 
+BITRATE_PRESETS = {
+    ("SD", "30"): ("2M", "4M"),
+    ("SD", "60"): ("3M", "6M"),
+    ("HD", "30"): ("4M", "8M"),
+    ("HD", "60"): ("6M", "12M"),
+    ("FHD", "30"): ("8M", "16M"),
+    ("FHD", "60"): ("12M", "24M"),
+}
+
+_linux_encoder_cache = None
+
 
 def _normalize_settings(settings: dict | None):
     settings = settings or {}
@@ -46,6 +57,61 @@ def _normalize_settings(settings: dict | None):
         "resolution": resolution,
         "fps": fps,
     }
+
+
+def _bitrate_profile(resolution_key: str, fps: str):
+    return BITRATE_PRESETS.get((resolution_key, fps), ("8M", "16M"))
+
+
+def _probe_ffmpeg_encoders():
+    try:
+        return subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to probe ffmpeg encoders: {e}")
+        return ""
+
+
+def _select_linux_encoder():
+    global _linux_encoder_cache
+
+    if _linux_encoder_cache is not None:
+        return _linux_encoder_cache
+
+    encoders_output = _probe_ffmpeg_encoders()
+    for encoder_name in ("h264_rkmpp", "h264_v4l2m2m"):
+        if encoder_name in encoders_output:
+            _linux_encoder_cache = encoder_name
+            print(f"[INFO] Using hardware encoder: {encoder_name}")
+            return _linux_encoder_cache
+
+    _linux_encoder_cache = "libx264"
+    print("[INFO] Hardware encoder not found, fallback to libx264")
+    return _linux_encoder_cache
+
+
+def _linux_encoder_args(encoder_name: str, bitrate: str, bufsize: str):
+    if encoder_name in {"h264_rkmpp", "h264_v4l2m2m"}:
+        return [
+            "-vf", "format=nv12",
+            "-c:v", encoder_name,
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
+            "-bufsize", bufsize,
+            "-g", "60",
+        ]
+
+    return [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "30",
+        "-pix_fmt", "yuv420p",
+        "-g", "60",
+    ]
 
 
 
@@ -67,11 +133,15 @@ def start_recording():
     
     resolution_key = camera_settings.get("resolution", "FHD")
     video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
+    fps = camera_settings["fps"]
+    bitrate, bufsize = _bitrate_profile(resolution_key, fps)
 
     if not video_size:
         # fallback + лог
         print(f"[WARN] Unsupported resolution preset: {resolution_key}, fallback to FHD")
+        resolution_key = "FHD"
         video_size = SUPPORTED_RESOLUTIONS["FHD"]
+        bitrate, bufsize = _bitrate_profile(resolution_key, fps)
 
     system = platform.system()
     output_file = utils.get_output_filename()
@@ -93,20 +163,18 @@ def start_recording():
         ]
 
     elif system == "Linux":
+        encoder_name = _select_linux_encoder()
         command = [
             "ffmpeg",
             "-y",
+            "-thread_queue_size", "1024",
     
             "-f", "v4l2",
             "-input_format", "mjpeg",
-            "-framerate", camera_settings["fps"],
+            "-framerate", fps,
             "-video_size", video_size,
             "-i", "/dev/video0",
-
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-pix_fmt", "yuv420p",
+            *_linux_encoder_args(encoder_name, bitrate, bufsize),
 
             "-movflags", "+faststart",
             output_file
@@ -118,7 +186,12 @@ def start_recording():
     try:
         log_file = open("ffmpeg.log", "w")
         ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_file, stderr=log_file)
-        return {"status": "recording_started", "file": output_file}
+        return {
+            "status": "recording_started",
+            "file": output_file,
+            "encoder": encoder_name if system == "Linux" else "libx264",
+            "bitrate": bitrate if system == "Linux" else None,
+        }
     except Exception as e:
         ffmpeg_process = None
         return {"status": "error", "details": str(e)}
