@@ -22,7 +22,7 @@ FFMPEG_STOP_TIMEOUT = 10.0
 
 camera_settings = {
     "resolution": "FHD",
-    "fps": "30",
+    "fps": "60",
 }
 
 # FullHD is intentionally the maximum supported resolution. The camera exposes
@@ -37,7 +37,8 @@ LEGACY_RESOLUTION_MAP = {
     value: key for key, value in SUPPORTED_RESOLUTIONS.items()
 }
 
-SUPPORTED_FPS = {"30", "60"}
+SUPPORTED_FPS = {"60"}
+LEGACY_FPS_MAP = {"30": "60"}
 
 ffmpeg_process = None
 ffmpeg_log_file = None
@@ -54,8 +55,9 @@ def _normalize_settings(settings: dict | None):
         resolution = "FHD"
 
     fps = str(settings.get("fps", camera_settings["fps"]))
+    fps = LEGACY_FPS_MAP.get(fps, fps)
     if fps not in SUPPORTED_FPS:
-        fps = "30"
+        fps = "60"
 
     return {
         "resolution": resolution,
@@ -104,21 +106,13 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
 
 def _build_linux_command(video_size: str, fps: str, output_file: str,
                          camera_device: str):
-    # The camera's native 30 fps mode periodically stalls. Its 60 fps MJPEG
-    # mode is stable, so 30 fps capture uses that mode and discards every
-    # second compressed packet without decoding or re-encoding it.
-    camera_fps = "60" if fps == "30" else fps
-    frame_rate_filter = (
-        ["-bsf:v", r"noise=drop=not(mod(n\,2))"] if fps == "30" else []
-    )
-
     return [
         "ffmpeg",
         "-hide_banner",
         "-y",
         "-f", "v4l2",
         "-input_format", "mjpeg",
-        "-framerate", camera_fps,
+        "-framerate", fps,
         "-video_size", video_size,
         "-i", camera_device,
         "-map", "0:v:0",
@@ -127,7 +121,6 @@ def _build_linux_command(video_size: str, fps: str, output_file: str,
         # decoding, colorspace conversion and re-encoding, which could process
         # FullHD at only ~0.43x realtime on the Radxa.
         "-c:v", "copy",
-        *frame_rate_filter,
         "-movflags", "+faststart",
         output_file,
     ]
@@ -217,7 +210,7 @@ def start_recording():
 
         resolution_key = camera_settings.get("resolution", "FHD")
         video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
-        fps = str(camera_settings.get("fps", "30"))
+        fps = str(camera_settings.get("fps", "60"))
         if not video_size or fps not in SUPPORTED_FPS:
             normalized = _normalize_settings(camera_settings)
             camera_settings.update(normalized)
@@ -355,6 +348,7 @@ def update_settings(resolution: str = None, fps: str = None):
 
     if fps:
         fps = str(fps)
+        fps = LEGACY_FPS_MAP.get(fps, fps)
         if fps not in SUPPORTED_FPS:
             raise HTTPException(
                 status_code=400,
