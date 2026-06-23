@@ -44,6 +44,7 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("libx264", command)
         self.assertNotIn("mpeg4", command)
         self.assertNotIn("h264_rkmpp", command)
+        self.assertNotIn("-thread_queue_size", command)
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
 
 
