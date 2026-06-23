@@ -46,6 +46,19 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("h264_rkmpp", command)
         self.assertNotIn("-thread_queue_size", command)
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
+        self.assertEqual(command[command.index("-framerate") + 1], "60")
+        self.assertIn("-bsf:v", command)
+
+    def test_native_60_fps_capture_does_not_drop_packets(self):
+        command = camera._build_linux_command(
+            "1920x1080",
+            "60",
+            "videos/test.mp4",
+            "/dev/v4l/by-id/camera-video-index0",
+        )
+
+        self.assertEqual(command[command.index("-framerate") + 1], "60")
+        self.assertNotIn("-bsf:v", command)
 
 
 class CameraLifecycleTests(unittest.TestCase):

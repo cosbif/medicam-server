@@ -104,13 +104,21 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
 
 def _build_linux_command(video_size: str, fps: str, output_file: str,
                          camera_device: str):
+    # The camera's native 30 fps mode periodically stalls. Its 60 fps MJPEG
+    # mode is stable, so 30 fps capture uses that mode and discards every
+    # second compressed packet without decoding or re-encoding it.
+    camera_fps = "60" if fps == "30" else fps
+    frame_rate_filter = (
+        ["-bsf:v", r"noise=drop=not(mod(n\,2))"] if fps == "30" else []
+    )
+
     return [
         "ffmpeg",
         "-hide_banner",
         "-y",
         "-f", "v4l2",
         "-input_format", "mjpeg",
-        "-framerate", fps,
+        "-framerate", camera_fps,
         "-video_size", video_size,
         "-i", camera_device,
         "-map", "0:v:0",
@@ -119,6 +127,7 @@ def _build_linux_command(video_size: str, fps: str, output_file: str,
         # decoding, colorspace conversion and re-encoding, which could process
         # FullHD at only ~0.43x realtime on the Radxa.
         "-c:v", "copy",
+        *frame_rate_filter,
         "-movflags", "+faststart",
         output_file,
     ]
