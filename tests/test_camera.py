@@ -19,20 +19,20 @@ class CameraSettingsTests(unittest.TestCase):
 
     def test_removed_resolution_is_normalized_to_fullhd(self):
         self.assertEqual(
-            camera._normalize_settings({"resolution": "3840x2160", "fps": "60"}),
-            {"resolution": "FHD", "fps": "60"},
+            camera._normalize_settings({"resolution": "3840x2160", "fps": "15"}),
+            {"resolution": "FHD", "fps": "15"},
         )
 
     def test_legacy_fullhd_value_is_supported(self):
         self.assertEqual(
             camera._normalize_settings({"resolution": "1920x1080", "fps": 60}),
-            {"resolution": "FHD", "fps": "60"},
+            {"resolution": "FHD", "fps": "15"},
         )
 
-    def test_legacy_30_fps_value_is_normalized_to_stable_60_fps(self):
+    def test_legacy_fps_values_are_normalized_to_stable_15_fps(self):
         self.assertEqual(
             camera._normalize_settings({"resolution": "FHD", "fps": "30"}),
-            {"resolution": "FHD", "fps": "60"},
+            {"resolution": "FHD", "fps": "15"},
         )
 
 
@@ -40,7 +40,7 @@ class CameraCommandTests(unittest.TestCase):
     def test_linux_command_copies_camera_mjpeg_without_reencoding(self):
         command = camera._build_linux_command(
             "1920x1080",
-            "60",
+            "15",
             "videos/test.mp4",
             "/dev/v4l/by-id/camera-video-index0",
         )
@@ -52,8 +52,9 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("h264_rkmpp", command)
         self.assertNotIn("-thread_queue_size", command)
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
-        self.assertEqual(command[command.index("-framerate") + 1], "60")
+        self.assertEqual(command[command.index("-framerate") + 1], "15")
         self.assertNotIn("-bsf:v", command)
+        self.assertNotIn("+faststart", command)
 
 
 class CameraLifecycleTests(unittest.TestCase):
