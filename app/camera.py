@@ -1,27 +1,36 @@
-'''app/camera.py'''
-from fastapi import HTTPException
-import subprocess
-import platform
-import os
-import time
-from app import utils
-import json
+'''Camera settings and video recording lifecycle.'''
 
-ffmpeg_process = None
+from fastapi import HTTPException
+import glob
+import json
+import os
+import platform
+import shlex
+import stat
+import subprocess
+import threading
+import time
+
+from app import utils
+
 
 SETTINGS_FILE = "camera_settings.json"
+FFMPEG_LOG_FILE = "ffmpeg.log"
+CAMERA_DISCOVERY_TIMEOUT = 3.0
+FFMPEG_STARTUP_DELAY = 1.0
+FFMPEG_STOP_TIMEOUT = 10.0
 
 camera_settings = {
     "resolution": "FHD",
-    "fps": "30"
+    "fps": "30",
 }
 
+# FullHD is intentionally the maximum supported resolution. The camera exposes
+# FullHD MJPEG at 30/60 fps, while uncompressed YUYV is limited to 5 fps.
 SUPPORTED_RESOLUTIONS = {
     "SD": "640x360",
     "HD": "1280x720",
     "FHD": "1920x1080",
-    "2K": "2688x1512",
-    "4K": "3840x2160",
 }
 
 LEGACY_RESOLUTION_MAP = {
@@ -30,16 +39,10 @@ LEGACY_RESOLUTION_MAP = {
 
 SUPPORTED_FPS = {"30", "60"}
 
-BITRATE_PRESETS = {
-    ("SD", "30"): ("2M", "4M"),
-    ("SD", "60"): ("3M", "6M"),
-    ("HD", "30"): ("4M", "8M"),
-    ("HD", "60"): ("6M", "12M"),
-    ("FHD", "30"): ("8M", "16M"),
-    ("FHD", "60"): ("12M", "24M"),
-}
-
-_linux_encoder_cache = None
+ffmpeg_process = None
+ffmpeg_log_file = None
+recording_output_file = None
+recording_lock = threading.Lock()
 
 
 def _normalize_settings(settings: dict | None):
@@ -60,270 +63,277 @@ def _normalize_settings(settings: dict | None):
     }
 
 
-def _bitrate_profile(resolution_key: str, fps: str):
-    return BITRATE_PRESETS.get((resolution_key, fps), ("8M", "16M"))
-
-
-def _probe_ffmpeg_encoders():
+def _is_character_device(path: str) -> bool:
     try:
-        return subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-    except Exception as e:
-        print(f"[WARN] Failed to probe ffmpeg encoders: {e}")
-        return ""
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except OSError:
+        return False
 
 
-def _probe_ffmpeg_version():
-    try:
-        return subprocess.check_output(
-            ["ffmpeg", "-version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-    except Exception as e:
-        print(f"[WARN] Failed to probe ffmpeg version: {e}")
-        return ""
+def _camera_candidates():
+    configured_device = os.environ.get("MEDICAM_CAMERA_DEVICE")
+    if configured_device:
+        return [configured_device]
+
+    # The by-id link follows the UVC capture node even when /dev/videoN changes
+    # after a USB reconnect. video-index0 is the image stream; index1 is metadata.
+    candidates = sorted(glob.glob("/dev/v4l/by-id/*-video-index0"))
+    candidates.extend(sorted(glob.glob("/dev/video[0-9]*")))
+
+    deduplicated = []
+    seen_targets = set()
+    for path in candidates:
+        real_path = os.path.realpath(path)
+        if real_path not in seen_targets:
+            seen_targets.add(real_path)
+            deduplicated.append(path)
+    return deduplicated
 
 
-def _linux_encoder_candidates():
-    global _linux_encoder_cache
+def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while True:
+        for path in _camera_candidates():
+            if _is_character_device(path):
+                return path
 
-    encoders_output = _probe_ffmpeg_encoders()
-    version_output = _probe_ffmpeg_version()
-
-    candidates = []
-    if _linux_encoder_cache:
-        candidates.append(_linux_encoder_cache)
-
-    # На Radxa имеет смысл пробовать RKMPP даже если encoder не попал в
-    # список из-за кривой/смешанной сборки ffmpeg.
-    if "--enable-rkmpp" in version_output or "h264_rkmpp" in encoders_output:
-        candidates.append("h264_rkmpp")
-
-    # Легкий software fallback. Обычно заметно быстрее libx264 на слабом ARM.
-    if "mpeg4" in encoders_output or not encoders_output:
-        candidates.append("mpeg4")
-
-    candidates.append("libx264")
-
-    deduped_candidates = []
-    for encoder_name in candidates:
-        if encoder_name not in deduped_candidates:
-            deduped_candidates.append(encoder_name)
-
-    return deduped_candidates
-
-
-def _linux_encoder_args(encoder_name: str, bitrate: str, bufsize: str):
-    if encoder_name == "h264_rkmpp":
-        return [
-            "-vf", "format=nv12",
-            "-c:v", "h264_rkmpp",
-            "-b:v", bitrate,
-            "-maxrate", bitrate,
-            "-bufsize", bufsize,
-            "-g", "60",
-        ]
-
-    if encoder_name == "mpeg4":
-        return [
-            "-c:v", "mpeg4",
-            "-b:v", bitrate,
-            "-maxrate", bitrate,
-            "-bufsize", bufsize,
-            "-qmin", "3",
-            "-qmax", "8",
-            "-bf", "0",
-            "-pix_fmt", "yuv420p",
-            "-g", "60",
-        ]
-
-    return [
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-crf", "30",
-        "-pix_fmt", "yuv420p",
-        "-g", "60",
-    ]
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
 
 
 def _build_linux_command(video_size: str, fps: str, output_file: str,
-                         encoder_name: str, bitrate: str, bufsize: str):
+                         camera_device: str):
     return [
         "ffmpeg",
+        "-hide_banner",
         "-y",
-        "-thread_queue_size", "1024",
+        "-thread_queue_size", "512",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", fps,
         "-video_size", video_size,
-        "-i", "/dev/video0",
-        *_linux_encoder_args(encoder_name, bitrate, bufsize),
+        "-i", camera_device,
+        "-map", "0:v:0",
+        "-an",
+        # The UVC camera already produces compressed MJPEG. Stream copy avoids
+        # decoding, colorspace conversion and re-encoding, which could process
+        # FullHD at only ~0.43x realtime on the Radxa.
+        "-c:v", "copy",
         "-movflags", "+faststart",
-        output_file
+        output_file,
     ]
 
 
-def _start_linux_ffmpeg(video_size: str, fps: str, output_file: str,
-                        bitrate: str, bufsize: str):
-    global _linux_encoder_cache
+def _build_windows_command(video_size: str, fps: str, output_file: str):
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-f", "dshow",
+        "-framerate", fps,
+        "-video_size", video_size,
+        "-vcodec", "mjpeg",
+        "-i", "video=AT025",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        output_file,
+    ]
 
-    attempted_encoders = []
-    log_file = open("ffmpeg.log", "w")
-    candidates = _linux_encoder_candidates()
-    log_file.write(f"[INFO] Encoder candidates: {', '.join(candidates)}\n")
-    log_file.flush()
 
-    for encoder_name in candidates:
-        attempted_encoders.append(encoder_name)
-        command = _build_linux_command(
-            video_size,
-            fps,
-            output_file,
-            encoder_name,
-            bitrate,
-            bufsize,
-        )
+def _close_process_resources(process):
+    global ffmpeg_log_file
 
-        log_file.write(f"[INFO] Trying encoder: {encoder_name}\n")
-        log_file.flush()
-        print(f"[INFO] Trying encoder: {encoder_name}")
+    if process is not None and process.stdin is not None:
+        try:
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=log_file,
-            stderr=log_file,
-        )
+    if ffmpeg_log_file is not None:
+        try:
+            ffmpeg_log_file.close()
+        finally:
+            ffmpeg_log_file = None
 
-        time.sleep(1.5)
-        if process.poll() is None:
-            _linux_encoder_cache = encoder_name
-            return process, encoder_name
 
-        log_file.write(
-            f"[WARN] Encoder {encoder_name} exited immediately with code {process.returncode}\n"
-        )
-        log_file.flush()
-        print(
-            f"[WARN] Encoder {encoder_name} exited immediately with code {process.returncode}"
-        )
+def _clear_recording_state():
+    global ffmpeg_process, recording_output_file
 
-    log_file.close()
-    return None, attempted_encoders
+    ffmpeg_process = None
+    recording_output_file = None
 
+
+def _remove_file(path: str | None):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _log_tail(max_lines: int = 20):
+    try:
+        with open(FFMPEG_LOG_FILE, "r", encoding="utf-8", errors="replace") as log:
+            return "".join(log.readlines()[-max_lines:]).strip()
+    except OSError:
+        return ""
 
 
 if os.path.exists(SETTINGS_FILE):
     try:
-        with open(SETTINGS_FILE, "r") as f:
-            camera_settings.update(_normalize_settings(json.load(f)))
-    except Exception:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
+            camera_settings.update(_normalize_settings(json.load(settings_file)))
+    except (OSError, json.JSONDecodeError, TypeError):
         pass
 
-# -------------------
-# 📼 Запись
-# -------------------
+
 def start_recording():
-    global ffmpeg_process
+    global ffmpeg_process, ffmpeg_log_file, recording_output_file
 
-    if ffmpeg_process is not None:
-        return {"status": "already_recording"}
-    
-    resolution_key = camera_settings.get("resolution", "FHD")
-    video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
-    fps = camera_settings["fps"]
-    bitrate, bufsize = _bitrate_profile(resolution_key, fps)
+    with recording_lock:
+        if ffmpeg_process is not None:
+            if ffmpeg_process.poll() is None:
+                return {
+                    "status": "already_recording",
+                    "file": recording_output_file,
+                }
 
-    if not video_size:
-        # fallback + лог
-        print(f"[WARN] Unsupported resolution preset: {resolution_key}, fallback to FHD")
-        resolution_key = "FHD"
-        video_size = SUPPORTED_RESOLUTIONS["FHD"]
-        bitrate, bufsize = _bitrate_profile(resolution_key, fps)
+            # A disconnected camera can terminate FFmpeg between API calls.
+            # Reap that process and allow the next /start request to recover.
+            _close_process_resources(ffmpeg_process)
+            _clear_recording_state()
 
-    system = platform.system()
-    output_file = utils.get_output_filename()
+        resolution_key = camera_settings.get("resolution", "FHD")
+        video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
+        fps = str(camera_settings.get("fps", "30"))
+        if not video_size or fps not in SUPPORTED_FPS:
+            normalized = _normalize_settings(camera_settings)
+            camera_settings.update(normalized)
+            resolution_key = normalized["resolution"]
+            video_size = SUPPORTED_RESOLUTIONS[resolution_key]
+            fps = normalized["fps"]
 
-    try:
-        if system == "Windows":
-            command = [
-                "ffmpeg",
-                "-y",
-                "-f", "dshow",
-                "-framerate", camera_settings["fps"],
-                "-video_size", video_size,
-                "-vcodec", "mjpeg",
-                "-i", "video=AT025",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                output_file
-            ]
-            log_file = open("ffmpeg.log", "w")
-            ffmpeg_process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=log_file,
-                stderr=log_file,
-            )
-            encoder_name = "libx264"
+        system = platform.system()
+        output_file = utils.get_output_filename()
 
-        elif system == "Linux":
-            ffmpeg_process, encoder_result = _start_linux_ffmpeg(
+        if system == "Linux":
+            camera_device = _find_linux_camera_device()
+            if camera_device is None:
+                _remove_file(output_file)
+                return {
+                    "status": "error",
+                    "details": "Camera capture device is not available",
+                }
+            command = _build_linux_command(
                 video_size,
                 fps,
                 output_file,
-                bitrate,
-                bufsize,
+                camera_device,
             )
-            if ffmpeg_process is None:
-                return {
-                    "status": "error",
-                    "details": (
-                        "Failed to start ffmpeg with encoders: "
-                        + ", ".join(encoder_result)
-                    ),
-                }
-            encoder_name = encoder_result
-
+            capture_format = "mjpeg_copy"
+        elif system == "Windows":
+            camera_device = "video=AT025"
+            command = _build_windows_command(video_size, fps, output_file)
+            capture_format = "h264"
         else:
-            return {"status": f"Unsupported OS: {system}"}
+            _remove_file(output_file)
+            return {"status": "error", "details": f"Unsupported OS: {system}"}
+
+        try:
+            ffmpeg_log_file = open(FFMPEG_LOG_FILE, "w", encoding="utf-8")
+            ffmpeg_log_file.write(
+                f"[INFO] Camera device: {camera_device}\n"
+                f"[INFO] Capture: {video_size} @ {fps} fps, format={capture_format}\n"
+                f"[INFO] Command: {shlex.join(command)}\n"
+            )
+            ffmpeg_log_file.flush()
+            ffmpeg_process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=ffmpeg_log_file,
+                stderr=ffmpeg_log_file,
+            )
+            recording_output_file = output_file
+        except (OSError, subprocess.SubprocessError) as error:
+            _close_process_resources(ffmpeg_process)
+            _clear_recording_state()
+            _remove_file(output_file)
+            return {"status": "error", "details": str(error)}
+
+        time.sleep(FFMPEG_STARTUP_DELAY)
+        return_code = ffmpeg_process.poll()
+        if return_code is not None:
+            _close_process_resources(ffmpeg_process)
+            details = _log_tail()
+            _clear_recording_state()
+            _remove_file(output_file)
+            return {
+                "status": "error",
+                "details": details or f"FFmpeg exited with code {return_code}",
+            }
 
         return {
             "status": "recording_started",
             "file": output_file,
-            "encoder": encoder_name,
-            "bitrate": bitrate if system == "Linux" else None,
+            "format": capture_format,
+            "device": camera_device,
+            "resolution": video_size,
+            "fps": fps,
         }
-    except Exception as e:
-        ffmpeg_process = None
-        return {"status": "error", "details": str(e)}
+
 
 def stop_recording():
     global ffmpeg_process
 
-    if ffmpeg_process:
-        if ffmpeg_process.poll() is None:
+    with recording_lock:
+        if ffmpeg_process is None:
+            return {"status": "no_recording_running"}
+
+        process = ffmpeg_process
+        output_file = recording_output_file
+        return_code = process.poll()
+        warning = None
+
+        if return_code is None:
             try:
-                ffmpeg_process.stdin.write(b"q\n")
-                ffmpeg_process.stdin.flush()
-                ffmpeg_process.wait(timeout=5)
-            except Exception as e:
-                print(f"Ошибка при остановке FFmpeg: {e}")
-                ffmpeg_process.kill()
-        ffmpeg_process = None
-        return {"status": "recording_stopped"}
-    else:
-        return {"status": "no_recording_running"}
+                process.stdin.write(b"q\n")
+                process.stdin.flush()
+                return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                warning = "FFmpeg did not stop cleanly and was terminated"
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    return_code = process.poll()
+                try:
+                    if return_code is None:
+                        return_code = process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return_code = process.wait(timeout=3)
+        else:
+            warning = f"FFmpeg had already exited with code {return_code}"
+
+        _close_process_resources(process)
+        _clear_recording_state()
+
+        response = {
+            "status": "recording_stopped",
+            "file": output_file,
+            "returncode": return_code,
+        }
+        if warning:
+            response["warning"] = warning
+        return response
+
 
 def get_settings():
     return camera_settings
+
 
 def update_settings(resolution: str = None, fps: str = None):
     if resolution:
@@ -331,7 +341,7 @@ def update_settings(resolution: str = None, fps: str = None):
         if resolution not in SUPPORTED_RESOLUTIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported resolution preset: {resolution}"
+                detail=f"Unsupported resolution preset: {resolution}",
             )
         camera_settings["resolution"] = resolution
 
@@ -340,11 +350,11 @@ def update_settings(resolution: str = None, fps: str = None):
         if fps not in SUPPORTED_FPS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported fps preset: {fps}"
+                detail=f"Unsupported fps preset: {fps}",
             )
         camera_settings["fps"] = fps
 
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(camera_settings, f)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
+        json.dump(camera_settings, settings_file)
 
     return camera_settings

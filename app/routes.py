@@ -29,11 +29,11 @@ async def ping():
 # 📼 Запись
 # -------------------
 @router.post("/start")
-async def start_recording(_ok: bool = Depends(require_provisioned)):
+def start_recording(_ok: bool = Depends(require_provisioned)):
     return camera.start_recording()
 
 @router.post("/stop")
-async def stop_recording(_ok: bool = Depends(require_provisioned)):
+def stop_recording(_ok: bool = Depends(require_provisioned)):
     return camera.stop_recording()
     
 # -------------------
