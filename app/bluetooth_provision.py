@@ -240,6 +240,29 @@ class ProvisionService:
         except Exception as e:
             print("[WARN] _set_response notify block error:", e)
 
+    def _set_response_async(self, response_dict, request_id=None):
+        threading.Thread(
+            target=self._set_response,
+            args=(response_dict,),
+            kwargs={"request_id": request_id},
+            daemon=True,
+        ).start()
+
+    def _dispatch_command(self, data):
+        """
+        Handle commands outside BlueZ's WriteValue callback.
+
+        Calling _set_response() synchronously from WriteValue can make BlueZ
+        wait on a nested D-Bus characteristic update before it sends the ATT
+        Write Response. iOS then times out the write. Returning from the write
+        callback immediately keeps the GATT transaction healthy.
+        """
+        threading.Thread(
+            target=self._handle_command,
+            args=(data,),
+            daemon=True,
+        ).start()
+
     def _status_payload(self):
         return {
             "status": "ok",
@@ -307,7 +330,7 @@ class ProvisionService:
 
             if len(self._cmd_buffer) > MAX_COMMAND_BYTES:
                 self._cmd_buffer.clear()
-                self._set_response({"error": "command_too_large"})
+                self._set_response_async({"error": "command_too_large"})
                 return
 
             handled = False
@@ -318,7 +341,7 @@ class ProvisionService:
                 if not raw_message:
                     continue
                 data = json.loads(raw_message.decode("utf-8"))
-                self._handle_command(data)
+                self._dispatch_command(data)
                 handled = True
 
             if handled:
@@ -333,10 +356,10 @@ class ProvisionService:
                 return
 
             self._cmd_buffer.clear()
-            self._handle_command(data)
+            self._dispatch_command(data)
         except Exception as e:
             print("[ERR] on_command top-level:", e, traceback.format_exc())
-            self._set_response({"error": str(e)})
+            self._set_response_async({"error": str(e)})
 
     def _handle_command(self, data):
         if not isinstance(data, dict):

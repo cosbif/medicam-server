@@ -94,6 +94,25 @@ class ProvisionFileTests(unittest.TestCase):
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
+    def test_on_command_dispatches_complete_messages_outside_write_callback(self):
+        service = object.__new__(ProvisionService)
+        service._cmd_buffer = bytearray()
+        dispatched = []
+
+        service._dispatch_command = dispatched.append
+        service._set_response_async = Mock()
+
+        service.on_command(
+            list(b'{"cmd":"STATUS","request_id":"req-1"}\n'),
+            {},
+        )
+
+        self.assertEqual(
+            dispatched,
+            [{"cmd": "STATUS", "request_id": "req-1"}],
+        )
+        service._set_response_async.assert_not_called()
+
     def test_scan_wifi_parses_nmcli_output(self):
         service = object.__new__(ProvisionService)
         completed = subprocess.CompletedProcess(
