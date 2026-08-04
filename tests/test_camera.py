@@ -20,13 +20,23 @@ class CameraSettingsTests(unittest.TestCase):
     def test_removed_resolution_is_normalized_to_fullhd(self):
         self.assertEqual(
             camera._normalize_settings({"resolution": "3840x2160", "fps": "30"}),
-            {"resolution": "FHD", "fps": "30"},
+            {
+                "resolution": "FHD",
+                "fps": "30",
+                "audio_enabled": True,
+                "audio_device": "auto",
+            },
         )
 
     def test_legacy_fullhd_value_is_supported(self):
         self.assertEqual(
             camera._normalize_settings({"resolution": "1920x1080", "fps": 60}),
-            {"resolution": "FHD", "fps": "30"},
+            {
+                "resolution": "FHD",
+                "fps": "30",
+                "audio_enabled": True,
+                "audio_device": "auto",
+            },
         )
 
     def test_legacy_fps_values_are_normalized_to_30_fps(self):
@@ -34,8 +44,31 @@ class CameraSettingsTests(unittest.TestCase):
             with self.subTest(fps=fps):
                 self.assertEqual(
                     camera._normalize_settings({"resolution": "FHD", "fps": fps}),
-                    {"resolution": "FHD", "fps": "30"},
+                    {
+                        "resolution": "FHD",
+                        "fps": "30",
+                        "audio_enabled": True,
+                        "audio_device": "auto",
+                    },
                 )
+
+    def test_audio_settings_are_normalized(self):
+        self.assertEqual(
+            camera._normalize_settings(
+                {
+                    "resolution": "FHD",
+                    "fps": "30",
+                    "audio_enabled": "off",
+                    "audio_device": "  plughw:CARD=Mic,DEV=0  ",
+                }
+            ),
+            {
+                "resolution": "FHD",
+                "fps": "30",
+                "audio_enabled": False,
+                "audio_device": "plughw:CARD=Mic,DEV=0",
+            },
+        )
 
 
 class CameraCommandTests(unittest.TestCase):
@@ -76,17 +109,51 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("-bsf:v", command)
         self.assertNotIn("+faststart", command)
 
+    def test_linux_ffmpeg_command_adds_synchronized_aac_without_video_reencoding(self):
+        command = camera._build_linux_command(
+            "videos/test.mp4.mjpeg",
+            "30",
+            "videos/test.mp4",
+            audio_file="videos/test.mp4.wav",
+            audio_start_delay=0.125,
+        )
+
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertEqual(command[command.index("-c:a") + 1], "aac")
+        self.assertEqual(command[command.index("-b:a") + 1], "128k")
+        self.assertEqual(command[command.index("-ar") + 1], "48000")
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertEqual(command[command.index("-itsoffset") + 1], "0.125000")
+        self.assertIn("aresample=async=1:first_pts=0", command)
+        self.assertIn("-shortest", command)
+        self.assertNotIn("-an", command)
+        self.assertNotIn("libx264", command)
+
 
 class CameraLifecycleTests(unittest.TestCase):
     def setUp(self):
+        camera.capture_process = None
+        camera.audio_process = None
         camera.ffmpeg_process = None
         camera.ffmpeg_log_file = None
         camera.recording_output_file = None
+        camera.recording_raw_file = None
+        camera.recording_audio_file = None
+        camera.recording_audio_device = None
+        camera.recording_audio_start_delay = 0.0
+        camera.recording_remux_command = None
 
     def tearDown(self):
+        camera.capture_process = None
+        camera.audio_process = None
         camera.ffmpeg_process = None
         camera.ffmpeg_log_file = None
         camera.recording_output_file = None
+        camera.recording_raw_file = None
+        camera.recording_audio_file = None
+        camera.recording_audio_device = None
+        camera.recording_audio_start_delay = 0.0
+        camera.recording_remux_command = None
 
     @patch("app.camera.utils.get_output_filename", return_value="videos/test.mp4")
     @patch("app.camera._find_linux_camera_device", return_value=None)

@@ -80,8 +80,8 @@ def get_video_metadata(filepath: str):
         # получаем JSON-вывод ffprobe для устойчивого парсинга
         cmd = [
             "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate",
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height,r_frame_rate,channels,sample_rate",
             "-show_entries", "format=duration",
             "-of", "json",
             filepath
@@ -90,12 +90,20 @@ def get_video_metadata(filepath: str):
         result = subprocess.check_output(cmd, text=True, timeout=5)
         data = _json.loads(result)
 
-        stream = data.get("streams", [{}])[0]
+        streams = data.get("streams", [])
+        video_stream = next(
+            (stream for stream in streams if stream.get("codec_type") == "video"),
+            {},
+        )
+        audio_stream = next(
+            (stream for stream in streams if stream.get("codec_type") == "audio"),
+            None,
+        )
         fmt = data.get("format", {})
 
-        width = stream.get("width")
-        height = stream.get("height")
-        r_frame_rate = stream.get("r_frame_rate", "0/1")
+        width = video_stream.get("width")
+        height = video_stream.get("height")
+        r_frame_rate = video_stream.get("r_frame_rate", "0/1")
         nums = r_frame_rate.split("/")
         fps = float(nums[0]) / float(nums[1]) if len(nums) == 2 and float(nums[1]) != 0 else 0.0
 
@@ -104,7 +112,13 @@ def get_video_metadata(filepath: str):
         metadata = {
             "resolution": f"{width}x{height}" if width and height else "",
             "fps": round(fps, 2),
-            "duration": round(duration, 2)
+            "duration": round(duration, 2),
+            "has_audio": audio_stream is not None,
+            "audio_codec": audio_stream.get("codec_name", "") if audio_stream else "",
+            "audio_channels": audio_stream.get("channels", 0) if audio_stream else 0,
+            "audio_sample_rate": int(audio_stream.get("sample_rate", 0))
+            if audio_stream and str(audio_stream.get("sample_rate", "")).isdigit()
+            else 0,
         }
         if len(_VIDEO_METADATA_CACHE) >= VIDEO_METADATA_CACHE_LIMIT:
             _VIDEO_METADATA_CACHE.clear()

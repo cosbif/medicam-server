@@ -154,10 +154,18 @@ class ProvisionFileTests(unittest.TestCase):
                 {
                     "streams": [
                         {
+                            "codec_type": "video",
+                            "codec_name": "mjpeg",
                             "width": 1920,
                             "height": 1080,
                             "r_frame_rate": "30/1",
-                        }
+                        },
+                        {
+                            "codec_type": "audio",
+                            "codec_name": "aac",
+                            "channels": 1,
+                            "sample_rate": "48000",
+                        },
                     ],
                     "format": {"duration": "10.0"},
                 }
@@ -172,6 +180,12 @@ class ProvisionFileTests(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertEqual(check_output.call_count, 1)
+            self.assertEqual(first["resolution"], "1920x1080")
+            self.assertEqual(first["fps"], 30.0)
+            self.assertTrue(first["has_audio"])
+            self.assertEqual(first["audio_codec"], "aac")
+            self.assertEqual(first["audio_channels"], 1)
+            self.assertEqual(first["audio_sample_rate"], 48000)
 
 
 class BleManagerTests(unittest.TestCase):

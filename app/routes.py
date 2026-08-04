@@ -1,7 +1,7 @@
 '''app/routes.py'''
 from fastapi import APIRouter, HTTPException, Form, Depends, Request
 from fastapi.responses import FileResponse, Response
-from app import camera, utils, updater
+from app import audio, camera, utils, updater
 import ipaddress
 import os
 import shutil
@@ -106,7 +106,13 @@ def start_recording(_ok: bool = Depends(require_api_auth)):
 @router.post("/stop")
 def stop_recording(_ok: bool = Depends(require_api_auth)):
     return camera.stop_recording()
-    
+
+
+@router.get("/recording/status")
+def recording_status(_ok: bool = Depends(require_api_auth)):
+    return camera.get_recording_status()
+
+
 # -------------------
 # 🎞 Управление видео
 # -------------------
@@ -230,8 +236,56 @@ async def get_settings(_ok: bool = Depends(require_api_auth)):
 async def update_settings(
     resolution: str = Form(None),
     fps: str = Form(None),
+    audio_enabled: bool = Form(None),
+    audio_device: str = Form(None),
     _ok: bool = Depends(require_api_auth)):
-    return camera.update_settings(resolution, fps)
+    return camera.update_settings(
+        resolution,
+        fps,
+        audio_enabled,
+        audio_device,
+    )
+
+
+# -------------------
+# 🎙️ Звук
+# -------------------
+@router.get("/audio/devices")
+async def audio_devices(_ok: bool = Depends(require_api_auth)):
+    settings = camera.get_settings()
+    devices = audio.list_capture_devices()
+    selected = audio.resolve_capture_device(settings.get("audio_device", "auto"))
+    return {
+        "enabled": bool(settings.get("audio_enabled", True)),
+        "configured_device": settings.get("audio_device", "auto"),
+        "selected_device": selected,
+        "devices": devices,
+        "format": {
+            "codec": "aac",
+            "sample_rate": audio.AUDIO_SAMPLE_RATE,
+            "channels": audio.AUDIO_CHANNELS,
+            "bitrate": audio.AUDIO_BITRATE,
+        },
+    }
+
+
+@router.post("/audio/test")
+async def audio_test(
+    device: str = Form(None),
+    duration_seconds: int = Form(2),
+    _ok: bool = Depends(require_api_auth),
+):
+    if camera.get_recording_status()["recording"]:
+        raise HTTPException(status_code=409, detail="recording_in_progress")
+    configured = device or camera.get_settings().get("audio_device", "auto")
+    try:
+        return audio.measure_audio_level(configured, duration_seconds)
+    except audio.AudioError as error:
+        status_code = 409 if error.code == "audio_device_busy" else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail=error.code,
+        ) from error
 
 
 # -------------------

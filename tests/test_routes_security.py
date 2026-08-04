@@ -72,6 +72,7 @@ class RouteSecurityTests(unittest.TestCase):
         api_token_paths = {
             "/start",
             "/stop",
+            "/recording/status",
             "/videos",
             "/videos/{filename}",
             "/download/{filename}",
@@ -79,6 +80,8 @@ class RouteSecurityTests(unittest.TestCase):
             "/videos/clear",
             "/storage",
             "/settings",
+            "/audio/devices",
+            "/audio/test",
             "/wifi",
             "/wifi/connect",
             "/wifi/status",

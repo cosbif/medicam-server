@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 
-from app import utils
+from app import audio, utils
 
 
 SETTINGS_FILE = "camera_settings.json"
@@ -25,6 +25,8 @@ FFMPEG_REMUX_TIMEOUT = 180.0
 camera_settings = {
     "resolution": "FHD",
     "fps": "30",
+    "audio_enabled": True,
+    "audio_device": "auto",
 }
 
 # FullHD is intentionally the maximum supported resolution. The Linux recorder
@@ -45,10 +47,14 @@ LEGACY_FPS_MAP = {"15": "30", "60": "30"}
 LINUX_V4L2_BUFFER_COUNT = "8"
 
 capture_process = None
+audio_process = None
 ffmpeg_process = None
 ffmpeg_log_file = None
 recording_output_file = None
 recording_raw_file = None
+recording_audio_file = None
+recording_audio_device = None
+recording_audio_start_delay = 0.0
 recording_remux_command = None
 recording_lock = threading.Lock()
 
@@ -66,9 +72,30 @@ def _normalize_settings(settings: dict | None):
     if fps not in SUPPORTED_FPS:
         fps = "30"
 
+    raw_audio_enabled = settings.get(
+        "audio_enabled",
+        camera_settings["audio_enabled"],
+    )
+    if isinstance(raw_audio_enabled, str):
+        audio_enabled = raw_audio_enabled.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        audio_enabled = bool(raw_audio_enabled)
+
+    audio_device = str(
+        settings.get("audio_device", camera_settings["audio_device"])
+        or "auto"
+    ).strip()
+
     return {
         "resolution": resolution,
         "fps": fps,
+        "audio_enabled": audio_enabled,
+        "audio_device": audio_device or "auto",
     }
 
 
@@ -135,8 +162,14 @@ def _build_linux_capture_command(
     ]
 
 
-def _build_linux_command(raw_file: str, fps: str, output_file: str):
-    return [
+def _build_linux_command(
+    raw_file: str,
+    fps: str,
+    output_file: str,
+    audio_file: str | None = None,
+    audio_start_delay: float = 0.0,
+):
+    command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
@@ -145,13 +178,32 @@ def _build_linux_command(raw_file: str, fps: str, output_file: str):
         "-f", "mjpeg",
         "-framerate", fps,
         "-i", raw_file,
+    ]
+    if audio_file:
+        if audio_start_delay > 0:
+            command.extend(["-itsoffset", f"{audio_start_delay:.6f}"])
+        command.extend(["-i", audio_file])
+
+    command.extend([
         "-map", "0:v:0",
-        "-an",
         # The UVC camera already produces compressed MJPEG. FFmpeg only remuxes
         # the raw v4l2-ctl capture into MP4; it does not decode or re-encode.
         "-c:v", "copy",
-        output_file,
-    ]
+    ])
+    if audio_file:
+        command.extend([
+            "-map", "1:a:0",
+            "-c:a", "aac",
+            "-b:a", audio.AUDIO_BITRATE,
+            "-ar", str(audio.AUDIO_SAMPLE_RATE),
+            "-ac", str(audio.AUDIO_CHANNELS),
+            "-af", "aresample=async=1:first_pts=0",
+            "-shortest",
+        ])
+    else:
+        command.append("-an")
+    command.append(output_file)
+    return command
 
 
 def _build_windows_command(video_size: str, fps: str, output_file: str):
@@ -189,13 +241,19 @@ def _close_process_resources(process):
 
 
 def _clear_recording_state():
-    global capture_process, ffmpeg_process
-    global recording_output_file, recording_raw_file, recording_remux_command
+    global capture_process, audio_process, ffmpeg_process
+    global recording_output_file, recording_raw_file, recording_audio_file
+    global recording_audio_device, recording_audio_start_delay
+    global recording_remux_command
 
     capture_process = None
+    audio_process = None
     ffmpeg_process = None
     recording_output_file = None
     recording_raw_file = None
+    recording_audio_file = None
+    recording_audio_device = None
+    recording_audio_start_delay = 0.0
     recording_remux_command = None
 
 
@@ -255,11 +313,13 @@ if os.path.exists(SETTINGS_FILE):
 
 
 def start_recording():
-    global capture_process, ffmpeg_process, ffmpeg_log_file
-    global recording_output_file, recording_raw_file, recording_remux_command
+    global capture_process, audio_process, ffmpeg_process, ffmpeg_log_file
+    global recording_output_file, recording_raw_file, recording_audio_file
+    global recording_audio_device, recording_audio_start_delay
+    global recording_remux_command
 
     with recording_lock:
-        active_process = ffmpeg_process or capture_process
+        active_process = ffmpeg_process or capture_process or audio_process
         if active_process is not None:
             if active_process.poll() is None:
                 return {
@@ -270,12 +330,14 @@ def start_recording():
             # A disconnected camera can terminate FFmpeg between API calls.
             # Reap that process and allow the next /start request to recover.
             _stop_capture_process(capture_process)
+            _stop_capture_process(audio_process)
             _close_process_resources(ffmpeg_process)
             _clear_recording_state()
 
         resolution_key = camera_settings.get("resolution", "FHD")
         video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
         fps = str(camera_settings.get("fps", "30"))
+        audio_enabled = bool(camera_settings.get("audio_enabled", True))
         if not video_size or fps not in SUPPORTED_FPS:
             normalized = _normalize_settings(camera_settings)
             camera_settings.update(normalized)
@@ -285,6 +347,9 @@ def start_recording():
 
         system = platform.system()
         output_file = utils.get_output_filename()
+        selected_audio_device = None
+        audio_file = None
+        audio_command = None
 
         if system == "Linux":
             camera_device = _find_linux_camera_device()
@@ -295,6 +360,22 @@ def start_recording():
                     "details": "Camera capture device is not available",
                 }
             raw_file = f"{output_file}.mjpeg"
+            if audio_enabled:
+                selected_audio_device = audio.resolve_capture_device(
+                    camera_settings.get("audio_device", "auto")
+                )
+                if selected_audio_device is None:
+                    _remove_file(output_file)
+                    return {
+                        "status": "error",
+                        "error_code": "audio_device_unavailable",
+                        "details": "Configured audio capture device is not available",
+                    }
+                audio_file = f"{output_file}.wav"
+                audio_command = audio.build_arecord_command(
+                    audio_file,
+                    selected_audio_device["id"],
+                )
             capture_command = _build_linux_capture_command(
                 video_size,
                 fps,
@@ -305,6 +386,7 @@ def start_recording():
                 raw_file,
                 fps,
                 output_file,
+                audio_file=audio_file,
             )
             capture_format = "v4l2_mjpeg_raw"
         elif system == "Windows":
@@ -324,7 +406,11 @@ def start_recording():
                 f"[INFO] Capture: {video_size} @ {fps} fps, format={capture_format}\n"
                 f"[INFO] Capture command: "
                 f"{shlex.join(capture_command) if capture_command else 'none'}\n"
-                f"[INFO] Remux command: {shlex.join(command)}\n"
+                f"[INFO] Audio enabled: {bool(audio_command)}\n"
+                f"[INFO] Audio device: "
+                f"{selected_audio_device['id'] if selected_audio_device else 'none'}\n"
+                f"[INFO] Audio command: "
+                f"{shlex.join(audio_command) if audio_command else 'none'}\n"
             )
             ffmpeg_log_file.flush()
             if capture_command:
@@ -333,8 +419,35 @@ def start_recording():
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                video_started_at = time.monotonic()
+                if audio_command:
+                    audio_process = subprocess.Popen(
+                        audio_command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=ffmpeg_log_file,
+                    )
+                    audio_started_at = time.monotonic()
+                    recording_audio_start_delay = max(
+                        0.0,
+                        audio_started_at - video_started_at,
+                    )
+                    command = _build_linux_command(
+                        raw_file,
+                        fps,
+                        output_file,
+                        audio_file=audio_file,
+                        audio_start_delay=recording_audio_start_delay,
+                    )
+                ffmpeg_log_file.write(
+                    f"[INFO] Audio start delay: "
+                    f"{recording_audio_start_delay:.6f} seconds\n"
+                    f"[INFO] Remux command: {shlex.join(command)}\n"
+                )
+                ffmpeg_log_file.flush()
                 ffmpeg_process = None
                 recording_raw_file = raw_file
+                recording_audio_file = audio_file
+                recording_audio_device = selected_audio_device
                 recording_remux_command = command
             else:
                 ffmpeg_process = subprocess.Popen(
@@ -346,10 +459,12 @@ def start_recording():
             recording_output_file = output_file
         except (OSError, subprocess.SubprocessError) as error:
             _stop_capture_process(capture_process)
+            _stop_capture_process(audio_process)
             _close_process_resources(ffmpeg_process)
             _clear_recording_state()
             _remove_file(output_file)
             _remove_file(raw_file)
+            _remove_file(audio_file)
             return {"status": "error", "details": str(error)}
 
         time.sleep(FFMPEG_STARTUP_DELAY)
@@ -363,18 +478,30 @@ def start_recording():
             if ffmpeg_process is not None
             else None
         )
-        if capture_return_code is not None or ffmpeg_return_code is not None:
+        audio_return_code = (
+            audio_process.poll()
+            if audio_process is not None
+            else None
+        )
+        if (
+            capture_return_code is not None
+            or ffmpeg_return_code is not None
+            or audio_return_code is not None
+        ):
             _stop_capture_process(capture_process)
+            _stop_capture_process(audio_process)
             _close_process_resources(ffmpeg_process)
             details = _log_tail()
             _clear_recording_state()
             _remove_file(output_file)
             _remove_file(raw_file)
-            return_code = (
-                ffmpeg_return_code
-                if ffmpeg_return_code is not None
-                else capture_return_code
-            )
+            _remove_file(audio_file)
+            if ffmpeg_return_code is not None:
+                return_code = ffmpeg_return_code
+            elif audio_return_code is not None:
+                return_code = audio_return_code
+            else:
+                return_code = capture_return_code
             return {
                 "status": "error",
                 "details": details or f"FFmpeg exited with code {return_code}",
@@ -387,25 +514,37 @@ def start_recording():
             "device": camera_device,
             "resolution": video_size,
             "fps": fps,
+            "audio": {
+                "enabled": bool(audio_command),
+                "device": selected_audio_device,
+                "codec": "aac" if audio_command else None,
+                "sample_rate": audio.AUDIO_SAMPLE_RATE if audio_command else None,
+                "channels": audio.AUDIO_CHANNELS if audio_command else None,
+            },
         }
 
 
 def stop_recording():
-    global capture_process, ffmpeg_process
+    global capture_process, audio_process, ffmpeg_process
 
     with recording_lock:
-        if capture_process is None and ffmpeg_process is None:
+        if capture_process is None and ffmpeg_process is None and audio_process is None:
             return {"status": "no_recording_running"}
 
         process = ffmpeg_process
         capture = capture_process
+        audio_capture = audio_process
         output_file = recording_output_file
         capture_return_code = None
+        audio_return_code = None
         return_code = None
         warning = None
 
         if capture is not None:
             capture_return_code = _stop_capture_process(capture)
+            audio_return_code = _stop_capture_process(audio_capture)
+            if audio_return_code not in (None, 0, -signal.SIGINT):
+                warning = f"Audio capture exited with code {audio_return_code}"
             try:
                 remux = subprocess.run(
                     recording_remux_command,
@@ -424,6 +563,7 @@ def stop_recording():
 
             if return_code == 0:
                 _remove_file(recording_raw_file)
+                _remove_file(recording_audio_file)
         else:
             return_code = process.poll()
             if return_code is None:
@@ -457,16 +597,39 @@ def stop_recording():
         }
         if capture_return_code is not None:
             response["capture_returncode"] = capture_return_code
+        if audio_return_code is not None:
+            response["audio_capture_returncode"] = audio_return_code
         if warning:
             response["warning"] = warning
         return response
 
 
 def get_settings():
-    return camera_settings
+    return dict(camera_settings)
 
 
-def update_settings(resolution: str = None, fps: str = None):
+def get_recording_status():
+    video_process = ffmpeg_process or capture_process
+    recording = video_process is not None and video_process.poll() is None
+    audio_recording = audio_process is not None and audio_process.poll() is None
+    return {
+        "recording": recording,
+        "file": recording_output_file if recording else None,
+        "audio": {
+            "enabled": recording_audio_file is not None,
+            "recording": audio_recording,
+            "device": recording_audio_device,
+            "start_delay_seconds": round(recording_audio_start_delay, 6),
+        },
+    }
+
+
+def update_settings(
+    resolution: str = None,
+    fps: str = None,
+    audio_enabled: bool = None,
+    audio_device: str = None,
+):
     if resolution:
         resolution = LEGACY_RESOLUTION_MAP.get(resolution, resolution)
         if resolution not in SUPPORTED_RESOLUTIONS:
@@ -486,7 +649,20 @@ def update_settings(resolution: str = None, fps: str = None):
             )
         camera_settings["fps"] = fps
 
+    if audio_enabled is not None:
+        camera_settings["audio_enabled"] = bool(audio_enabled)
+
+    if audio_device is not None:
+        audio_device = audio_device.strip() or "auto"
+        available_ids = {item["id"] for item in audio.list_capture_devices()}
+        if audio_device != "auto" and audio_device not in available_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported audio capture device",
+            )
+        camera_settings["audio_device"] = audio_device
+
     with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
         json.dump(camera_settings, settings_file)
 
-    return camera_settings
+    return dict(camera_settings)
