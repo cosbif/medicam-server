@@ -32,6 +32,10 @@ class UpdaterTests(unittest.TestCase):
             "medicam-ble-restart-1234567890",
         )
         self.assertIn(
+            ["/bin/bash", "scripts/install_server_runtime.sh"],
+            commands,
+        )
+        self.assertIn(
             [
                 "sudo",
                 "/usr/bin/systemd-run",
@@ -88,6 +92,29 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(result["step"], "restart")
         self.assertEqual(result["returncode"], 1)
         self.assertEqual(result["stderr"], "systemd-run failed")
+
+    def test_apply_update_reports_runtime_install_failure(self):
+        def fake_run(cmd, **kwargs):
+            if cmd == ["/bin/bash", "scripts/install_server_runtime.sh"]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stdout="",
+                    stderr="runtime install failed",
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+        with patch("app.updater.subprocess.run", side_effect=fake_run):
+            result = updater.apply_update()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["step"], "server_runtime")
+        self.assertEqual(result["stderr"], "runtime install failed")
 
 
 if __name__ == "__main__":

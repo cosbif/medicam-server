@@ -88,7 +88,21 @@ def apply_update():
     if not reset["ok"]:
         return {"ok": False, "step": "reset", **reset}
 
-    # 3. Schedule restart after this HTTP response is returned. A synchronous
+    # 3. Keep the systemd runtime directory and other server-unit drop-ins in
+    # sync with the checked-out version before restarting the service.
+    install_runtime = _run([
+        "/bin/bash",
+        "scripts/install_server_runtime.sh",
+    ])
+    log_debug(f"SERVER RUNTIME INSTALL: {install_runtime}")
+    if not install_runtime["ok"]:
+        return {
+            "ok": False,
+            "step": "server_runtime",
+            **install_runtime,
+        }
+
+    # 4. Schedule restart after this HTTP response is returned. A synchronous
     # restart kills the current uvicorn worker before /update/apply can respond,
     # which makes successful updates look like HTTP 500 failures.
     restart_unit = f"medicam-restart-{int(time.time())}"

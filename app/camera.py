@@ -24,7 +24,7 @@ FFMPEG_REMUX_TIMEOUT = 180.0
 AUDIO_OPEN_ATTEMPTS = 8
 AUDIO_OPEN_PROBE_DELAY = 0.15
 AUDIO_OPEN_RETRY_DELAY = 0.35
-AUDIO_TEMP_DIR = os.environ.get("MEDICAM_AUDIO_TEMP_DIR", "/dev/shm")
+AUDIO_TEMP_DIR = os.environ.get("MEDICAM_AUDIO_TEMP_DIR", "/run/medicam")
 
 camera_settings = {
     "resolution": "FHD",
@@ -149,9 +149,9 @@ def _split_video_size(video_size: str):
 
 def _build_audio_temp_file(output_file: str):
     # PCM is tiny compared with FullHD MJPEG but frequent synchronous writes to
-    # the same microSD can starve ALSA for several seconds. Linux tmpfs keeps
-    # audio capture independent from video I/O. Fall back to the video folder
-    # on systems without a writable /dev/shm.
+    # the same microSD can starve ALSA for several seconds. systemd creates the
+    # /run/medicam tmpfs directory, which is not subject to logind RemoveIPC.
+    # Fall back to the video folder if the runtime directory is unavailable.
     temp_dir = AUDIO_TEMP_DIR
     if not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
         temp_dir = os.path.dirname(output_file) or "."
