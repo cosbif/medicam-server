@@ -39,7 +39,23 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
-    def test_linux_command_copies_camera_mjpeg_without_reencoding(self):
+    def test_linux_capture_command_streams_camera_mjpeg_with_v4l2_ctl(self):
+        command = camera._build_linux_capture_command(
+            "1920x1080",
+            "30",
+            "/dev/v4l/by-id/camera-video-index0",
+        )
+
+        self.assertEqual(command[0], "v4l2-ctl")
+        self.assertIn("--silent", command)
+        self.assertIn("-d", command)
+        self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
+        self.assertIn("--set-fmt-video=width=1920,height=1080,pixelformat=MJPG", command)
+        self.assertIn("--set-parm=30", command)
+        self.assertIn("--stream-mmap=8", command)
+        self.assertIn("--stream-to=-", command)
+
+    def test_linux_ffmpeg_command_muxes_mjpeg_pipe_without_reencoding(self):
         command = camera._build_linux_command(
             "1920x1080",
             "30",
@@ -48,16 +64,14 @@ class CameraCommandTests(unittest.TestCase):
         )
 
         self.assertIn("mjpeg", command)
+        self.assertEqual(command[command.index("-i") + 1], "pipe:0")
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertNotIn("libx264", command)
         self.assertNotIn("mpeg4", command)
         self.assertNotIn("h264_rkmpp", command)
         self.assertNotIn("-thread_queue_size", command)
-        self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
         self.assertEqual(command[command.index("-framerate") + 1], "30")
-        self.assertIn("-bsf:v", command)
-        bitstream_filter = command[command.index("-bsf:v") + 1]
-        self.assertIn("setts=pts=N/(30*TB)", bitstream_filter)
+        self.assertNotIn("-bsf:v", command)
         self.assertNotIn("+faststart", command)
 
 

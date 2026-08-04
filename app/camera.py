@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shlex
+import signal
 import stat
 import subprocess
 import threading
@@ -40,13 +41,9 @@ LEGACY_RESOLUTION_MAP = {
 
 SUPPORTED_FPS = {"30"}
 LEGACY_FPS_MAP = {"15": "30", "60": "30"}
-LINUX_CAMERA_CAPTURE_FPS = {
-    "30": "30",
-}
-LINUX_OUTPUT_BITSTREAM_FILTER = {
-    "30": r"setts=pts=N/(30*TB):dts=N/(30*TB):duration=1/(30*TB)",
-}
+LINUX_V4L2_BUFFER_COUNT = "8"
 
+capture_process = None
 ffmpeg_process = None
 ffmpeg_log_file = None
 recording_output_file = None
@@ -111,31 +108,39 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
         time.sleep(0.25)
 
 
+def _split_video_size(video_size: str):
+    width, height = video_size.split("x", maxsplit=1)
+    return width, height
+
+
+def _build_linux_capture_command(video_size: str, fps: str, camera_device: str):
+    width, height = _split_video_size(video_size)
+
+    return [
+        "v4l2-ctl",
+        "--silent",
+        "-d", camera_device,
+        f"--set-fmt-video=width={width},height={height},pixelformat=MJPG",
+        f"--set-parm={fps}",
+        f"--stream-mmap={LINUX_V4L2_BUFFER_COUNT}",
+        "--stream-to=-",
+    ]
+
+
 def _build_linux_command(video_size: str, fps: str, output_file: str,
                          camera_device: str):
-    capture_fps = LINUX_CAMERA_CAPTURE_FPS.get(fps, fps)
-    bitstream_filter = LINUX_OUTPUT_BITSTREAM_FILTER.get(fps)
-
     return [
         "ffmpeg",
         "-hide_banner",
         "-y",
-        "-f", "v4l2",
-        "-input_format", "mjpeg",
-        "-framerate", capture_fps,
-        "-video_size", video_size,
-        "-i", camera_device,
+        "-f", "mjpeg",
+        "-framerate", fps,
+        "-i", "pipe:0",
         "-map", "0:v:0",
         "-an",
-        # The UVC camera already produces compressed MJPEG. Stream copy avoids
-        # decoding, colorspace conversion and re-encoding, which could process
-        # FullHD at only ~0.43x realtime on the Radxa.
+        # The UVC camera already produces compressed MJPEG. FFmpeg only muxes
+        # the v4l2-ctl pipe into MP4; it does not decode or re-encode frames.
         "-c:v", "copy",
-        *(
-            ["-bsf:v", bitstream_filter]
-            if bitstream_filter
-            else []
-        ),
         output_file,
     ]
 
@@ -175,10 +180,41 @@ def _close_process_resources(process):
 
 
 def _clear_recording_state():
-    global ffmpeg_process, recording_output_file
+    global capture_process, ffmpeg_process, recording_output_file
 
+    capture_process = None
     ffmpeg_process = None
     recording_output_file = None
+
+
+def _stop_capture_process(process, timeout: float = 3.0):
+    if process is None:
+        return None
+
+    if process.stdout is not None and not process.stdout.closed:
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+    return_code = process.poll()
+    if return_code is not None:
+        return return_code
+
+    try:
+        process.send_signal(signal.SIGINT)
+        return process.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return process.poll()
+
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait(timeout=timeout)
 
 
 def _remove_file(path: str | None):
@@ -207,7 +243,7 @@ if os.path.exists(SETTINGS_FILE):
 
 
 def start_recording():
-    global ffmpeg_process, ffmpeg_log_file, recording_output_file
+    global capture_process, ffmpeg_process, ffmpeg_log_file, recording_output_file
 
     with recording_lock:
         if ffmpeg_process is not None:
@@ -219,6 +255,7 @@ def start_recording():
 
             # A disconnected camera can terminate FFmpeg between API calls.
             # Reap that process and allow the next /start request to recover.
+            _stop_capture_process(capture_process)
             _close_process_resources(ffmpeg_process)
             _clear_recording_state()
 
@@ -243,15 +280,21 @@ def start_recording():
                     "status": "error",
                     "details": "Camera capture device is not available",
                 }
+            capture_command = _build_linux_capture_command(
+                video_size,
+                fps,
+                camera_device,
+            )
             command = _build_linux_command(
                 video_size,
                 fps,
                 output_file,
                 camera_device,
             )
-            capture_format = "mjpeg_copy"
+            capture_format = "v4l2_mjpeg_pipe"
         elif system == "Windows":
             camera_device = "video=AT025"
+            capture_command = None
             command = _build_windows_command(video_size, fps, output_file)
             capture_format = "h264"
         else:
@@ -263,29 +306,55 @@ def start_recording():
             ffmpeg_log_file.write(
                 f"[INFO] Camera device: {camera_device}\n"
                 f"[INFO] Capture: {video_size} @ {fps} fps, format={capture_format}\n"
+                f"[INFO] Capture command: "
+                f"{shlex.join(capture_command) if capture_command else 'none'}\n"
                 f"[INFO] Command: {shlex.join(command)}\n"
             )
             ffmpeg_log_file.flush()
+            if capture_command:
+                capture_process = subprocess.Popen(
+                    capture_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                ffmpeg_stdin = capture_process.stdout
+            else:
+                ffmpeg_stdin = subprocess.PIPE
+
             ffmpeg_process = subprocess.Popen(
                 command,
-                stdin=subprocess.PIPE,
+                stdin=ffmpeg_stdin,
                 stdout=ffmpeg_log_file,
                 stderr=ffmpeg_log_file,
             )
+            if capture_process is not None and capture_process.stdout is not None:
+                capture_process.stdout.close()
             recording_output_file = output_file
         except (OSError, subprocess.SubprocessError) as error:
+            _stop_capture_process(capture_process)
             _close_process_resources(ffmpeg_process)
             _clear_recording_state()
             _remove_file(output_file)
             return {"status": "error", "details": str(error)}
 
         time.sleep(FFMPEG_STARTUP_DELAY)
-        return_code = ffmpeg_process.poll()
-        if return_code is not None:
+        capture_return_code = (
+            capture_process.poll()
+            if capture_process is not None
+            else None
+        )
+        ffmpeg_return_code = ffmpeg_process.poll()
+        if capture_return_code is not None or ffmpeg_return_code is not None:
+            _stop_capture_process(capture_process)
             _close_process_resources(ffmpeg_process)
             details = _log_tail()
             _clear_recording_state()
             _remove_file(output_file)
+            return_code = (
+                ffmpeg_return_code
+                if ffmpeg_return_code is not None
+                else capture_return_code
+            )
             return {
                 "status": "error",
                 "details": details or f"FFmpeg exited with code {return_code}",
@@ -302,36 +371,48 @@ def start_recording():
 
 
 def stop_recording():
-    global ffmpeg_process
+    global capture_process, ffmpeg_process
 
     with recording_lock:
         if ffmpeg_process is None:
             return {"status": "no_recording_running"}
 
         process = ffmpeg_process
+        capture = capture_process
         output_file = recording_output_file
         return_code = process.poll()
+        capture_return_code = None
         warning = None
 
         if return_code is None:
-            try:
-                process.stdin.write(b"q\n")
-                process.stdin.flush()
-                return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                warning = "FFmpeg did not stop cleanly and was terminated"
+            if capture is not None:
+                capture_return_code = _stop_capture_process(capture)
                 try:
-                    process.terminate()
-                except ProcessLookupError:
-                    return_code = process.poll()
-                try:
-                    if return_code is None:
-                        return_code = process.wait(timeout=3)
+                    return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    warning = "FFmpeg did not stop cleanly and was terminated"
+                    process.terminate()
+            else:
+                try:
+                    process.stdin.write(b"q\n")
+                    process.stdin.flush()
+                    return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    warning = "FFmpeg did not stop cleanly and was terminated"
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        return_code = process.poll()
+
+            try:
+                if return_code is None:
                     return_code = process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait(timeout=3)
         else:
             warning = f"FFmpeg had already exited with code {return_code}"
+            capture_return_code = _stop_capture_process(capture)
 
         _close_process_resources(process)
         _clear_recording_state()
@@ -341,6 +422,8 @@ def stop_recording():
             "file": output_file,
             "returncode": return_code,
         }
+        if capture_return_code is not None:
+            response["capture_returncode"] = capture_return_code
         if warning:
             response["warning"] = warning
         return response
