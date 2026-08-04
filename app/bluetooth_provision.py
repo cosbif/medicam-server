@@ -375,16 +375,7 @@ class ProvisionService:
             return
 
         if cmd == "SCAN_WIFI":
-            t = threading.Thread(
-                target=self._worker_scan_wifi,
-                kwargs={"request_id": request_id},
-                daemon=True,
-            )
-            t.start()
-            self._set_response(
-                {"status": "started_scan"},
-                request_id=request_id,
-            )
+            self._worker_scan_wifi(request_id=request_id)
             return
 
         if cmd == "CONNECT_WIFI":
@@ -397,17 +388,7 @@ class ProvisionService:
                 )
                 return
 
-            t = threading.Thread(
-                target=self._worker_connect_wifi,
-                args=(ssid, password),
-                kwargs={"request_id": request_id},
-                daemon=True,
-            )
-            t.start()
-            self._set_response(
-                {"status": "connecting"},
-                request_id=request_id,
-            )
+            self._worker_connect_wifi(ssid, password, request_id=request_id)
             return
 
         self._set_response(
