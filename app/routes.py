@@ -9,12 +9,56 @@ import socket
 import subprocess
 from app.updater import check_for_update, apply_update
 
+BLE_SERVICE = "medicam-ble.service"
+
 def require_provisioned():
     '''if not utils.is_provisioned():
         raise HTTPException(status_code=403, detail="device_not_provisioned")'''
     return True
 
 router = APIRouter()
+
+
+def _systemctl_status(unit: str):
+    try:
+        proc = subprocess.run(
+            ["/bin/systemctl", "is-active", unit],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        status = proc.stdout.strip() or proc.stderr.strip() or "unknown"
+        return {
+            "ok": proc.returncode == 0,
+            "status": status,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "error": str(e),
+        }
+
+
+def _systemctl_action(action: str, unit: str):
+    try:
+        proc = subprocess.run(
+            ["sudo", "/bin/systemctl", action, unit],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": str(e),
+        }
 
 
 @router.get("/ping")
@@ -186,47 +230,29 @@ async def list_wifi():
 
 @router.post("/wifi/connect")
 async def connect_wifi(ssid: str = Form(...), password: str = Form(None)):
-    # Попытка подключиться через nmcli
-    try:
-        if password:
-            cmd = ["nmcli", "dev", "wifi", "connect", ssid, "password", password]
-        else:
-            cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=30)
-        success = proc.returncode == 0
-        stdout = proc.stdout.strip()
-        stderr = proc.stderr.strip()
-        if success:
-            # определим ip (если есть) — сначала ищем первый глобальный IPv4
-            try:
-                ip_out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
-                import re
-                m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
-                ip = m.group(1) if m else ""
-            except Exception:
-                ip = ""
-            utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-            return {"status": "connected", "stdout": stdout}
-        else:
-            return {"status": "error", "stdout": stdout, "stderr": stderr}
-    except Exception as e:
-        return {"status": "error", "details": str(e)}
+    result = utils.connect_wifi_nmcli(ssid, password, timeout=60)
+    if result["ok"]:
+        utils.set_provisioned(True, {"ssid": ssid, "ip": result["ip"]})
+        return {
+            "status": "connected",
+            "stdout": result["stdout"],
+            "ip": result["ip"],
+        }
+
+    return {
+        "status": "error",
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+    }
     
 @router.get("/wifi/status")
 async def wifi_status():
-    try:
-        state = subprocess.check_output(["nmcli", "-t", "-f", "STATE", "g"], text=True).strip()
-        connected = "connected" in state.lower()
-        ssid = ""
-        if connected:
-            ssid_lines = subprocess.check_output(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"], text=True)
-            for line in ssid_lines.splitlines():
-                if line.startswith("yes:"):
-                    ssid = line.split(":", 1)[1]
-                    break
-        return {"connected": connected, "ssid": ssid}
-    except Exception as e:
-        return {"connected": False, "error": str(e)}
+    connected = utils.is_wifi_connected()
+    return {
+        "connected": connected,
+        "ssid": utils.get_wifi_ssid() if connected else "",
+        "ip": utils.get_primary_ipv4() if connected else "",
+    }
 
 # -------------------
 # 🔵 Bluetooth (заглушка)
@@ -235,14 +261,25 @@ async def wifi_status():
 async def provision_status():
     return {
         "provisioned": utils.is_provisioned(),
-        "info": utils.get_provision_info()
+        "info": utils.get_provision_info(),
+        "wifi": {
+            "connected": utils.is_wifi_connected(),
+            "ssid": utils.get_wifi_ssid(),
+            "ip": utils.get_primary_ipv4(),
+        },
+        "ble_service": _systemctl_status(BLE_SERVICE),
     }
 
 @router.post("/provision/reset")
 async def provision_reset():
-    # сбросим статус (например для теста)
+    # сбросим статус (например для теста) и поднимем BLE-провижининг заново
     utils.set_provisioned(False, {})
-    return {"status": "reset"}
+    restart = _systemctl_action("restart", BLE_SERVICE)
+    return {
+        "status": "reset",
+        "ble_restart": restart,
+        "ble_service": _systemctl_status(BLE_SERVICE),
+    }
 
 # -------------------
 # 🔄 OTA UPDATE (git pull)

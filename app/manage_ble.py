@@ -1,31 +1,66 @@
 #!/usr/bin/env python3
 import time
 import subprocess
-import os
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from app import utils
 
 BLE_SERVICE = "medicam-ble.service"
 
-def wifi_connected():
+
+def service_status():
     try:
-        out = subprocess.check_output(["nmcli", "-t", "-f", "STATE", "g"], text=True).strip()
-        return "connected" in out
-    except Exception:
+        return subprocess.check_output(
+            ["systemctl", "is-active", BLE_SERVICE],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return "inactive"
+    except Exception as e:
+        print(f"[Auto] Failed to read BLE service status: {e}")
+        return "unknown"
+
+
+def systemctl(action: str):
+    try:
+        proc = subprocess.run(
+            ["sudo", "/bin/systemctl", action, BLE_SERVICE],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            print(
+                f"[Auto] systemctl {action} failed: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return proc.returncode == 0
+    except Exception as e:
+        print(f"[Auto] systemctl {action} exception: {e}")
         return False
 
 def main():
     while True:
-        connected = wifi_connected()
-        try:
-            status = subprocess.check_output(["systemctl", "is-active", BLE_SERVICE], text=True).strip()
-        except subprocess.CalledProcessError:
-            status = "inactive"
+        provisioned = utils.is_provisioned()
+        connected = utils.is_wifi_connected()
+        status = service_status()
 
-        if connected and status == "active":
-            os.system(f"sudo systemctl stop {BLE_SERVICE}")
-            print("[Auto] Wi-Fi active → stop BLE")
-        elif not connected and status != "active":
-            os.system(f"sudo systemctl start {BLE_SERVICE}")
-            print("[Auto] No Wi-Fi → start BLE")
+        should_ble_run = (not provisioned) or (not connected)
+
+        if not should_ble_run and status == "active":
+            if systemctl("stop"):
+                print("[Auto] Provisioned Wi-Fi active → stop BLE")
+        elif should_ble_run and status != "active":
+            if systemctl("start"):
+                print(
+                    "[Auto] BLE provisioning required → start BLE "
+                    f"(provisioned={provisioned}, wifi_connected={connected})"
+                )
 
         time.sleep(10)
 

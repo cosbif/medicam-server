@@ -18,12 +18,16 @@ from app import utils
 try:
     from bluezero import peripheral
 except Exception as e:
-    print(f"[ERR] bluezero import failed: {e}")
     peripheral = None
+    peripheral_import_error = e
+else:
+    peripheral_import_error = None
 
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 CMD_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
 RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
+PROTOCOL_VERSION = 2
+MAX_COMMAND_BYTES = 8192
 
 PROVISION_FILE = utils._provision_path()
 
@@ -62,15 +66,13 @@ def get_adapter_mac():
 def is_wifi_connected() -> bool:
     if TEST_MODE:
         return False
-    try:
-        status = subprocess.check_output(
-            ["nmcli", "-t", "-f", "STATE", "g"],
-            text=True
-        ).strip()
-        return "connected" in status.lower()
-    except Exception as e:
-        print(f"[WARN] Wi-Fi check failed: {e}")
-        return False
+    return utils.is_wifi_connected()
+
+
+def get_wifi_ssid() -> str:
+    if TEST_MODE:
+        return ""
+    return utils.get_wifi_ssid()
 
 # ---------------------------
 # Provision service class
@@ -78,7 +80,9 @@ def is_wifi_connected() -> bool:
 class ProvisionService:
     def __init__(self):
         if peripheral is None:
-            raise RuntimeError("bluezero.peripheral is not available")
+            raise RuntimeError(
+                f"bluezero.peripheral is not available: {peripheral_import_error}"
+            )
 
         mac = get_adapter_mac()
         if not mac:
@@ -236,6 +240,17 @@ class ProvisionService:
         except Exception as e:
             print("[WARN] _set_response notify block error:", e)
 
+    def _status_payload(self):
+        return {
+            "status": "ok",
+            "protocol": PROTOCOL_VERSION,
+            "device": "Medicam",
+            "provisioned": utils.is_provisioned(),
+            "wifi_connected": is_wifi_connected(),
+            "ssid": get_wifi_ssid(),
+            "ip": "" if TEST_MODE else utils.get_primary_ipv4(),
+        }
+
     # ---------------------------
     # Long-running workers
     # ---------------------------
@@ -250,24 +265,23 @@ class ProvisionService:
 
     def _worker_connect_wifi(self, ssid, password, request_id=None):
         try:
-            ok = self.connect_wifi(ssid, password)
-            ip = ""
+            result = self.connect_wifi(ssid, password)
+            ok = bool(result.get("ok"))
+            ip = result.get("ip", "")
             if ok:
-                # get first ip
-                try:
-                    out = subprocess.check_output(["ip", "-4", "addr", "show", "scope", "global"], text=True)
-                    import re
-                    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-                    ip = m.group(1) if m else ""
-                except Exception:
-                    ip = ""
                 utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
                 self._set_response(
                     {"status": "connected", "ip": ip},
                     request_id=request_id,
                 )
             else:
-                self._set_response({"status": "failed"}, request_id=request_id)
+                self._set_response(
+                    {
+                        "status": "failed",
+                        "stderr": result.get("stderr", ""),
+                    },
+                    request_id=request_id,
+                )
         except Exception as e:
             print("[ERR] worker_connect_wifi:", e, traceback.format_exc())
             self._set_response({"error": str(e)}, request_id=request_id)
@@ -276,85 +290,102 @@ class ProvisionService:
     # Command handler (fast return)
     # ---------------------------
     def on_command(self, value, options=None):
-        """
-        Принимаем куски данных (value может быть bytes или list(int)).
-        Накапливаем в self._cmd_buffer и пытаемся распарсить JSON.
-        Если JSON некорректен из-за неполноты — ждём следующего вызова.
-        Если JSON распарсен успешно — обрабатываем команду.
-        """
+        """Accept newline-framed JSON commands, including fragmented BLE writes."""
         try:
-            # Получаем байты из value
             if isinstance(value, (bytes, bytearray)):
                 chunk = bytes(value)
             else:
                 chunk = bytes(bytearray(value))
 
-            # Добавляем фрагмент в общий буфер
             if chunk:
                 self._cmd_buffer.extend(chunk)
 
-            # Попытка распарсить содержимое буфера как JSON
-            try:
-                text = self._cmd_buffer.decode()
-            except UnicodeDecodeError:
-                # Если ещё не полный UTF-8 фрагмент — ждём продолжения
+            if len(self._cmd_buffer) > MAX_COMMAND_BYTES:
+                self._cmd_buffer.clear()
+                self._set_response({"error": "command_too_large"})
                 return
 
+            handled = False
+            while b"\n" in self._cmd_buffer:
+                raw_message, _, rest = self._cmd_buffer.partition(b"\n")
+                self._cmd_buffer = bytearray(rest)
+                raw_message = raw_message.strip()
+                if not raw_message:
+                    continue
+                data = json.loads(raw_message.decode("utf-8"))
+                self._handle_command(data)
+                handled = True
+
+            if handled:
+                return
+
+            # Backward compatibility: older clients sent a single JSON write
+            # without newline framing. Keep supporting it for manual testing.
             try:
+                text = self._cmd_buffer.decode("utf-8")
                 data = json.loads(text)
-            except json.JSONDecodeError as jde:
-                # Неполный JSON — ждём следующих фрагментов
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 return
 
-            # Если дошли сюда — JSON успешно распарсен
-            # Очищаем буфер (готовы принимать следующий JSON)
             self._cmd_buffer.clear()
-
-            cmd = data.get("cmd")
-            request_id = data.get("request_id")
-            print("[BLE] Command:", cmd)
-
-            if cmd == "PING":
-                self._set_response({"status": "OK"}, request_id=request_id)
-                return
-
-            if cmd == "SCAN_WIFI":
-                t = threading.Thread(
-                    target=self._worker_scan_wifi,
-                    kwargs={"request_id": request_id},
-                    daemon=True,
-                )
-                t.start()
-                self._set_response(
-                    {"status": "started_scan"},
-                    request_id=request_id,
-                )
-                return
-
-            if cmd == "CONNECT_WIFI":
-                ssid = data.get("ssid")
-                password = data.get("password")
-                t = threading.Thread(
-                    target=self._worker_connect_wifi,
-                    args=(ssid, password),
-                    kwargs={"request_id": request_id},
-                    daemon=True,
-                )
-                t.start()
-                self._set_response(
-                    {"status": "connecting"},
-                    request_id=request_id,
-                )
-                return
-
-            # unknown
-            self._set_response(
-                {"error": "unknown_command"},
-                request_id=request_id,
-            )
+            self._handle_command(data)
         except Exception as e:
             print("[ERR] on_command top-level:", e, traceback.format_exc())
             self._set_response({"error": str(e)})
+
+    def _handle_command(self, data):
+        if not isinstance(data, dict):
+            self._set_response({"error": "invalid_command"})
+            return
+
+        cmd = data.get("cmd")
+        request_id = data.get("request_id")
+        print("[BLE] Command:", cmd)
+
+        if cmd in {"PING", "STATUS"}:
+            self._set_response(self._status_payload(), request_id=request_id)
+            return
+
+        if cmd == "SCAN_WIFI":
+            t = threading.Thread(
+                target=self._worker_scan_wifi,
+                kwargs={"request_id": request_id},
+                daemon=True,
+            )
+            t.start()
+            self._set_response(
+                {"status": "started_scan"},
+                request_id=request_id,
+            )
+            return
+
+        if cmd == "CONNECT_WIFI":
+            ssid = data.get("ssid")
+            password = data.get("password")
+            if not isinstance(ssid, str) or not ssid:
+                self._set_response(
+                    {"error": "ssid_required"},
+                    request_id=request_id,
+                )
+                return
+
+            t = threading.Thread(
+                target=self._worker_connect_wifi,
+                args=(ssid, password),
+                kwargs={"request_id": request_id},
+                daemon=True,
+            )
+            t.start()
+            self._set_response(
+                {"status": "connecting"},
+                request_id=request_id,
+            )
+            return
+
+        self._set_response(
+            {"error": "unknown_command"},
+            request_id=request_id,
+        )
 
     # ---------------------------
     # Wi-Fi helpers (unchanged, non-blocking now moved to worker)
@@ -362,49 +393,61 @@ class ProvisionService:
     def scan_wifi(self):
         try:
             result = subprocess.run(
-                ["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi"],
+                [
+                    "nmcli",
+                    "-t",
+                    "--escape",
+                    "yes",
+                    "-f",
+                    "SSID,SIGNAL,SECURITY",
+                    "dev",
+                    "wifi",
+                    "list",
+                    "--rescan",
+                    "yes",
+                ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="ignore",
                 check=True
             )
-            seen = set()
-            networks = []
+            by_ssid = {}
             for line in result.stdout.splitlines():
                 if not line:
                     continue
-                parts = line.split(":", 1)
-                if len(parts) != 2:
+                parts = utils.split_nmcli_escaped(line)
+                if len(parts) < 2:
                     continue
-                ssid, signal_str = parts
+                ssid, signal_str = parts[0], parts[1]
+                security = parts[2] if len(parts) > 2 else ""
                 ssid = ssid.strip()
-                if not ssid or ssid in seen:
+                if not ssid:
                     continue
-                seen.add(ssid)
                 try:
                     signal = int(signal_str) if signal_str.isdigit() else 0
                 except Exception:
                     signal = 0
                 if signal >= 30:
-                    safe_ssid = ssid[:64]
-                    networks.append({"ssid": safe_ssid, "signal": signal})
+                    current = by_ssid.get(ssid)
+                    if current is None or signal > current["signal"]:
+                        by_ssid[ssid] = {
+                            "ssid": ssid[:64],
+                            "signal": signal,
+                            "secured": bool(security.strip()),
+                        }
+            networks = list(by_ssid.values())
             networks = sorted(networks, key=lambda x: -x["signal"])
-            return networks[:10]
+            return networks[:12]
         except Exception as e:
             print(f"[ERR] scan_wifi: {e}")
             return []
 
     def connect_wifi(self, ssid, password):
-        try:
-            if password:
-                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid,
-                                "password", password], check=True, timeout=60)
-            else:
-                subprocess.run(["nmcli", "dev", "wifi", "connect", ssid],
-                               check=True, timeout=60)
-            return True
-        except Exception as e:
-            print(f"[ERR] connect_wifi: {e}")
-            return False
+        result = utils.connect_wifi_nmcli(ssid, password, timeout=60)
+        if not result.get("ok"):
+            print(f"[ERR] connect_wifi: {result.get('stderr')}")
+        return result
 
     # ---------------------------
     # Main loop
@@ -420,8 +463,8 @@ class ProvisionService:
 
         try:
             while True:
-                if is_wifi_connected():
-                    print("[BLE] Wi-Fi connected -> stopping BLE")
+                if utils.is_provisioned() and is_wifi_connected():
+                    print("[BLE] Device provisioned and Wi-Fi connected -> stopping BLE")
                     break
                 time.sleep(1)
         except KeyboardInterrupt:

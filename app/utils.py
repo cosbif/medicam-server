@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from datetime import datetime
 import json
@@ -57,7 +58,138 @@ def get_video_metadata(filepath: str):
         }
     except Exception as e:
         return {"error": str(e)}
-    
+
+
+def split_nmcli_escaped(line: str) -> list[str]:
+    """Split an nmcli -t --escape yes line without breaking escaped colons."""
+    parts = []
+    current = []
+    escaped = False
+
+    for char in line:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+
+        if char == "\\":
+            escaped = True
+            continue
+
+        if char == ":":
+            parts.append("".join(current))
+            current = []
+            continue
+
+        current.append(char)
+
+    if escaped:
+        current.append("\\")
+    parts.append("".join(current))
+    return parts
+
+
+def is_wifi_connected() -> bool:
+    """Return True only when a Wi-Fi interface is connected."""
+    try:
+        status = subprocess.check_output(
+            ["nmcli", "-t", "-f", "TYPE,STATE", "dev", "status"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        ).strip()
+        for line in status.splitlines():
+            parts = split_nmcli_escaped(line)
+            if len(parts) >= 2 and parts[0] == "wifi":
+                return parts[1].lower() == "connected"
+        return False
+    except Exception:
+        return False
+
+
+def get_wifi_ssid() -> str:
+    """Return the active Wi-Fi SSID, or an empty string if disconnected."""
+    try:
+        ssid_lines = subprocess.check_output(
+            ["nmcli", "-t", "--escape", "yes", "-f", "ACTIVE,SSID", "dev", "wifi"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        for line in ssid_lines.splitlines():
+            parts = split_nmcli_escaped(line)
+            if len(parts) >= 2 and parts[0] == "yes":
+                return parts[1]
+    except Exception:
+        pass
+    return ""
+
+
+def get_primary_ipv4() -> str:
+    """Return the first global IPv4 address visible on the device."""
+    try:
+        ip_out = subprocess.check_output(
+            ["ip", "-4", "addr", "show", "scope", "global"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+        return match.group(1) if match else ""
+    except Exception:
+        return ""
+
+
+def connect_wifi_nmcli(ssid: str, password: str | None = None, timeout: int = 60) -> dict:
+    """
+    Connect to Wi-Fi through NetworkManager.
+
+    The password is passed through stdin with nmcli --ask so it does not appear
+    in process arguments while provisioning is running.
+    """
+    ssid = (ssid or "").strip()
+    password = password or ""
+    if not ssid:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": "ssid_required",
+            "ip": "",
+        }
+
+    try:
+        if password:
+            proc = subprocess.run(
+                ["nmcli", "--ask", "dev", "wifi", "connect", ssid],
+                input=f"{password}\n",
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        else:
+            proc = subprocess.run(
+                ["nmcli", "dev", "wifi", "connect", ssid],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "ip": get_primary_ipv4() if ok else "",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": str(e),
+            "ip": "",
+        }
+
+
 def _provision_path():
     # файл хранится в корне проекта (один уровень выше app/)
     project_root = Path(__file__).resolve().parents[1]
@@ -86,8 +218,10 @@ def set_provisioned(value: bool, info: dict | None = None):
         except Exception:
             data = {}
     data["provisioned"] = bool(value)
-    if info:
+    if info is not None and value:
         data.setdefault("info", {}).update(info)
+    elif info is not None:
+        data["info"] = dict(info)
     # добавим timestamp
     from datetime import datetime
     data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
