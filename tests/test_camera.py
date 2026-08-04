@@ -129,6 +129,36 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("-an", command)
         self.assertNotIn("libx264", command)
 
+    @patch("app.camera._remove_file")
+    @patch("app.camera.time.sleep")
+    @patch("app.camera.time.monotonic", side_effect=[10.0, 11.0])
+    @patch("app.camera.subprocess.Popen")
+    def test_audio_capture_retries_a_transient_busy_device(
+        self,
+        popen_mock,
+        _monotonic,
+        sleep_mock,
+        remove_file_mock,
+    ):
+        busy_process = Mock()
+        busy_process.poll.return_value = 1
+        active_process = Mock()
+        active_process.poll.return_value = None
+        popen_mock.side_effect = [busy_process, active_process]
+        log = io.StringIO()
+
+        process, started_at = camera._start_audio_capture(
+            ["arecord", "test.wav"],
+            log,
+            "test.wav",
+        )
+
+        self.assertIs(process, active_process)
+        self.assertEqual(started_at, 11.0)
+        self.assertIn("retrying", log.getvalue())
+        remove_file_mock.assert_called_once_with("test.wav")
+        self.assertEqual(sleep_mock.call_count, 3)
+
 
 class CameraLifecycleTests(unittest.TestCase):
     def setUp(self):

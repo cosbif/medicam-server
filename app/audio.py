@@ -6,6 +6,7 @@ import math
 import re
 import struct
 import subprocess
+import time
 
 
 AUDIO_SAMPLE_RATE = 48_000
@@ -14,6 +15,8 @@ AUDIO_FORMAT = "S16_LE"
 AUDIO_BITRATE = "128k"
 LEVEL_SAMPLE_RATE = 16_000
 MAX_LEVEL_TEST_SECONDS = 5
+LEVEL_BUSY_ATTEMPTS = 4
+LEVEL_BUSY_RETRY_DELAY = 0.25
 
 _ARECORD_DEVICE_RE = re.compile(
     r"^card\s+(?P<card_index>\d+):\s+"
@@ -126,22 +129,29 @@ def measure_audio_level(
         "-c", str(AUDIO_CHANNELS),
         "-d", str(duration),
     ]
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=duration + 5,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise AudioError("audio_test_timeout") from error
-    except OSError as error:
-        raise AudioError("audio_capture_failed", str(error)) from error
+    for attempt in range(1, LEVEL_BUSY_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=duration + 5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AudioError("audio_test_timeout") from error
+        except OSError as error:
+            raise AudioError("audio_capture_failed", str(error)) from error
 
-    if result.returncode != 0:
+        if result.returncode == 0:
+            break
+
         details = result.stderr.decode("utf-8", errors="replace").strip()
-        code = "audio_device_busy" if "busy" in details.lower() else "audio_capture_failed"
+        is_busy = "busy" in details.lower()
+        if is_busy and attempt < LEVEL_BUSY_ATTEMPTS:
+            time.sleep(LEVEL_BUSY_RETRY_DELAY)
+            continue
+        code = "audio_device_busy" if is_busy else "audio_capture_failed"
         raise AudioError(code, details)
 
     stats = calculate_pcm_s16le_stats(result.stdout)

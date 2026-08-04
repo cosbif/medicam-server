@@ -81,6 +81,31 @@ class AudioLevelTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, "audio_no_samples")
 
+    @patch("app.audio.time.sleep")
+    @patch("app.audio.subprocess.run")
+    @patch("app.audio.resolve_capture_device")
+    def test_level_measurement_retries_a_transient_busy_device(
+        self,
+        resolve_mock,
+        run_mock,
+        sleep_mock,
+    ):
+        resolve_mock.return_value = {
+            "id": "plughw:CARD=HD,DEV=0",
+            "label": "USB microphone",
+        }
+        run_mock.side_effect = [
+            Mock(returncode=1, stdout=b"", stderr=b"Device or resource busy"),
+            Mock(returncode=0, stdout=self._pcm(4_096, -4_096), stderr=b""),
+        ]
+
+        result = audio.measure_audio_level(duration_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["signal_detected"])
+        self.assertEqual(run_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(audio.LEVEL_BUSY_RETRY_DELAY)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,9 @@ CAMERA_DISCOVERY_TIMEOUT = 3.0
 FFMPEG_STARTUP_DELAY = 1.0
 FFMPEG_STOP_TIMEOUT = 10.0
 FFMPEG_REMUX_TIMEOUT = 180.0
-AUDIO_STARTUP_DELAY = 0.1
+AUDIO_OPEN_ATTEMPTS = 8
+AUDIO_OPEN_PROBE_DELAY = 0.15
+AUDIO_OPEN_RETRY_DELAY = 0.35
 
 camera_settings = {
     "resolution": "FHD",
@@ -228,6 +230,37 @@ def _build_windows_command(video_size: str, fps: str, output_file: str):
     ]
 
 
+def _start_audio_capture(command, log_file, audio_file):
+    """Open ALSA before UVC, tolerating short desktop audio probes."""
+    last_return_code = None
+    for attempt in range(1, AUDIO_OPEN_ATTEMPTS + 1):
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+        )
+        started_at = time.monotonic()
+        time.sleep(AUDIO_OPEN_PROBE_DELAY)
+        last_return_code = process.poll()
+        if last_return_code is None:
+            return process, started_at
+
+        _remove_file(audio_file)
+        if attempt < AUDIO_OPEN_ATTEMPTS:
+            log_file.write(
+                f"[WARN] Audio open attempt {attempt} exited with "
+                f"code {last_return_code}; retrying\n"
+            )
+            log_file.flush()
+            time.sleep(AUDIO_OPEN_RETRY_DELAY)
+
+    raise audio.AudioError(
+        "audio_capture_failed",
+        f"Audio input did not open after {AUDIO_OPEN_ATTEMPTS} attempts "
+        f"(last exit code {last_return_code})",
+    )
+
+
 def _close_process_resources(process):
     global ffmpeg_log_file
 
@@ -419,15 +452,11 @@ def start_recording():
             ffmpeg_log_file.flush()
             if capture_command:
                 if audio_command:
-                    audio_process = subprocess.Popen(
+                    audio_process, audio_started_at = _start_audio_capture(
                         audio_command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=ffmpeg_log_file,
+                        ffmpeg_log_file,
+                        audio_file,
                     )
-                    audio_started_at = time.monotonic()
-                    # Give the shared USB device enough time to claim its ALSA
-                    # interface before UVC video streaming starts.
-                    time.sleep(AUDIO_STARTUP_DELAY)
                 capture_process = subprocess.Popen(
                     capture_command,
                     stdout=subprocess.DEVNULL,
@@ -465,6 +494,20 @@ def start_recording():
                     stderr=ffmpeg_log_file,
                 )
             recording_output_file = output_file
+        except audio.AudioError as error:
+            _stop_capture_process(capture_process)
+            _stop_capture_process(audio_process)
+            _close_process_resources(ffmpeg_process)
+            details = _log_tail()
+            _clear_recording_state()
+            _remove_file(output_file)
+            _remove_file(raw_file)
+            _remove_file(audio_file)
+            return {
+                "status": "error",
+                "error_code": error.code,
+                "details": details or error.details or str(error),
+            }
         except (OSError, subprocess.SubprocessError) as error:
             _stop_capture_process(capture_process)
             _stop_capture_process(audio_process)
