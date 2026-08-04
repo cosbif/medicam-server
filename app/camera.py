@@ -132,6 +132,8 @@ def _build_linux_command(video_size: str, fps: str, output_file: str,
     return [
         "ffmpeg",
         "-hide_banner",
+        "-loglevel", "warning",
+        "-nostats",
         "-y",
         "-f", "mjpeg",
         "-framerate", fps,

@@ -64,6 +64,8 @@ class CameraCommandTests(unittest.TestCase):
         )
 
         self.assertIn("mjpeg", command)
+        self.assertEqual(command[command.index("-loglevel") + 1], "warning")
+        self.assertIn("-nostats", command)
         self.assertEqual(command[command.index("-i") + 1], "pipe:0")
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertNotIn("libx264", command)
