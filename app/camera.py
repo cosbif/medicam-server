@@ -22,11 +22,12 @@ FFMPEG_STOP_TIMEOUT = 10.0
 
 camera_settings = {
     "resolution": "FHD",
-    "fps": "15",
+    "fps": "30",
 }
 
 # FullHD is intentionally the maximum supported resolution. The camera exposes
-# stable FullHD MJPEG at 15 fps, while uncompressed YUYV is limited to 5 fps.
+# FullHD MJPEG at 60 fps; the Linux recorder keeps CPU usage low by stream
+# copying MJPEG and writing a normalized 30 fps output file.
 SUPPORTED_RESOLUTIONS = {
     "SD": "640x360",
     "HD": "1280x720",
@@ -37,8 +38,14 @@ LEGACY_RESOLUTION_MAP = {
     value: key for key, value in SUPPORTED_RESOLUTIONS.items()
 }
 
-SUPPORTED_FPS = {"15"}
-LEGACY_FPS_MAP = {"30": "15", "60": "15"}
+SUPPORTED_FPS = {"30"}
+LEGACY_FPS_MAP = {"15": "30", "60": "30"}
+LINUX_CAMERA_CAPTURE_FPS = {
+    "30": "60",
+}
+LINUX_OUTPUT_BITSTREAM_FILTER = {
+    "30": r"noise=drop=not(mod(n\,2)),setts=pts=N/(30*TB):dts=N/(30*TB):duration=1/(30*TB)",
+}
 
 ffmpeg_process = None
 ffmpeg_log_file = None
@@ -57,7 +64,7 @@ def _normalize_settings(settings: dict | None):
     fps = str(settings.get("fps", camera_settings["fps"]))
     fps = LEGACY_FPS_MAP.get(fps, fps)
     if fps not in SUPPORTED_FPS:
-        fps = "15"
+        fps = "30"
 
     return {
         "resolution": resolution,
@@ -106,13 +113,16 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
 
 def _build_linux_command(video_size: str, fps: str, output_file: str,
                          camera_device: str):
+    capture_fps = LINUX_CAMERA_CAPTURE_FPS.get(fps, fps)
+    bitstream_filter = LINUX_OUTPUT_BITSTREAM_FILTER.get(fps)
+
     return [
         "ffmpeg",
         "-hide_banner",
         "-y",
         "-f", "v4l2",
         "-input_format", "mjpeg",
-        "-framerate", fps,
+        "-framerate", capture_fps,
         "-video_size", video_size,
         "-i", camera_device,
         "-map", "0:v:0",
@@ -121,6 +131,11 @@ def _build_linux_command(video_size: str, fps: str, output_file: str,
         # decoding, colorspace conversion and re-encoding, which could process
         # FullHD at only ~0.43x realtime on the Radxa.
         "-c:v", "copy",
+        *(
+            ["-bsf:v", bitstream_filter]
+            if bitstream_filter
+            else []
+        ),
         output_file,
     ]
 
@@ -209,7 +224,7 @@ def start_recording():
 
         resolution_key = camera_settings.get("resolution", "FHD")
         video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
-        fps = str(camera_settings.get("fps", "15"))
+        fps = str(camera_settings.get("fps", "30"))
         if not video_size or fps not in SUPPORTED_FPS:
             normalized = _normalize_settings(camera_settings)
             camera_settings.update(normalized)

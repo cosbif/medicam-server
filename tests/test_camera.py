@@ -19,28 +19,30 @@ class CameraSettingsTests(unittest.TestCase):
 
     def test_removed_resolution_is_normalized_to_fullhd(self):
         self.assertEqual(
-            camera._normalize_settings({"resolution": "3840x2160", "fps": "15"}),
-            {"resolution": "FHD", "fps": "15"},
+            camera._normalize_settings({"resolution": "3840x2160", "fps": "30"}),
+            {"resolution": "FHD", "fps": "30"},
         )
 
     def test_legacy_fullhd_value_is_supported(self):
         self.assertEqual(
             camera._normalize_settings({"resolution": "1920x1080", "fps": 60}),
-            {"resolution": "FHD", "fps": "15"},
+            {"resolution": "FHD", "fps": "30"},
         )
 
-    def test_legacy_fps_values_are_normalized_to_stable_15_fps(self):
-        self.assertEqual(
-            camera._normalize_settings({"resolution": "FHD", "fps": "30"}),
-            {"resolution": "FHD", "fps": "15"},
-        )
+    def test_legacy_fps_values_are_normalized_to_30_fps(self):
+        for fps in ("15", "60"):
+            with self.subTest(fps=fps):
+                self.assertEqual(
+                    camera._normalize_settings({"resolution": "FHD", "fps": fps}),
+                    {"resolution": "FHD", "fps": "30"},
+                )
 
 
 class CameraCommandTests(unittest.TestCase):
     def test_linux_command_copies_camera_mjpeg_without_reencoding(self):
         command = camera._build_linux_command(
             "1920x1080",
-            "15",
+            "30",
             "videos/test.mp4",
             "/dev/v4l/by-id/camera-video-index0",
         )
@@ -52,8 +54,11 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("h264_rkmpp", command)
         self.assertNotIn("-thread_queue_size", command)
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
-        self.assertEqual(command[command.index("-framerate") + 1], "15")
-        self.assertNotIn("-bsf:v", command)
+        self.assertEqual(command[command.index("-framerate") + 1], "60")
+        self.assertIn("-bsf:v", command)
+        bitstream_filter = command[command.index("-bsf:v") + 1]
+        self.assertIn("noise=drop=not(mod(n\\,2))", bitstream_filter)
+        self.assertIn("setts=pts=N/(30*TB)", bitstream_filter)
         self.assertNotIn("+faststart", command)
 
 
