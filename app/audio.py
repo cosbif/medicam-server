@@ -17,6 +17,8 @@ LEVEL_SAMPLE_RATE = 16_000
 MAX_LEVEL_TEST_SECONDS = 5
 LEVEL_BUSY_ATTEMPTS = 4
 LEVEL_BUSY_RETRY_DELAY = 0.25
+AUDIO_BUFFER_TIME_US = 2_000_000
+AUDIO_PERIOD_TIME_US = 250_000
 
 _ARECORD_DEVICE_RE = re.compile(
     r"^card\s+(?P<card_index>\d+):\s+"
@@ -105,7 +107,8 @@ def build_arecord_command(audio_file: str, alsa_device: str) -> list[str]:
         "-f", AUDIO_FORMAT,
         "-r", str(AUDIO_SAMPLE_RATE),
         "-c", str(AUDIO_CHANNELS),
-        "--buffer-time=1000000",
+        f"--buffer-time={AUDIO_BUFFER_TIME_US}",
+        f"--period-time={AUDIO_PERIOD_TIME_US}",
         audio_file,
     ]
 

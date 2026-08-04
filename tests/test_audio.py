@@ -43,6 +43,8 @@ class AudioDiscoveryTests(unittest.TestCase):
         self.assertEqual(command[command.index("-f") + 1], "S16_LE")
         self.assertEqual(command[command.index("-r") + 1], "48000")
         self.assertEqual(command[command.index("-c") + 1], "1")
+        self.assertIn("--buffer-time=2000000", command)
+        self.assertIn("--period-time=250000", command)
 
 
 class AudioLevelTests(unittest.TestCase):

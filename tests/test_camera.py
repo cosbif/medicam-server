@@ -72,6 +72,19 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
+    def test_audio_temp_file_uses_memory_backed_storage(self):
+        with patch.object(camera, "AUDIO_TEMP_DIR", "/dev/shm"):
+            with patch("app.camera.os.path.isdir", return_value=True):
+                with patch("app.camera.os.access", return_value=True):
+                    path = camera._build_audio_temp_file(
+                        "videos/12-00-00_01.01.2026.mp4"
+                    )
+
+        self.assertEqual(
+            path,
+            "/dev/shm/medicam-12-00-00_01.01.2026.mp4.wav",
+        )
+
     def test_linux_capture_command_streams_camera_mjpeg_with_v4l2_ctl(self):
         command = camera._build_linux_capture_command(
             "1920x1080",

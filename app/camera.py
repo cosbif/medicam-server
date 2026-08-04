@@ -24,6 +24,7 @@ FFMPEG_REMUX_TIMEOUT = 180.0
 AUDIO_OPEN_ATTEMPTS = 8
 AUDIO_OPEN_PROBE_DELAY = 0.15
 AUDIO_OPEN_RETRY_DELAY = 0.35
+AUDIO_TEMP_DIR = os.environ.get("MEDICAM_AUDIO_TEMP_DIR", "/dev/shm")
 
 camera_settings = {
     "resolution": "FHD",
@@ -144,6 +145,17 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
 def _split_video_size(video_size: str):
     width, height = video_size.split("x", maxsplit=1)
     return width, height
+
+
+def _build_audio_temp_file(output_file: str):
+    # PCM is tiny compared with FullHD MJPEG but frequent synchronous writes to
+    # the same microSD can starve ALSA for several seconds. Linux tmpfs keeps
+    # audio capture independent from video I/O. Fall back to the video folder
+    # on systems without a writable /dev/shm.
+    temp_dir = AUDIO_TEMP_DIR
+    if not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
+        temp_dir = os.path.dirname(output_file) or "."
+    return os.path.join(temp_dir, f"medicam-{os.path.basename(output_file)}.wav")
 
 
 def _build_linux_capture_command(
@@ -408,7 +420,7 @@ def start_recording():
                         "error_code": "audio_device_unavailable",
                         "details": "Configured audio capture device is not available",
                     }
-                audio_file = f"{output_file}.wav"
+                audio_file = _build_audio_temp_file(output_file)
                 audio_command = audio.build_arecord_command(
                     audio_file,
                     selected_audio_device["id"],
