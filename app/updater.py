@@ -1,7 +1,6 @@
 # app/updater.py
 import subprocess
-import os
-from pathlib import Path
+import time
 
 #18#
 
@@ -19,7 +18,8 @@ def _run(cmd: list[str]):
         return {
             "ok": proc.returncode == 0,
             "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip()
+            "stderr": proc.stderr.strip(),
+            "returncode": proc.returncode,
         }
     except Exception as e:
         return {"ok": False, "stdout": "", "stderr": str(e)}
@@ -88,14 +88,22 @@ def apply_update():
     if not reset["ok"]:
         return {"ok": False, "step": "reset", **reset}
 
-    # 3. restart via systemd-run
-    log_debug("Attempting restart...")
-    restart = _run(["sudo", "/bin/systemctl", "start", "restart-medicam.service"])
+    # 3. Schedule restart after this HTTP response is returned. A synchronous
+    # restart kills the current uvicorn worker before /update/apply can respond,
+    # which makes successful updates look like HTTP 500 failures.
+    restart_unit = f"medicam-restart-{int(time.time())}"
+    log_debug(f"Scheduling restart via {restart_unit}...")
+    restart = _run([
+        "sudo",
+        "/usr/bin/systemd-run",
+        "--unit", restart_unit,
+        "--on-active=1",
+        "--collect",
+        "/bin/systemctl",
+        "restart",
+        "medicam.service",
+    ])
     log_debug(f"RESTART RESULT: {restart}")
-
-    # Extra: run journalctl for restart job
-    journal = _run(["journalctl", "-u", "medicam-restart", "--no-pager", "--since", "5 minutes ago"])
-    log_debug(f"JOURNAL OUTPUT: {journal}")
 
     log_debug("===== APPLY UPDATE END =====")
 
@@ -105,5 +113,6 @@ def apply_update():
     return {
         "ok": True,
         "step": "done",
-        "local": get_local_commit()
+        "local": get_local_commit(),
+        "restart_unit": restart_unit,
     }
