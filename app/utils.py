@@ -10,6 +10,9 @@ from pathlib import Path
 PROVISION_FILENAME = "provision.json"
 VIDEOS_DIR = "videos"
 API_TOKEN_BYTES = 32
+VIDEO_METADATA_CACHE_LIMIT = 512
+
+_VIDEO_METADATA_CACHE = {}
 
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
@@ -54,6 +57,20 @@ def list_videos():
 
 def get_video_metadata(filepath: str):
     try:
+        stat_result = os.stat(filepath)
+        cache_key = (
+            filepath,
+            stat_result.st_mtime_ns,
+            stat_result.st_size,
+        )
+    except OSError as e:
+        return {"error": str(e)}
+
+    cached = _VIDEO_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    try:
         # получаем JSON-вывод ffprobe для устойчивого парсинга
         cmd = [
             "ffprobe", "-v", "error",
@@ -64,7 +81,7 @@ def get_video_metadata(filepath: str):
             filepath
         ]
         import json as _json
-        result = subprocess.check_output(cmd, text=True)
+        result = subprocess.check_output(cmd, text=True, timeout=5)
         data = _json.loads(result)
 
         stream = data.get("streams", [{}])[0]
@@ -78,11 +95,15 @@ def get_video_metadata(filepath: str):
 
         duration = float(fmt.get("duration", 0.0))
 
-        return {
+        metadata = {
             "resolution": f"{width}x{height}" if width and height else "",
             "fps": round(fps, 2),
             "duration": round(duration, 2)
         }
+        if len(_VIDEO_METADATA_CACHE) >= VIDEO_METADATA_CACHE_LIMIT:
+            _VIDEO_METADATA_CACHE.clear()
+        _VIDEO_METADATA_CACHE[cache_key] = dict(metadata)
+        return metadata
     except Exception as e:
         return {"error": str(e)}
 

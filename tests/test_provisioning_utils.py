@@ -92,6 +92,35 @@ class ProvisionFileTests(unittest.TestCase):
 
         self.assertEqual(utils.get_video_path("clip.mp4"), "videos/clip.mp4")
 
+    def test_get_video_metadata_caches_unchanged_file_probe(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            video.write(b"fake")
+            video.flush()
+
+            utils._VIDEO_METADATA_CACHE.clear()
+            probe_json = json.dumps(
+                {
+                    "streams": [
+                        {
+                            "width": 1920,
+                            "height": 1080,
+                            "r_frame_rate": "30/1",
+                        }
+                    ],
+                    "format": {"duration": "10.0"},
+                }
+            )
+
+            with patch(
+                "app.utils.subprocess.check_output",
+                return_value=probe_json,
+            ) as check_output:
+                first = utils.get_video_metadata(video.name)
+                second = utils.get_video_metadata(video.name)
+
+            self.assertEqual(first, second)
+            self.assertEqual(check_output.call_count, 1)
+
 
 class BluetoothProvisioningTests(unittest.TestCase):
     def test_on_command_dispatches_complete_messages_outside_write_callback(self):
