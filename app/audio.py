@@ -98,18 +98,19 @@ def resolve_capture_device(configured_device: str | None = "auto") -> dict | Non
     return devices[0] if devices else None
 
 
-def build_arecord_command(audio_file: str, alsa_device: str) -> list[str]:
+def build_arecord_command(alsa_device: str) -> list[str]:
     return [
         "arecord",
         "-q",
         "-D", alsa_device,
-        "-t", "wav",
+        # Stream headerless PCM to stdout. The parent process owns the output
+        # file, so a USB disconnect cannot make arecord unlink captured audio.
+        "-t", "raw",
         "-f", AUDIO_FORMAT,
         "-r", str(AUDIO_SAMPLE_RATE),
         "-c", str(AUDIO_CHANNELS),
         f"--buffer-time={AUDIO_BUFFER_TIME_US}",
         f"--period-time={AUDIO_PERIOD_TIME_US}",
-        audio_file,
     ]
 
 

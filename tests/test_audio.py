@@ -31,20 +31,18 @@ class AudioDiscoveryTests(unittest.TestCase):
 
         self.assertEqual([item["card_id"] for item in devices], ["HD", "Lav"])
 
-    def test_recording_command_captures_mono_48khz_wav(self):
-        command = audio.build_arecord_command(
-            "videos/test.mp4.wav",
-            "plughw:CARD=HD,DEV=0",
-        )
+    def test_recording_command_streams_mono_48khz_pcm(self):
+        command = audio.build_arecord_command("plughw:CARD=HD,DEV=0")
 
         self.assertEqual(command[0], "arecord")
         self.assertEqual(command[command.index("-D") + 1], "plughw:CARD=HD,DEV=0")
-        self.assertEqual(command[command.index("-t") + 1], "wav")
+        self.assertEqual(command[command.index("-t") + 1], "raw")
         self.assertEqual(command[command.index("-f") + 1], "S16_LE")
         self.assertEqual(command[command.index("-r") + 1], "48000")
         self.assertEqual(command[command.index("-c") + 1], "1")
         self.assertIn("--buffer-time=2000000", command)
         self.assertIn("--period-time=250000", command)
+        self.assertNotIn("videos/test.mp4.wav", command)
 
 
 class AudioLevelTests(unittest.TestCase):

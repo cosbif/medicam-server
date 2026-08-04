@@ -155,7 +155,7 @@ def _build_audio_temp_file(output_file: str):
     temp_dir = AUDIO_TEMP_DIR
     if not os.path.isdir(temp_dir) or not os.access(temp_dir, os.W_OK):
         temp_dir = os.path.dirname(output_file) or "."
-    return os.path.join(temp_dir, f"medicam-{os.path.basename(output_file)}.wav")
+    return os.path.join(temp_dir, f"medicam-{os.path.basename(output_file)}.pcm")
 
 
 def _build_linux_capture_command(
@@ -195,6 +195,11 @@ def _build_linux_command(
         "-i", raw_file,
     ]
     if audio_file:
+        command.extend([
+            "-f", "s16le",
+            "-ar", str(audio.AUDIO_SAMPLE_RATE),
+            "-ac", str(audio.AUDIO_CHANNELS),
+        ])
         # This USB camera only allows simultaneous UVC and ALSA capture when
         # the audio interface is opened first. Drop that short audio lead so
         # both tracks begin at the same wall-clock moment in the MP4 file.
@@ -246,11 +251,12 @@ def _start_audio_capture(command, log_file, audio_file):
     """Open ALSA before UVC, tolerating short desktop audio probes."""
     last_return_code = None
     for attempt in range(1, AUDIO_OPEN_ATTEMPTS + 1):
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-        )
+        with open(audio_file, "wb") as audio_output:
+            process = subprocess.Popen(
+                command,
+                stdout=audio_output,
+                stderr=log_file,
+            )
         started_at = time.monotonic()
         time.sleep(AUDIO_OPEN_PROBE_DELAY)
         last_return_code = process.poll()
@@ -368,20 +374,24 @@ def start_recording():
     global recording_remux_command
 
     with recording_lock:
-        active_process = ffmpeg_process or capture_process or audio_process
-        if active_process is not None:
-            if active_process.poll() is None:
+        processes = [
+            process
+            for process in (ffmpeg_process, capture_process, audio_process)
+            if process is not None
+        ]
+        if processes:
+            if any(process.poll() is None for process in processes):
                 return {
                     "status": "already_recording",
                     "file": recording_output_file,
                 }
-
-            # A disconnected camera can terminate FFmpeg between API calls.
-            # Reap that process and allow the next /start request to recover.
-            _stop_capture_process(capture_process)
-            _stop_capture_process(audio_process)
-            _close_process_resources(ffmpeg_process)
-            _clear_recording_state()
+            # Preserve interrupted source files until /stop remuxes them. This
+            # can recover everything captured before a USB disconnect.
+            return {
+                "status": "recording_interrupted",
+                "file": recording_output_file,
+                "details": "Finalize the interrupted recording with /stop",
+            }
 
         resolution_key = camera_settings.get("resolution", "FHD")
         video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
@@ -422,7 +432,6 @@ def start_recording():
                     }
                 audio_file = _build_audio_temp_file(output_file)
                 audio_command = audio.build_arecord_command(
-                    audio_file,
                     selected_audio_device["id"],
                 )
             capture_command = _build_linux_capture_command(
@@ -472,7 +481,7 @@ def start_recording():
                 capture_process = subprocess.Popen(
                     capture_command,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=ffmpeg_log_file,
                 )
                 video_started_at = time.monotonic()
                 if audio_command:
@@ -604,13 +613,29 @@ def stop_recording():
         warning = None
 
         if capture is not None:
+            capture_was_running = capture.poll() is None
+            audio_was_running = (
+                audio_capture is not None and audio_capture.poll() is None
+            )
             capture_return_code = _stop_capture_process(capture)
             audio_return_code = _stop_capture_process(audio_capture)
-            # arecord handles SIGINT by finalizing the WAV header and returns 1
-            # on this platform. It was alive throughout recording, so this is
-            # a normal user-requested stop rather than a capture failure.
-            if audio_return_code not in (None, 0, 1, -signal.SIGINT):
-                warning = f"Audio capture exited with code {audio_return_code}"
+            if not capture_was_running:
+                warning = (
+                    "Video capture ended before stop "
+                    f"(code {capture_return_code})"
+                )
+            elif capture_return_code not in (None, 0, -signal.SIGINT):
+                warning = f"Video capture exited with code {capture_return_code}"
+            # arecord returns 1 after handling SIGINT on this platform. When it
+            # stayed alive throughout recording, this is a normal requested
+            # stop rather than a capture failure.
+            audio_stopped_normally = (
+                audio_return_code in (None, 0, -signal.SIGINT)
+                or (audio_return_code == 1 and audio_was_running)
+            )
+            if not audio_stopped_normally:
+                audio_warning = f"Audio capture exited with code {audio_return_code}"
+                warning = f"{warning}; {audio_warning}" if warning else audio_warning
             try:
                 remux = subprocess.run(
                     recording_remux_command,
@@ -676,11 +701,20 @@ def get_settings():
 
 def get_recording_status():
     video_process = ffmpeg_process or capture_process
-    recording = video_process is not None and video_process.poll() is None
+    capture_active = video_process is not None and video_process.poll() is None
     audio_recording = audio_process is not None and audio_process.poll() is None
+    pending_finalization = (
+        recording_output_file is not None
+        and any(
+            process is not None
+            for process in (ffmpeg_process, capture_process, audio_process)
+        )
+    )
     return {
-        "recording": recording,
-        "file": recording_output_file if recording else None,
+        "recording": pending_finalization,
+        "capture_active": capture_active,
+        "interrupted": pending_finalization and not capture_active,
+        "file": recording_output_file if pending_finalization else None,
         "audio": {
             "enabled": recording_audio_file is not None,
             "recording": audio_recording,

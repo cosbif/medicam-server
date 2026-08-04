@@ -1,7 +1,7 @@
 import io
 import os
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 from app import camera
 
@@ -82,7 +82,7 @@ class CameraCommandTests(unittest.TestCase):
 
         self.assertEqual(
             path,
-            "/dev/shm/medicam-12-00-00_01.01.2026.mp4.wav",
+            "/dev/shm/medicam-12-00-00_01.01.2026.mp4.pcm",
         )
 
     def test_linux_capture_command_streams_camera_mjpeg_with_v4l2_ctl(self):
@@ -127,7 +127,7 @@ class CameraCommandTests(unittest.TestCase):
             "videos/test.mp4.mjpeg",
             "30",
             "videos/test.mp4",
-            audio_file="videos/test.mp4.wav",
+            audio_file="/dev/shm/videos-test.mp4.pcm",
             audio_lead_seconds=0.125,
         )
 
@@ -137,12 +137,14 @@ class CameraCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ar") + 1], "48000")
         self.assertEqual(command[command.index("-ac") + 1], "1")
         self.assertEqual(command[command.index("-ss") + 1], "0.125000")
+        self.assertIn("s16le", command)
         self.assertIn("aresample=async=1:first_pts=0", command)
         self.assertIn("-shortest", command)
         self.assertNotIn("-an", command)
         self.assertNotIn("libx264", command)
 
     @patch("app.camera._remove_file")
+    @patch("app.camera.open", new_callable=mock_open)
     @patch("app.camera.time.sleep")
     @patch("app.camera.time.monotonic", side_effect=[10.0, 11.0])
     @patch("app.camera.subprocess.Popen")
@@ -151,6 +153,7 @@ class CameraCommandTests(unittest.TestCase):
         popen_mock,
         _monotonic,
         sleep_mock,
+        _open_mock,
         remove_file_mock,
     ):
         busy_process = Mock()
