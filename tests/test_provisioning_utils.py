@@ -2,11 +2,13 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import utils
 from app.bluetooth_provision import ProvisionService
+from app.manage_ble import should_run_ble
 
 
 class NmcliParsingTests(unittest.TestCase):
@@ -35,6 +37,31 @@ class NmcliParsingTests(unittest.TestCase):
         self.assertNotIn("secret-password", args)
         self.assertEqual(kwargs["input"], "secret-password\n")
         self.assertEqual(result["ip"], "192.168.1.50")
+
+    def test_rejects_invalid_wifi_input_before_running_nmcli(self):
+        with patch("app.utils.subprocess.run") as run:
+            short_password = utils.connect_wifi_nmcli("Office", "short")
+            long_ssid = utils.connect_wifi_nmcli("x" * 33, "valid-pass")
+
+        run.assert_not_called()
+        self.assertEqual(short_password["error_code"], "invalid_password")
+        self.assertEqual(long_ssid["error_code"], "ssid_too_long")
+
+    def test_classifies_common_nmcli_failures(self):
+        self.assertEqual(
+            utils.classify_nmcli_error(
+                "Secrets were required, but not provided: invalid secrets"
+            ),
+            "invalid_password",
+        )
+        self.assertEqual(
+            utils.classify_nmcli_error("No network with SSID 'Missing' found"),
+            "network_not_found",
+        )
+        self.assertEqual(
+            utils.classify_nmcli_error("Activation timed out"),
+            "connection_timeout",
+        )
 
 
 class ProvisionFileTests(unittest.TestCase):
@@ -84,6 +111,31 @@ class ProvisionFileTests(unittest.TestCase):
                 self.assertTrue(utils.verify_api_token(token))
                 self.assertFalse(utils.verify_api_token("wrong"))
 
+    def test_recovery_window_expires_and_successful_provisioning_closes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                utils.set_provisioned(True, {"ssid": "Office"})
+                expires_at = utils.start_ble_recovery(120)
+                before_expiry = datetime.fromisoformat(expires_at) - timedelta(seconds=1)
+                after_expiry = datetime.fromisoformat(expires_at) + timedelta(seconds=1)
+
+                self.assertTrue(utils.is_ble_recovery_active(before_expiry))
+                self.assertFalse(utils.is_ble_recovery_active(after_expiry))
+
+                utils.set_provisioned(True, {"ssid": "Office"})
+                self.assertFalse(utils.is_ble_recovery_active())
+
+    def test_device_identity_is_stable_and_not_raw_machine_id(self):
+        with patch.dict("os.environ", {"MEDICAM_DEVICE_ID": "factory-secret"}):
+            first = utils.get_device_id()
+            second = utils.get_device_id()
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 8)
+        self.assertNotIn("factory", first.lower())
+        self.assertTrue(utils.get_device_name().startswith("Medicam-"))
     def test_get_video_path_rejects_traversal_and_non_video_names(self):
         for filename in ("../secret.mp4", "nested/file.mp4", "clip.mjpeg", ""):
             with self.subTest(filename=filename):
@@ -122,6 +174,15 @@ class ProvisionFileTests(unittest.TestCase):
             self.assertEqual(check_output.call_count, 1)
 
 
+class BleManagerTests(unittest.TestCase):
+    def test_ble_runs_for_setup_disconnect_and_recovery_windows(self):
+        self.assertTrue(should_run_ble(False, True, False, False))
+        self.assertTrue(should_run_ble(True, False, False, False))
+        self.assertTrue(should_run_ble(True, True, True, False))
+        self.assertTrue(should_run_ble(True, True, False, True))
+        self.assertFalse(should_run_ble(True, True, False, False))
+
+
 class BluetoothProvisioningTests(unittest.TestCase):
     def test_on_command_dispatches_complete_messages_outside_write_callback(self):
         service = object.__new__(ProvisionService)
@@ -157,8 +218,20 @@ class BluetoothProvisioningTests(unittest.TestCase):
         self.assertEqual(
             networks,
             [
-                {"ssid": "Home:Main", "signal": 87, "secured": True},
-                {"ssid": "Cafe", "signal": 52, "secured": False},
+                {
+                    "ssid": "Home:Main",
+                    "signal": 87,
+                    "secured": True,
+                    "security": "WPA2",
+                    "supported": True,
+                },
+                {
+                    "ssid": "Cafe",
+                    "signal": 52,
+                    "secured": False,
+                    "security": "",
+                    "supported": True,
+                },
             ],
         )
 

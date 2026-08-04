@@ -27,6 +27,10 @@ class UpdaterTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["restart_unit"], "medicam-restart-1234567890")
+        self.assertEqual(
+            result["ble_restart_unit"],
+            "medicam-ble-restart-1234567890",
+        )
         self.assertIn(
             [
                 "sudo",
@@ -38,6 +42,21 @@ class UpdaterTests(unittest.TestCase):
                 "/bin/systemctl",
                 "restart",
                 "medicam.service",
+                "medicam-ble-manager.service",
+            ],
+            commands,
+        )
+        self.assertIn(
+            [
+                "sudo",
+                "/usr/bin/systemd-run",
+                "--unit",
+                "medicam-ble-restart-1234567890",
+                "--on-active=1",
+                "--collect",
+                "/bin/systemctl",
+                "try-restart",
+                "medicam-ble.service",
             ],
             commands,
         )

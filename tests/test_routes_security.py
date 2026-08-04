@@ -82,6 +82,8 @@ class RouteSecurityTests(unittest.TestCase):
             "/wifi",
             "/wifi/connect",
             "/wifi/status",
+            "/provision/recovery/start",
+            "/provision/recovery/stop",
         }
         update_paths = {
             "/update/check",
@@ -156,11 +158,48 @@ class RouteSecurityTests(unittest.TestCase):
         self.assertNotIn("ssid", public_status["wifi"])
         self.assertNotIn("ip", public_status["wifi"])
         self.assertNotIn("ble_service", public_status)
+        self.assertIn("device", public_status)
+        self.assertNotIn("recovery", public_status)
 
         self.assertEqual(authenticated_status["info"]["ssid"], "Office")
         self.assertEqual(authenticated_status["wifi"]["ssid"], "Office")
         self.assertEqual(authenticated_status["wifi"]["ip"], "192.168.1.50")
         self.assertIn("ble_service", authenticated_status)
+        self.assertIn("recovery", authenticated_status)
+
+    def test_authenticated_owner_can_open_recovery_window(self):
+        token = self._provision()
+
+        with patch(
+            "app.routes._systemctl_action",
+            return_value={"ok": True, "stdout": "", "stderr": ""},
+        ):
+            result = asyncio.run(routes.provision_recovery_start(120, _ok=True))
+
+        self.assertEqual(result["status"], "recovery_started")
+        self.assertTrue(utils.is_ble_recovery_active())
+
+        stopped = asyncio.run(routes.provision_recovery_stop(_ok=True))
+        self.assertEqual(stopped["status"], "recovery_stopped")
+        self.assertFalse(utils.is_ble_recovery_active())
+
+        self.assertTrue(utils.verify_api_token(token))
+
+    def test_owner_reset_revokes_token_and_reopens_ble(self):
+        token = self._provision()
+
+        with patch(
+            "app.routes._systemctl_action",
+            return_value={"ok": True, "stdout": "", "stderr": ""},
+        ) as systemctl_action:
+            result = asyncio.run(
+                routes.provision_reset(self._request(self._headers(token)))
+            )
+
+        self.assertEqual(result["status"], "reset")
+        self.assertFalse(utils.is_provisioned())
+        self.assertFalse(utils.verify_api_token(token))
+        systemctl_action.assert_called_once_with("restart", routes.BLE_SERVICE)
 
     def test_video_endpoints_reject_bad_names_and_authorize_streaming(self):
         token = self._provision()

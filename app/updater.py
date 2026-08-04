@@ -102,17 +102,34 @@ def apply_update():
         "/bin/systemctl",
         "restart",
         "medicam.service",
+        "medicam-ble-manager.service",
     ])
     log_debug(f"RESTART RESULT: {restart}")
+
+    ble_restart_unit = f"medicam-ble-restart-{int(time.time())}"
+    ble_restart = _run([
+        "sudo",
+        "/usr/bin/systemd-run",
+        "--unit", ble_restart_unit,
+        "--on-active=1",
+        "--collect",
+        "/bin/systemctl",
+        "try-restart",
+        "medicam-ble.service",
+    ])
+    log_debug(f"BLE RESTART RESULT: {ble_restart}")
 
     log_debug("===== APPLY UPDATE END =====")
 
     if not restart["ok"]:
         return {"ok": False, "step": "restart", **restart}
+    if not ble_restart["ok"]:
+        return {"ok": False, "step": "ble_restart", **ble_restart}
 
     return {
         "ok": True,
         "step": "done",
         "local": get_local_commit(),
         "restart_unit": restart_unit,
+        "ble_restart_unit": ble_restart_unit,
     }

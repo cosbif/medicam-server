@@ -26,7 +26,7 @@ else:
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 CMD_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
 RESP_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_COMMAND_BYTES = 8192
 
 PROVISION_FILE = utils._provision_path()
@@ -95,7 +95,7 @@ class ProvisionService:
 
         self.periph = peripheral.Peripheral(
             adapter_address=mac,
-            local_name="MedicamProvision"
+            local_name=utils.get_device_name()
         )
 
         print("[BLE] Peripheral created via bluezero")
@@ -268,10 +268,19 @@ class ProvisionService:
             "status": "ok",
             "protocol": PROTOCOL_VERSION,
             "device": "Medicam",
+            "device_id": utils.get_device_id(),
+            "device_name": utils.get_device_name(),
             "provisioned": utils.is_provisioned(),
             "wifi_connected": is_wifi_connected(),
             "ssid": get_wifi_ssid(),
             "ip": "" if TEST_MODE else utils.get_primary_ipv4(),
+            "recovery_active": utils.is_ble_recovery_active(),
+            "capabilities": [
+                "wifi_scan",
+                "wifi_connect",
+                "session_token",
+                "recovery_window",
+            ],
         }
 
     # ---------------------------
@@ -299,6 +308,8 @@ class ProvisionService:
                         "status": "connected",
                         "ip": ip,
                         "api_token": api_token,
+                        "device_id": utils.get_device_id(),
+                        "device_name": utils.get_device_name(),
                     },
                     request_id=request_id,
                 )
@@ -306,7 +317,7 @@ class ProvisionService:
                 self._set_response(
                     {
                         "status": "failed",
-                        "stderr": result.get("stderr", ""),
+                        "error_code": result.get("error_code", "connection_failed"),
                     },
                     request_id=request_id,
                 )
@@ -444,6 +455,11 @@ class ProvisionService:
                             "ssid": ssid[:64],
                             "signal": signal,
                             "secured": bool(security.strip()),
+                            "security": security.strip(),
+                            "supported": not any(
+                                marker in security.upper()
+                                for marker in ("802.1X", "EAP")
+                            ),
                         }
             networks = list(by_ssid.values())
             networks = sorted(networks, key=lambda x: -x["signal"])

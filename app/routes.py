@@ -276,14 +276,12 @@ async def connect_wifi(ssid: str = Form(...), password: str = Form(None), _ok: b
         utils.set_provisioned(True, {"ssid": ssid, "ip": result["ip"]})
         return {
             "status": "connected",
-            "stdout": result["stdout"],
             "ip": result["ip"],
         }
 
     return {
         "status": "error",
-        "stdout": result["stdout"],
-        "stderr": result["stderr"],
+        "error_code": result.get("error_code", "connection_failed"),
     }
     
 @router.get("/wifi/status")
@@ -303,6 +301,11 @@ async def provision_status(request: Request):
     authenticated = _is_authenticated(request)
     payload = {
         "provisioned": utils.is_provisioned(),
+        "device": {
+            "id": utils.get_device_id(),
+            "name": utils.get_device_name(),
+        },
+        "protocol": 3,
         "wifi": {
             "connected": utils.is_wifi_connected(),
         },
@@ -312,13 +315,41 @@ async def provision_status(request: Request):
         payload["wifi"]["ssid"] = utils.get_wifi_ssid()
         payload["wifi"]["ip"] = utils.get_primary_ipv4()
         payload["ble_service"] = _systemctl_status(BLE_SERVICE)
+        payload["recovery"] = {
+            "active": utils.is_ble_recovery_active(),
+            "expires_at": utils.get_ble_recovery_until(),
+        }
     return payload
+
+
+@router.post("/provision/recovery/start")
+async def provision_recovery_start(
+    duration_seconds: int = Form(600),
+    _ok: bool = Depends(require_api_auth),
+):
+    expires_at = utils.start_ble_recovery(duration_seconds)
+    start = _systemctl_action("start", BLE_SERVICE)
+    return {
+        "status": "recovery_started",
+        "expires_at": expires_at,
+        "ble_start": start,
+        "ble_service": _systemctl_status(BLE_SERVICE),
+    }
+
+
+@router.post("/provision/recovery/stop")
+async def provision_recovery_stop(_ok: bool = Depends(require_api_auth)):
+    utils.stop_ble_recovery()
+    return {
+        "status": "recovery_stopped",
+        "ble_service": _systemctl_status(BLE_SERVICE),
+    }
 
 @router.post("/provision/reset")
 async def provision_reset(request: Request):
     if utils.is_provisioned() and not _is_authenticated(request):
         raise HTTPException(status_code=401, detail="invalid_api_token")
-    # сбросим статус (например для теста) и поднимем BLE-провижининг заново
+    # Rotate ownership credentials and expose BLE for the next owner.
     utils.set_provisioned(False, {})
     restart = _systemctl_action("restart", BLE_SERVICE)
     return {
