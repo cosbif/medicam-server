@@ -270,8 +270,13 @@ class ProvisionService:
             ip = result.get("ip", "")
             if ok:
                 utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
+                api_token = utils.get_api_token()
                 self._set_response(
-                    {"status": "connected", "ip": ip},
+                    {
+                        "status": "connected",
+                        "ip": ip,
+                        "api_token": api_token,
+                    },
                     request_id=request_id,
                 )
             else:

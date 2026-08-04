@@ -1,11 +1,15 @@
 import os
 import re
+import hmac
+import secrets
 import subprocess
 from datetime import datetime
 import json
 from pathlib import Path
 
 PROVISION_FILENAME = "provision.json"
+VIDEOS_DIR = "videos"
+API_TOKEN_BYTES = 32
 
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
@@ -13,16 +17,39 @@ def iterfile(path: str):
             yield chunk
 
 def get_video_path(filename: str):
-    return os.path.join("videos", filename)
+    video_name = _safe_video_filename(filename)
+    return os.path.join(VIDEOS_DIR, video_name)
+
+
+def _safe_video_filename(filename: str):
+    filename = (filename or "").strip()
+    if not filename:
+        raise ValueError("filename_required")
+
+    basename = os.path.basename(filename)
+    if basename != filename:
+        raise ValueError("invalid_video_filename")
+
+    if filename in {".", ".."} or ".." in Path(filename).parts:
+        raise ValueError("invalid_video_filename")
+
+    if not filename.lower().endswith(".mp4"):
+        raise ValueError("invalid_video_filename")
+
+    return filename
 
 def get_output_filename():
-    os.makedirs("videos", exist_ok=True)
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%H-%M-%S_%d.%m.%Y")
-    return os.path.join("videos", f"{timestamp}.mp4")
+    return os.path.join(VIDEOS_DIR, f"{timestamp}.mp4")
 
 def list_videos():
-    os.makedirs("videos", exist_ok=True)
-    files = sorted(os.listdir("videos"))
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
+    files = sorted(
+        filename
+        for filename in os.listdir(VIDEOS_DIR)
+        if filename.lower().endswith(".mp4")
+    )
     return files
 
 def get_video_metadata(filepath: str):
@@ -222,6 +249,10 @@ def set_provisioned(value: bool, info: dict | None = None):
         data.setdefault("info", {}).update(info)
     elif info is not None:
         data["info"] = dict(info)
+    if value:
+        data["api_token"] = data.get("api_token") or generate_api_token()
+    else:
+        data.pop("api_token", None)
     # добавим timestamp
     from datetime import datetime
     data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
@@ -251,6 +282,30 @@ def _normalize_provision_file_permissions(path: Path):
         os.chmod(path, 0o664)
     except Exception:
         pass
+
+
+def generate_api_token() -> str:
+    return secrets.token_urlsafe(API_TOKEN_BYTES)
+
+
+def get_api_token() -> str:
+    path = _provision_path()
+    try:
+        if not path.exists():
+            return ""
+        with open(path, "r") as f:
+            data = json.load(f)
+        token = data.get("api_token", "")
+        return token if isinstance(token, str) else ""
+    except Exception:
+        return ""
+
+
+def verify_api_token(token: str | None) -> bool:
+    expected = get_api_token()
+    if not expected or not token:
+        return False
+    return hmac.compare_digest(token, expected)
 
 def get_provision_info() -> dict:
     """Возвращает словарь с инфо (ssid, ip и т.п.) или пустой словарь."""

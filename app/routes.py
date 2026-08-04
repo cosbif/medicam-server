@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Form, Depends, Request
 from fastapi.responses import FileResponse, Response
 from app import camera, utils, updater
+import ipaddress
 import os
 import shutil
 import platform
@@ -10,11 +11,37 @@ import subprocess
 from app.updater import check_for_update, apply_update
 
 BLE_SERVICE = "medicam-ble.service"
+AUTH_HEADER = "x-medicam-token"
 
-def require_provisioned():
-    '''if not utils.is_provisioned():
-        raise HTTPException(status_code=403, detail="device_not_provisioned")'''
+
+def _token_from_request(request: Request):
+    return request.headers.get(AUTH_HEADER)
+
+
+def _is_authenticated(request: Request):
+    return utils.verify_api_token(_token_from_request(request))
+
+
+def require_api_auth(request: Request):
+    if not utils.is_provisioned():
+        raise HTTPException(status_code=403, detail="device_not_provisioned")
+    if not _is_authenticated(request):
+        raise HTTPException(status_code=401, detail="invalid_api_token")
     return True
+
+
+def _is_loopback_request(request: Request):
+    client_host = request.client.host if request.client else ""
+    try:
+        return ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        return client_host in {"localhost"}
+
+
+def require_update_auth(request: Request):
+    if _is_loopback_request(request):
+        return True
+    return require_api_auth(request)
 
 router = APIRouter()
 
@@ -73,18 +100,18 @@ async def ping():
 # 📼 Запись
 # -------------------
 @router.post("/start")
-def start_recording(_ok: bool = Depends(require_provisioned)):
+def start_recording(_ok: bool = Depends(require_api_auth)):
     return camera.start_recording()
 
 @router.post("/stop")
-def stop_recording(_ok: bool = Depends(require_provisioned)):
+def stop_recording(_ok: bool = Depends(require_api_auth)):
     return camera.stop_recording()
     
 # -------------------
 # 🎞 Управление видео
 # -------------------
 @router.get("/videos")
-async def list_videos(_ok: bool = Depends(require_provisioned)):
+async def list_videos(_ok: bool = Depends(require_api_auth)):
     videos = utils.list_videos()
     video_info = []
     for f in videos:
@@ -98,8 +125,11 @@ async def list_videos(_ok: bool = Depends(require_provisioned)):
     return {"videos": video_info}
 
 @router.get("/videos/{filename}")
-async def get_video(filename: str, request: Request, _ok: bool = Depends(require_provisioned)):
-    filepath = utils.get_video_path(filename)
+async def get_video(filename: str, request: Request, _ok: bool = Depends(require_api_auth)):
+    try:
+        filepath = utils.get_video_path(filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_video_filename")
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -108,11 +138,16 @@ async def get_video(filename: str, request: Request, _ok: bool = Depends(require
 
     if range_header:
         # Пример: Range: bytes=0-1023
-        range_value = range_header.strip().lower().replace("bytes=", "")
-        start, end = range_value.split("-") if "-" in range_value else (0, "")
-        start = int(start) if start else 0
-        end = int(end) if end else file_size - 1
-        end = min(end, file_size - 1)
+        try:
+            range_value = range_header.strip().lower().replace("bytes=", "")
+            start, end = range_value.split("-") if "-" in range_value else (0, "")
+            start = int(start) if start else 0
+            end = int(end) if end else file_size - 1
+            end = min(end, file_size - 1)
+            if start < 0 or end < start or start >= file_size:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=416, detail="invalid_range")
 
         with open(filepath, "rb") as f:
             f.seek(start)
@@ -139,27 +174,33 @@ async def get_video(filename: str, request: Request, _ok: bool = Depends(require
 
 
 @router.get("/download/{filename}")
-async def download_video(filename: str, _ok: bool = Depends(require_provisioned)):
-    filepath = utils.get_video_path(filename)
+async def download_video(filename: str, _ok: bool = Depends(require_api_auth)):
+    try:
+        filepath = utils.get_video_path(filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_video_filename")
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=filepath, filename=filename, media_type="video/mp4")
 
 @router.delete("/delete/{filename}")
-async def delete_video(filename: str, _ok: bool = Depends(require_provisioned)):
-    filepath = utils.get_video_path(filename)
+async def delete_video(filename: str, _ok: bool = Depends(require_api_auth)):
+    try:
+        filepath = utils.get_video_path(filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_video_filename")
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
     os.remove(filepath)
     return {"status": "deleted", "file": filename}
 
 @router.delete("/videos/clear")
-async def clear_all_videos(_ok: bool = Depends(require_provisioned)):
-    folder = "videos"
+async def clear_all_videos(_ok: bool = Depends(require_api_auth)):
+    folder = utils.VIDEOS_DIR
     deleted = []
     if os.path.exists(folder):
-        for f in os.listdir(folder):
-            path = os.path.join(folder, f)
+        for f in utils.list_videos():
+            path = utils.get_video_path(f)
             os.remove(path)
             deleted.append(f)
     return {"status": "all_deleted", "files": deleted}
@@ -168,7 +209,7 @@ async def clear_all_videos(_ok: bool = Depends(require_provisioned)):
 # 💾 Хранилище
 # -------------------
 @router.get("/storage")
-async def get_storage_info():
+async def get_storage_info(_ok: bool = Depends(require_api_auth)):
     total, used, free = shutil.disk_usage(".")
     free_gb = round(free / (1024 ** 3), 2)
     return {
@@ -182,14 +223,14 @@ async def get_storage_info():
 # ⚙️ Настройки камеры
 # -------------------
 @router.get("/settings")
-async def get_settings():
+async def get_settings(_ok: bool = Depends(require_api_auth)):
     return camera.get_settings()
 
 @router.post("/settings")
 async def update_settings(
     resolution: str = Form(None),
     fps: str = Form(None),
-    _ok: bool = Depends(require_provisioned)):
+    _ok: bool = Depends(require_api_auth)):
     return camera.update_settings(resolution, fps)
 
 
@@ -197,7 +238,7 @@ async def update_settings(
 # 📡 Wi-Fi
 # -------------------
 @router.get("/wifi")
-async def list_wifi():
+async def list_wifi(_ok: bool = Depends(require_api_auth)):
     system = platform.system()
     try:
         if system == "Windows":
@@ -229,7 +270,7 @@ async def list_wifi():
         return {"networks": []}
 
 @router.post("/wifi/connect")
-async def connect_wifi(ssid: str = Form(...), password: str = Form(None)):
+async def connect_wifi(ssid: str = Form(...), password: str = Form(None), _ok: bool = Depends(require_api_auth)):
     result = utils.connect_wifi_nmcli(ssid, password, timeout=60)
     if result["ok"]:
         utils.set_provisioned(True, {"ssid": ssid, "ip": result["ip"]})
@@ -246,7 +287,7 @@ async def connect_wifi(ssid: str = Form(...), password: str = Form(None)):
     }
     
 @router.get("/wifi/status")
-async def wifi_status():
+async def wifi_status(_ok: bool = Depends(require_api_auth)):
     connected = utils.is_wifi_connected()
     return {
         "connected": connected,
@@ -258,20 +299,25 @@ async def wifi_status():
 # 🔵 Bluetooth (заглушка)
 # -------------------
 @router.get("/provision/status")
-async def provision_status():
-    return {
+async def provision_status(request: Request):
+    authenticated = _is_authenticated(request)
+    payload = {
         "provisioned": utils.is_provisioned(),
-        "info": utils.get_provision_info(),
         "wifi": {
             "connected": utils.is_wifi_connected(),
-            "ssid": utils.get_wifi_ssid(),
-            "ip": utils.get_primary_ipv4(),
         },
-        "ble_service": _systemctl_status(BLE_SERVICE),
     }
+    if authenticated:
+        payload["info"] = utils.get_provision_info()
+        payload["wifi"]["ssid"] = utils.get_wifi_ssid()
+        payload["wifi"]["ip"] = utils.get_primary_ipv4()
+        payload["ble_service"] = _systemctl_status(BLE_SERVICE)
+    return payload
 
 @router.post("/provision/reset")
-async def provision_reset():
+async def provision_reset(request: Request):
+    if utils.is_provisioned() and not _is_authenticated(request):
+        raise HTTPException(status_code=401, detail="invalid_api_token")
     # сбросим статус (например для теста) и поднимем BLE-провижининг заново
     utils.set_provisioned(False, {})
     restart = _systemctl_action("restart", BLE_SERVICE)
@@ -286,7 +332,7 @@ async def provision_reset():
 # -------------------
 
 @router.get("/update/check")
-async def update_check(_ok: bool = Depends(require_provisioned)):
+async def update_check(_ok: bool = Depends(require_update_auth)):
     """
     Возвращает текущий и удалённый git commit.
     """
@@ -294,7 +340,7 @@ async def update_check(_ok: bool = Depends(require_provisioned)):
 
 
 @router.post("/update/apply")
-async def update_apply(_ok: bool = Depends(require_provisioned)):
+async def update_apply(_ok: bool = Depends(require_update_auth)):
     """
     Выполняет git pull (fetch + reset) и перезапуск сервиса.
     """

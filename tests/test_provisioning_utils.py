@@ -51,6 +51,7 @@ class ProvisionFileTests(unittest.TestCase):
         self.assertFalse(data["provisioned"])
         self.assertNotIn("ssid", data["info"])
         self.assertNotIn("ip", data["info"])
+        self.assertNotIn("api_token", data)
         self.assertIn("updated_at", data["info"])
 
     def test_set_provisioned_replaces_existing_file_atomically(self):
@@ -70,6 +71,26 @@ class ProvisionFileTests(unittest.TestCase):
 
         self.assertTrue(data["provisioned"])
         self.assertEqual(data["info"]["ssid"], "New")
+
+    def test_set_provisioned_creates_and_verifies_api_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                utils.set_provisioned(True, {"ssid": "Office"})
+                token = utils.get_api_token()
+
+                self.assertTrue(token)
+                self.assertTrue(utils.verify_api_token(token))
+                self.assertFalse(utils.verify_api_token("wrong"))
+
+    def test_get_video_path_rejects_traversal_and_non_video_names(self):
+        for filename in ("../secret.mp4", "nested/file.mp4", "clip.mjpeg", ""):
+            with self.subTest(filename=filename):
+                with self.assertRaises(ValueError):
+                    utils.get_video_path(filename)
+
+        self.assertEqual(utils.get_video_path("clip.mp4"), "videos/clip.mp4")
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
