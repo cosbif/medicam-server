@@ -25,9 +25,9 @@ camera_settings = {
     "fps": "30",
 }
 
-# FullHD is intentionally the maximum supported resolution. The camera exposes
-# FullHD MJPEG at 60 fps; the Linux recorder keeps CPU usage low by stream
-# copying MJPEG and writing a normalized 30 fps output file.
+# FullHD is intentionally the maximum supported resolution. The Linux recorder
+# keeps CPU usage low by stream copying the camera's FullHD MJPEG stream and
+# writing a normalized 30 fps output file.
 SUPPORTED_RESOLUTIONS = {
     "SD": "640x360",
     "HD": "1280x720",
@@ -41,10 +41,10 @@ LEGACY_RESOLUTION_MAP = {
 SUPPORTED_FPS = {"30"}
 LEGACY_FPS_MAP = {"15": "30", "60": "30"}
 LINUX_CAMERA_CAPTURE_FPS = {
-    "30": "60",
+    "30": "30",
 }
 LINUX_OUTPUT_BITSTREAM_FILTER = {
-    "30": r"noise=drop=not(mod(n\,2)),setts=pts=N/(30*TB):dts=N/(30*TB):duration=1/(30*TB)",
+    "30": r"setts=pts=N/(30*TB):dts=N/(30*TB):duration=1/(30*TB)",
 }
 
 ffmpeg_process = None

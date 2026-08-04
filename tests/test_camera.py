@@ -54,10 +54,9 @@ class CameraCommandTests(unittest.TestCase):
         self.assertNotIn("h264_rkmpp", command)
         self.assertNotIn("-thread_queue_size", command)
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
-        self.assertEqual(command[command.index("-framerate") + 1], "60")
+        self.assertEqual(command[command.index("-framerate") + 1], "30")
         self.assertIn("-bsf:v", command)
         bitstream_filter = command[command.index("-bsf:v") + 1]
-        self.assertIn("noise=drop=not(mod(n\\,2))", bitstream_filter)
         self.assertIn("setts=pts=N/(30*TB)", bitstream_filter)
         self.assertNotIn("+faststart", command)
 
