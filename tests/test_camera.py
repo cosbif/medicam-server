@@ -43,6 +43,7 @@ class CameraCommandTests(unittest.TestCase):
         command = camera._build_linux_capture_command(
             "1920x1080",
             "30",
+            "videos/test.mp4.mjpeg",
             "/dev/v4l/by-id/camera-video-index0",
         )
 
@@ -53,20 +54,19 @@ class CameraCommandTests(unittest.TestCase):
         self.assertIn("--set-fmt-video=width=1920,height=1080,pixelformat=MJPG", command)
         self.assertIn("--set-parm=30", command)
         self.assertIn("--stream-mmap=8", command)
-        self.assertIn("--stream-to=-", command)
+        self.assertIn("--stream-to=videos/test.mp4.mjpeg", command)
 
-    def test_linux_ffmpeg_command_muxes_mjpeg_pipe_without_reencoding(self):
+    def test_linux_ffmpeg_command_remuxes_mjpeg_file_without_reencoding(self):
         command = camera._build_linux_command(
-            "1920x1080",
+            "videos/test.mp4.mjpeg",
             "30",
             "videos/test.mp4",
-            "/dev/v4l/by-id/camera-video-index0",
         )
 
         self.assertIn("mjpeg", command)
         self.assertEqual(command[command.index("-loglevel") + 1], "warning")
         self.assertIn("-nostats", command)
-        self.assertEqual(command[command.index("-i") + 1], "pipe:0")
+        self.assertEqual(command[command.index("-i") + 1], "videos/test.mp4.mjpeg")
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertNotIn("libx264", command)
         self.assertNotIn("mpeg4", command)

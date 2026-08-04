@@ -20,6 +20,7 @@ FFMPEG_LOG_FILE = "ffmpeg.log"
 CAMERA_DISCOVERY_TIMEOUT = 3.0
 FFMPEG_STARTUP_DELAY = 1.0
 FFMPEG_STOP_TIMEOUT = 10.0
+FFMPEG_REMUX_TIMEOUT = 180.0
 
 camera_settings = {
     "resolution": "FHD",
@@ -47,6 +48,8 @@ capture_process = None
 ffmpeg_process = None
 ffmpeg_log_file = None
 recording_output_file = None
+recording_raw_file = None
+recording_remux_command = None
 recording_lock = threading.Lock()
 
 
@@ -113,7 +116,12 @@ def _split_video_size(video_size: str):
     return width, height
 
 
-def _build_linux_capture_command(video_size: str, fps: str, camera_device: str):
+def _build_linux_capture_command(
+    video_size: str,
+    fps: str,
+    raw_file: str,
+    camera_device: str,
+):
     width, height = _split_video_size(video_size)
 
     return [
@@ -123,12 +131,11 @@ def _build_linux_capture_command(video_size: str, fps: str, camera_device: str):
         f"--set-fmt-video=width={width},height={height},pixelformat=MJPG",
         f"--set-parm={fps}",
         f"--stream-mmap={LINUX_V4L2_BUFFER_COUNT}",
-        "--stream-to=-",
+        f"--stream-to={raw_file}",
     ]
 
 
-def _build_linux_command(video_size: str, fps: str, output_file: str,
-                         camera_device: str):
+def _build_linux_command(raw_file: str, fps: str, output_file: str):
     return [
         "ffmpeg",
         "-hide_banner",
@@ -137,11 +144,11 @@ def _build_linux_command(video_size: str, fps: str, output_file: str,
         "-y",
         "-f", "mjpeg",
         "-framerate", fps,
-        "-i", "pipe:0",
+        "-i", raw_file,
         "-map", "0:v:0",
         "-an",
-        # The UVC camera already produces compressed MJPEG. FFmpeg only muxes
-        # the v4l2-ctl pipe into MP4; it does not decode or re-encode frames.
+        # The UVC camera already produces compressed MJPEG. FFmpeg only remuxes
+        # the raw v4l2-ctl capture into MP4; it does not decode or re-encode.
         "-c:v", "copy",
         output_file,
     ]
@@ -182,11 +189,14 @@ def _close_process_resources(process):
 
 
 def _clear_recording_state():
-    global capture_process, ffmpeg_process, recording_output_file
+    global capture_process, ffmpeg_process
+    global recording_output_file, recording_raw_file, recording_remux_command
 
     capture_process = None
     ffmpeg_process = None
     recording_output_file = None
+    recording_raw_file = None
+    recording_remux_command = None
 
 
 def _stop_capture_process(process, timeout: float = 3.0):
@@ -245,11 +255,13 @@ if os.path.exists(SETTINGS_FILE):
 
 
 def start_recording():
-    global capture_process, ffmpeg_process, ffmpeg_log_file, recording_output_file
+    global capture_process, ffmpeg_process, ffmpeg_log_file
+    global recording_output_file, recording_raw_file, recording_remux_command
 
     with recording_lock:
-        if ffmpeg_process is not None:
-            if ffmpeg_process.poll() is None:
+        active_process = ffmpeg_process or capture_process
+        if active_process is not None:
+            if active_process.poll() is None:
                 return {
                     "status": "already_recording",
                     "file": recording_output_file,
@@ -282,20 +294,22 @@ def start_recording():
                     "status": "error",
                     "details": "Camera capture device is not available",
                 }
+            raw_file = f"{output_file}.mjpeg"
             capture_command = _build_linux_capture_command(
                 video_size,
                 fps,
+                raw_file,
                 camera_device,
             )
             command = _build_linux_command(
-                video_size,
+                raw_file,
                 fps,
                 output_file,
-                camera_device,
             )
-            capture_format = "v4l2_mjpeg_pipe"
+            capture_format = "v4l2_mjpeg_raw"
         elif system == "Windows":
             camera_device = "video=AT025"
+            raw_file = None
             capture_command = None
             command = _build_windows_command(video_size, fps, output_file)
             capture_format = "h264"
@@ -310,33 +324,32 @@ def start_recording():
                 f"[INFO] Capture: {video_size} @ {fps} fps, format={capture_format}\n"
                 f"[INFO] Capture command: "
                 f"{shlex.join(capture_command) if capture_command else 'none'}\n"
-                f"[INFO] Command: {shlex.join(command)}\n"
+                f"[INFO] Remux command: {shlex.join(command)}\n"
             )
             ffmpeg_log_file.flush()
             if capture_command:
                 capture_process = subprocess.Popen(
                     capture_command,
-                    stdout=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                ffmpeg_stdin = capture_process.stdout
+                ffmpeg_process = None
+                recording_raw_file = raw_file
+                recording_remux_command = command
             else:
-                ffmpeg_stdin = subprocess.PIPE
-
-            ffmpeg_process = subprocess.Popen(
-                command,
-                stdin=ffmpeg_stdin,
-                stdout=ffmpeg_log_file,
-                stderr=ffmpeg_log_file,
-            )
-            if capture_process is not None and capture_process.stdout is not None:
-                capture_process.stdout.close()
+                ffmpeg_process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=ffmpeg_log_file,
+                    stderr=ffmpeg_log_file,
+                )
             recording_output_file = output_file
         except (OSError, subprocess.SubprocessError) as error:
             _stop_capture_process(capture_process)
             _close_process_resources(ffmpeg_process)
             _clear_recording_state()
             _remove_file(output_file)
+            _remove_file(raw_file)
             return {"status": "error", "details": str(error)}
 
         time.sleep(FFMPEG_STARTUP_DELAY)
@@ -345,13 +358,18 @@ def start_recording():
             if capture_process is not None
             else None
         )
-        ffmpeg_return_code = ffmpeg_process.poll()
+        ffmpeg_return_code = (
+            ffmpeg_process.poll()
+            if ffmpeg_process is not None
+            else None
+        )
         if capture_return_code is not None or ffmpeg_return_code is not None:
             _stop_capture_process(capture_process)
             _close_process_resources(ffmpeg_process)
             details = _log_tail()
             _clear_recording_state()
             _remove_file(output_file)
+            _remove_file(raw_file)
             return_code = (
                 ffmpeg_return_code
                 if ffmpeg_return_code is not None
@@ -376,25 +394,39 @@ def stop_recording():
     global capture_process, ffmpeg_process
 
     with recording_lock:
-        if ffmpeg_process is None:
+        if capture_process is None and ffmpeg_process is None:
             return {"status": "no_recording_running"}
 
         process = ffmpeg_process
         capture = capture_process
         output_file = recording_output_file
-        return_code = process.poll()
         capture_return_code = None
+        return_code = None
         warning = None
 
-        if return_code is None:
-            if capture is not None:
-                capture_return_code = _stop_capture_process(capture)
-                try:
-                    return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    warning = "FFmpeg did not stop cleanly and was terminated"
-                    process.terminate()
-            else:
+        if capture is not None:
+            capture_return_code = _stop_capture_process(capture)
+            try:
+                remux = subprocess.run(
+                    recording_remux_command,
+                    stdout=ffmpeg_log_file,
+                    stderr=ffmpeg_log_file,
+                    timeout=FFMPEG_REMUX_TIMEOUT,
+                    check=False,
+                )
+                return_code = remux.returncode
+            except (OSError, subprocess.SubprocessError) as error:
+                warning = f"FFmpeg remux failed: {error}"
+                return_code = 1
+            except subprocess.TimeoutExpired:
+                warning = "FFmpeg remux timed out"
+                return_code = 124
+
+            if return_code == 0:
+                _remove_file(recording_raw_file)
+        else:
+            return_code = process.poll()
+            if return_code is None:
                 try:
                     process.stdin.write(b"q\n")
                     process.stdin.flush()
@@ -406,15 +438,14 @@ def stop_recording():
                     except ProcessLookupError:
                         return_code = process.poll()
 
-            try:
-                if return_code is None:
+                try:
+                    if return_code is None:
+                        return_code = process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
                     return_code = process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait(timeout=3)
-        else:
-            warning = f"FFmpeg had already exited with code {return_code}"
-            capture_return_code = _stop_capture_process(capture)
+            else:
+                warning = f"FFmpeg had already exited with code {return_code}"
 
         _close_process_resources(process)
         _clear_recording_state()
