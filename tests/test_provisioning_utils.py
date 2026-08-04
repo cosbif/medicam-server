@@ -53,6 +53,24 @@ class ProvisionFileTests(unittest.TestCase):
         self.assertNotIn("ip", data["info"])
         self.assertIn("updated_at", data["info"])
 
+    def test_set_provisioned_replaces_existing_file_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+            provision_path.write_text(
+                json.dumps({
+                    "provisioned": True,
+                    "info": {"ssid": "Old"},
+                })
+            )
+
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                utils.set_provisioned(True, {"ssid": "New"})
+
+            data = json.loads(provision_path.read_text())
+
+        self.assertTrue(data["provisioned"])
+        self.assertEqual(data["info"]["ssid"], "New")
+
 
 class BluetoothProvisioningTests(unittest.TestCase):
     def test_scan_wifi_parses_nmcli_output(self):

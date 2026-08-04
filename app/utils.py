@@ -225,8 +225,32 @@ def set_provisioned(value: bool, info: dict | None = None):
     # добавим timestamp
     from datetime import datetime
     data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
-    with open(path, "w") as f:
-        json.dump(data, f)
+
+    # Root-owned BLE service and radxa-owned HTTP service both update this file.
+    # Write through a temp file + rename so a radxa process can replace an older
+    # root-owned file as long as the project directory itself is writable.
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+        _normalize_provision_file_permissions(path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def _normalize_provision_file_permissions(path: Path):
+    try:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            project_owner = path.parent.stat()
+            os.chown(path, project_owner.st_uid, project_owner.st_gid)
+        os.chmod(path, 0o664)
+    except Exception:
+        pass
 
 def get_provision_info() -> dict:
     """Возвращает словарь с инфо (ssid, ip и т.п.) или пустой словарь."""
