@@ -21,6 +21,7 @@ CAMERA_DISCOVERY_TIMEOUT = 3.0
 FFMPEG_STARTUP_DELAY = 1.0
 FFMPEG_STOP_TIMEOUT = 10.0
 FFMPEG_REMUX_TIMEOUT = 180.0
+AUDIO_STARTUP_DELAY = 0.1
 
 camera_settings = {
     "resolution": "FHD",
@@ -54,7 +55,7 @@ recording_output_file = None
 recording_raw_file = None
 recording_audio_file = None
 recording_audio_device = None
-recording_audio_start_delay = 0.0
+recording_audio_lead_seconds = 0.0
 recording_remux_command = None
 recording_lock = threading.Lock()
 
@@ -167,7 +168,7 @@ def _build_linux_command(
     fps: str,
     output_file: str,
     audio_file: str | None = None,
-    audio_start_delay: float = 0.0,
+    audio_lead_seconds: float = 0.0,
 ):
     command = [
         "ffmpeg",
@@ -180,8 +181,11 @@ def _build_linux_command(
         "-i", raw_file,
     ]
     if audio_file:
-        if audio_start_delay > 0:
-            command.extend(["-itsoffset", f"{audio_start_delay:.6f}"])
+        # This USB camera only allows simultaneous UVC and ALSA capture when
+        # the audio interface is opened first. Drop that short audio lead so
+        # both tracks begin at the same wall-clock moment in the MP4 file.
+        if audio_lead_seconds > 0:
+            command.extend(["-ss", f"{audio_lead_seconds:.6f}"])
         command.extend(["-i", audio_file])
 
     command.extend([
@@ -243,7 +247,7 @@ def _close_process_resources(process):
 def _clear_recording_state():
     global capture_process, audio_process, ffmpeg_process
     global recording_output_file, recording_raw_file, recording_audio_file
-    global recording_audio_device, recording_audio_start_delay
+    global recording_audio_device, recording_audio_lead_seconds
     global recording_remux_command
 
     capture_process = None
@@ -253,7 +257,7 @@ def _clear_recording_state():
     recording_raw_file = None
     recording_audio_file = None
     recording_audio_device = None
-    recording_audio_start_delay = 0.0
+    recording_audio_lead_seconds = 0.0
     recording_remux_command = None
 
 
@@ -315,7 +319,7 @@ if os.path.exists(SETTINGS_FILE):
 def start_recording():
     global capture_process, audio_process, ffmpeg_process, ffmpeg_log_file
     global recording_output_file, recording_raw_file, recording_audio_file
-    global recording_audio_device, recording_audio_start_delay
+    global recording_audio_device, recording_audio_lead_seconds
     global recording_remux_command
 
     with recording_lock:
@@ -414,12 +418,6 @@ def start_recording():
             )
             ffmpeg_log_file.flush()
             if capture_command:
-                capture_process = subprocess.Popen(
-                    capture_command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                video_started_at = time.monotonic()
                 if audio_command:
                     audio_process = subprocess.Popen(
                         audio_command,
@@ -427,20 +425,30 @@ def start_recording():
                         stderr=ffmpeg_log_file,
                     )
                     audio_started_at = time.monotonic()
-                    recording_audio_start_delay = max(
+                    # Give the shared USB device enough time to claim its ALSA
+                    # interface before UVC video streaming starts.
+                    time.sleep(AUDIO_STARTUP_DELAY)
+                capture_process = subprocess.Popen(
+                    capture_command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                video_started_at = time.monotonic()
+                if audio_command:
+                    recording_audio_lead_seconds = max(
                         0.0,
-                        audio_started_at - video_started_at,
+                        video_started_at - audio_started_at,
                     )
                     command = _build_linux_command(
                         raw_file,
                         fps,
                         output_file,
                         audio_file=audio_file,
-                        audio_start_delay=recording_audio_start_delay,
+                        audio_lead_seconds=recording_audio_lead_seconds,
                     )
                 ffmpeg_log_file.write(
-                    f"[INFO] Audio start delay: "
-                    f"{recording_audio_start_delay:.6f} seconds\n"
+                    f"[INFO] Audio lead before video: "
+                    f"{recording_audio_lead_seconds:.6f} seconds\n"
                     f"[INFO] Remux command: {shlex.join(command)}\n"
                 )
                 ffmpeg_log_file.flush()
@@ -543,7 +551,10 @@ def stop_recording():
         if capture is not None:
             capture_return_code = _stop_capture_process(capture)
             audio_return_code = _stop_capture_process(audio_capture)
-            if audio_return_code not in (None, 0, -signal.SIGINT):
+            # arecord handles SIGINT by finalizing the WAV header and returns 1
+            # on this platform. It was alive throughout recording, so this is
+            # a normal user-requested stop rather than a capture failure.
+            if audio_return_code not in (None, 0, 1, -signal.SIGINT):
                 warning = f"Audio capture exited with code {audio_return_code}"
             try:
                 remux = subprocess.run(
@@ -619,7 +630,7 @@ def get_recording_status():
             "enabled": recording_audio_file is not None,
             "recording": audio_recording,
             "device": recording_audio_device,
-            "start_delay_seconds": round(recording_audio_start_delay, 6),
+            "lead_seconds": round(recording_audio_lead_seconds, 6),
         },
     }
 

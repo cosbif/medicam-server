@@ -115,7 +115,7 @@ class CameraCommandTests(unittest.TestCase):
             "30",
             "videos/test.mp4",
             audio_file="videos/test.mp4.wav",
-            audio_start_delay=0.125,
+            audio_lead_seconds=0.125,
         )
 
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
@@ -123,7 +123,7 @@ class CameraCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("-b:a") + 1], "128k")
         self.assertEqual(command[command.index("-ar") + 1], "48000")
         self.assertEqual(command[command.index("-ac") + 1], "1")
-        self.assertEqual(command[command.index("-itsoffset") + 1], "0.125000")
+        self.assertEqual(command[command.index("-ss") + 1], "0.125000")
         self.assertIn("aresample=async=1:first_pts=0", command)
         self.assertIn("-shortest", command)
         self.assertNotIn("-an", command)
@@ -140,7 +140,7 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_raw_file = None
         camera.recording_audio_file = None
         camera.recording_audio_device = None
-        camera.recording_audio_start_delay = 0.0
+        camera.recording_audio_lead_seconds = 0.0
         camera.recording_remux_command = None
 
     def tearDown(self):
@@ -152,7 +152,7 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_raw_file = None
         camera.recording_audio_file = None
         camera.recording_audio_device = None
-        camera.recording_audio_start_delay = 0.0
+        camera.recording_audio_lead_seconds = 0.0
         camera.recording_remux_command = None
 
     @patch("app.camera.utils.get_output_filename", return_value="videos/test.mp4")
