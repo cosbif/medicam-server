@@ -48,6 +48,7 @@ WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
+sudo systemctl disable --now ble-provision.service 2>/dev/null || true
 sudo systemctl enable medicam-ble.service medicam-ble-manager.service
 sudo systemctl restart medicam-ble-manager.service
 sudo systemctl restart medicam-ble.service || true

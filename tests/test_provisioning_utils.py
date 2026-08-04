@@ -4,11 +4,11 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from app import utils
 from app.bluetooth_provision import ProvisionService
-from app.manage_ble import should_run_ble
+from app.manage_ble import disable_legacy_ble_services, should_run_ble
 
 
 class NmcliParsingTests(unittest.TestCase):
@@ -181,6 +181,27 @@ class BleManagerTests(unittest.TestCase):
         self.assertTrue(should_run_ble(True, True, True, False))
         self.assertTrue(should_run_ble(True, True, False, True))
         self.assertFalse(should_run_ble(True, True, False, False))
+
+    def test_manager_stops_and_disables_legacy_ble_service(self):
+        enabled_result = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+        )
+        with patch("app.manage_ble.service_status", return_value="active"):
+            with patch(
+                "app.manage_ble.subprocess.run",
+                return_value=enabled_result,
+            ):
+                with patch("app.manage_ble.systemctl", return_value=True) as control:
+                    disable_legacy_ble_services()
+
+        self.assertEqual(
+            control.call_args_list,
+            [
+                call("stop", "ble-provision.service"),
+                call("disable", "ble-provision.service"),
+            ],
+        )
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
