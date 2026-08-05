@@ -24,6 +24,9 @@ FFMPEG_STARTUP_DELAY = 1.0
 CAPTURE_START_OBSERVATION_TIMEOUT = 3.0
 FFMPEG_STOP_TIMEOUT = 10.0
 FFMPEG_REMUX_TIMEOUT = 180.0
+REMUX_MIN_THROUGHPUT_BYTES_PER_SECOND = 4 * 1024 * 1024
+PROBE_MIN_THROUGHPUT_BYTES_PER_SECOND = 2 * 1024 * 1024
+FILE_PROCESSING_TIMEOUT_MARGIN = 120.0
 AUDIO_OPEN_ATTEMPTS = 8
 AUDIO_OPEN_PROBE_DELAY = 0.15
 AUDIO_OPEN_RETRY_DELAY = 0.35
@@ -423,6 +426,15 @@ def _safe_file_size(path: str | None):
         return 0
 
 
+def _file_processing_timeout(
+    path: str | None,
+    minimum_seconds: float,
+    minimum_throughput: float,
+):
+    estimated = _safe_file_size(path) / max(1.0, minimum_throughput)
+    return max(minimum_seconds, estimated + FILE_PROCESSING_TIMEOUT_MARGIN)
+
+
 def _count_mjpeg_frames(path: str):
     count = 0
     previous = b""
@@ -634,7 +646,11 @@ def _probe_recording(path: str, elapsed_seconds: float, expected_fps: float):
             ],
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=_file_processing_timeout(
+                path,
+                60.0,
+                PROBE_MIN_THROUGHPUT_BYTES_PER_SECOND,
+            ),
             check=False,
         )
         if result.returncode != 0:
@@ -1143,6 +1159,11 @@ def stop_recording():
     warning_parts = []
     quality = None
     audio_recovered = bool(audio_file)
+    remux_timeout = _file_processing_timeout(
+        raw_file,
+        FFMPEG_REMUX_TIMEOUT,
+        REMUX_MIN_THROUGHPUT_BYTES_PER_SECOND,
+    )
 
     if raw_file:
         capture_was_running = capture is not None and capture.poll() is None
@@ -1192,7 +1213,7 @@ def stop_recording():
                 remux_command,
                 stdout=log_output,
                 stderr=log_output,
-                timeout=FFMPEG_REMUX_TIMEOUT,
+                timeout=remux_timeout,
                 check=False,
             )
             return_code = remux.returncode
@@ -1213,7 +1234,7 @@ def stop_recording():
                     video_only_command,
                     stdout=log_output,
                     stderr=log_output,
-                    timeout=FFMPEG_REMUX_TIMEOUT,
+                    timeout=remux_timeout,
                     check=False,
                 )
                 return_code = retry.returncode

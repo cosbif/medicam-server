@@ -55,6 +55,7 @@ def _rate(value):
 
 
 def _probe(path):
+    probe_timeout = max(120.0, path.stat().st_size / (2 * 1024 * 1024) + 120.0)
     result = subprocess.run(
         [
             "ffprobe",
@@ -68,7 +69,7 @@ def _probe(path):
         ],
         text=True,
         capture_output=True,
-        timeout=120,
+        timeout=probe_timeout,
         check=False,
     )
     if result.returncode != 0:
@@ -121,7 +122,7 @@ def _run_one(base_url, token, duration, poll_interval):
             if latest.get("state") != "recording" or not latest.get("capture_active"):
                 raise RuntimeError(f"capture became unhealthy after {elapsed:.1f}s: {latest}")
     finally:
-        stopped = _api(base_url, token, "POST", "/stop", timeout=240)
+        stopped = _api(base_url, token, "POST", "/stop", timeout=3 * 60 * 60)
 
     if stopped.get("status") != "recording_stopped" or stopped.get("returncode") != 0:
         raise RuntimeError(f"recording did not finalize: {stopped}")

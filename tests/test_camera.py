@@ -75,6 +75,16 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
+    def test_long_recordings_receive_size_based_processing_timeout(self):
+        with patch("app.camera._safe_file_size", return_value=8 * 1024 ** 3):
+            timeout = camera._file_processing_timeout(
+                "videos/long.mjpeg",
+                camera.FFMPEG_REMUX_TIMEOUT,
+                camera.REMUX_MIN_THROUGHPUT_BYTES_PER_SECOND,
+            )
+
+        self.assertGreater(timeout, 30 * 60)
+
     def test_mjpeg_frame_counter_uses_jpeg_start_markers(self):
         with tempfile.NamedTemporaryFile() as raw:
             raw.write(b"\xff\xd8frame-a\xff\xd9\xff\xd8frame-b\xff\xd9")

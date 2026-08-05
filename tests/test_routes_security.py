@@ -164,6 +164,24 @@ class RouteSecurityTests(unittest.TestCase):
         )
         apply_mock.assert_not_called()
 
+    def test_update_can_repair_an_interrupted_recording(self):
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={
+                "recording": True,
+                "capture_active": False,
+                "state": "interrupted",
+            },
+        ):
+            with patch(
+                "app.routes.updater.apply_update",
+                return_value={"ok": True, "step": "done"},
+            ) as apply_mock:
+                response = asyncio.run(routes.update_apply(_ok=True))
+
+        self.assertTrue(response["ok"])
+        apply_mock.assert_called_once_with()
+
     def test_provision_status_redacts_private_fields_without_token(self):
         token = self._provision()
 
