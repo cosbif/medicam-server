@@ -138,6 +138,9 @@ def git(*arguments: str, check: bool = True):
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
+            # Root verification must never refresh the unprivileged checkout's
+            # cache index or change its owner.
+            "GIT_OPTIONAL_LOCKS": "0",
             "HOME": "/var/empty",
         }
     )
@@ -819,6 +822,26 @@ def install_usb_power_policy(release_root: Path) -> None:
             continue
 
 
+def normalize_git_runtime_ownership() -> None:
+    """Keep backend-owned Git cache files writable after root verification."""
+    uid, gid = _radxa_ids()
+    for path in (REPO / ".git" / "index", REPO / ".git" / "ORIG_HEAD"):
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ActivationError(f"unsafe Git runtime file: {path}")
+            os.fchown(descriptor, uid, gid)
+        finally:
+            os.close(descriptor)
+
+
 def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     source_helper = release_root / "scripts" / "medicam_ota_activate.py"
     source_signers = release_root / "deploy" / "ota_allowed_signers"
@@ -870,6 +893,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
         mode=0o755,
         owner=(0, 0),
     )
+    normalize_git_runtime_ownership()
     if harden:
         harden_sudoers()
     run(["/bin/systemctl", "daemon-reload"])

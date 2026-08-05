@@ -15,6 +15,25 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_root_git_verification_disables_optional_index_locks(self):
+        with patch.object(activate, "run") as run:
+            activate.git("status", "--porcelain")
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_git_runtime_cache_ownership_is_normalized_without_following_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            index = repo / ".git" / "index"
+            index.parent.mkdir()
+            index.write_bytes(b"index")
+            with patch.object(activate, "REPO", repo):
+                activate.normalize_git_runtime_ownership()
+
+            uid, gid = activate._radxa_ids()
+            self.assertEqual((index.stat().st_uid, index.stat().st_gid), (uid, gid))
+
     def test_root_path_consumer_validates_and_schedules_fixed_request(self):
         with tempfile.TemporaryDirectory() as directory:
             request = Path(directory) / "request.json"
