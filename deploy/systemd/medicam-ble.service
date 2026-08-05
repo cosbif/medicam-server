@@ -6,11 +6,30 @@ Wants=bluetooth.service NetworkManager.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/radxa/medicam-server
+WorkingDirectory=/opt/medicam/ble
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/radxa/medicam-server/medicam-venv/bin/python3 /home/radxa/medicam-server/app/bluetooth_provision.py
+Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
+Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
+Environment=MEDICAM_PAIRING_SECRET_FILE=/etc/medicam/pairing-secret
+Environment=MEDICAM_TLS_CERT_FILE=/etc/medicam/tls/cert.pem
+ExecStart=/opt/medicam/venv/bin/python3 /opt/medicam/ble/app/bluetooth_provision.py
 Restart=on-failure
 RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/medicam
+ReadOnlyPaths=/etc/medicam /opt/medicam
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_BLUETOOTH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target

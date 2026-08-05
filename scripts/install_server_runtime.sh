@@ -17,26 +17,16 @@ RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart
 UNIT
 
-# Install the independent activator before restarting the backend. The
-# transition from the legacy updater still needs its existing sudo rule for
-# this one restart; the helper's explicit `harden` action removes it after the
-# signed-release backend is confirmed running.
-sudo install -d -m 0775 -o radxa -g radxa "$OTA_STATE_DIR"
+# Install the independent activator, then let its signed-release `harden`
+# action materialize and install every privileged asset from the verified
+# commit rather than this mutable checkout.
+sudo install -d -m 0770 -o root -g radxa "$OTA_STATE_DIR"
 sudo install -d -m 0755 "$OTA_CONFIG_DIR" /usr/local/sbin
 sudo install -m 0755 scripts/medicam_ota_activate.py "$OTA_HELPER"
 sudo install -m 0644 deploy/ota_allowed_signers \
     "$OTA_CONFIG_DIR/ota_allowed_signers"
 sudo install -m 0644 deploy/image-version "$OTA_CONFIG_DIR/image-version"
-sudo install -m 0644 deploy/systemd/medicam.service \
-    /etc/systemd/system/medicam.service
-sudo install -m 0644 deploy/systemd/medicam-ble.service \
-    /etc/systemd/system/medicam-ble.service
-sudo install -m 0644 deploy/systemd/medicam-ble-manager.service \
-    /etc/systemd/system/medicam-ble-manager.service
-
-sudo systemctl daemon-reload
-sudo systemctl enable medicam.service medicam-ble.service \
-    medicam-ble-manager.service
+sudo "$OTA_HELPER" harden
 
 echo "Installed Medicam runtime directory: /run/medicam"
 echo "Installed signed OTA activator: $OTA_HELPER"

@@ -1,4 +1,7 @@
 import json
+import hashlib
+import hmac
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -7,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from app import utils
-from app.bluetooth_provision import ProvisionService
+from app.bluetooth_provision import ProvisionService, encode_notification_frames
 from app.manage_ble import disable_legacy_ble_services, should_run_ble
 
 
@@ -95,9 +98,39 @@ class ProvisionFileTests(unittest.TestCase):
                 utils.set_provisioned(True, {"ssid": "New"})
 
             data = json.loads(provision_path.read_text())
+            mode = provision_path.stat().st_mode & 0o777
 
         self.assertTrue(data["provisioned"])
         self.assertEqual(data["info"]["ssid"], "New")
+        self.assertEqual(mode, 0o600)
+
+    def test_provision_write_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+            target = Path(tmp) / "target"
+            target.write_text("do-not-touch", encoding="utf-8")
+            provision_path.symlink_to(target)
+
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                utils.set_provisioned(True, {"ssid": "Office"})
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "do-not-touch")
+            self.assertFalse(provision_path.is_symlink())
+            self.assertTrue(stat.S_ISREG(provision_path.stat().st_mode))
+            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o600)
+
+    def test_rotate_api_token_is_atomic_and_rejects_stale_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                utils.set_provisioned(True, {"ssid": "Office"})
+                old_token = utils.get_api_token()
+                new_token = utils.generate_api_token()
+
+                self.assertTrue(utils.rotate_api_token(old_token, new_token))
+                self.assertFalse(utils.rotate_api_token(old_token, utils.generate_api_token()))
+                self.assertFalse(utils.verify_api_token(old_token))
+                self.assertTrue(utils.verify_api_token(new_token))
 
     def test_set_provisioned_creates_and_verifies_api_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +258,84 @@ class BleManagerTests(unittest.TestCase):
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
+    def test_large_ble_response_is_framed_with_bounded_values(self):
+        payload = json.dumps({"networks": ["x" * 64] * 20}).encode()
+        frames = encode_notification_frames(payload, frame_id="deadbeef")
+
+        self.assertGreater(len(frames), 1)
+        self.assertTrue(all(len(frame) <= 150 for frame in frames))
+        bodies = [frame.split(b"|", 4)[4] for frame in frames]
+        self.assertEqual(b"".join(bodies), payload)
+        for sequence, frame in enumerate(frames):
+            prefix = f"M4|deadbeef|{sequence}|{len(frames)}|".encode()
+            self.assertTrue(frame.startswith(prefix))
+
+    def test_oversize_ble_response_is_replaced_by_small_error(self):
+        frames = encode_notification_frames(b"x" * 8193, frame_id="deadbeef")
+        self.assertEqual(frames, [b'{"error":"response_too_large"}'])
+
+    @staticmethod
+    def _pairing_service():
+        service = object.__new__(ProvisionService)
+        service._pairing_lock = __import__("threading").Lock()
+        service._pairing_nonce = "fresh-nonce"
+        service._pairing_nonce_issued = __import__("time").monotonic()
+        service._pairing_failures = 0
+        service._pairing_blocked_until = 0.0
+        service._session_id = ""
+        service._session_key = ""
+        service._session_expires = 0.0
+        service._session_counter = -1
+        service._set_response = Mock()
+        return service
+
+    def test_pairing_unlock_returns_mutual_proof_and_creates_hmac_session(self):
+        service = self._pairing_service()
+        with patch("app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"), patch(
+            "app.bluetooth_provision.utils.get_device_name", return_value="Medicam-VICE01"
+        ), patch(
+            "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
+        ), patch(
+            "app.bluetooth_provision.utils.verify_pairing_client_proof", return_value=True
+        ), patch(
+            "app.bluetooth_provision.utils.pairing_session_key", return_value="b" * 64
+        ), patch(
+            "app.bluetooth_provision.utils.pairing_server_proof", return_value="c" * 64
+        ):
+            service._unlock_pairing(
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
+                request_id="unlock-1",
+            )
+
+        response = service._set_response.call_args.args[0]
+        self.assertEqual(response["status"], "unlocked")
+        self.assertEqual(response["server_proof"], "c" * 64)
+        self.assertEqual(response["tls_fingerprint"], "a" * 64)
+        self.assertNotIn("api_token", response)
+        self.assertTrue(service._session_id)
+
+    def test_wifi_commands_require_valid_monotonic_session_hmac(self):
+        service = self._pairing_service()
+        service._session_id = "session"
+        service._session_key = "ab" * 32
+        service._session_expires = __import__("time").monotonic() + 60
+        command = {
+            "cmd": "SCAN_WIFI",
+            "request_id": "scan-1",
+            "session_id": "session",
+            "counter": 1,
+        }
+        command["auth"] = hmac.new(
+            bytes.fromhex(service._session_key),
+            service._canonical_session_command(command),
+            hashlib.sha256,
+        ).hexdigest()
+
+        self.assertTrue(service._verify_session_command(command))
+        self.assertFalse(service._verify_session_command(command))
+
+        tampered = {**command, "counter": 2, "auth": "0" * 64}
+        self.assertFalse(service._verify_session_command(tampered))
     def test_on_command_dispatches_complete_messages_outside_write_callback(self):
         service = object.__new__(ProvisionService)
         service._cmd_buffer = bytearray()

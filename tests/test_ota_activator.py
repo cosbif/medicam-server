@@ -9,6 +9,8 @@ from scripts import medicam_ota_activate as activate
 PREVIOUS = "a" * 40
 TARGET = "b" * 40
 TAG = "medicam-v1.2.0"
+TARGET_RELEASE = Path("/signed/target")
+PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
@@ -46,6 +48,8 @@ class OtaActivatorTests(unittest.TestCase):
         with patch.object(activate, "verify_release"), patch.object(
             activate, "validate_transition"
         ), patch.object(
+            activate, "materialize_release", return_value=TARGET_RELEASE
+        ), patch.object(
             activate, "restart_services"
         ), patch.object(
             activate, "wait_for_health", return_value=(True, "")
@@ -65,6 +69,10 @@ class OtaActivatorTests(unittest.TestCase):
         statuses = []
         with patch.object(activate, "verify_release"), patch.object(
             activate, "validate_transition"
+        ), patch.object(
+            activate,
+            "materialize_release",
+            side_effect=[TARGET_RELEASE, PREVIOUS_RELEASE],
         ), patch.object(
             activate, "restart_services"
         ), patch.object(
@@ -95,6 +103,8 @@ class OtaActivatorTests(unittest.TestCase):
         with patch.object(activate, "verify_release") as verify, patch.object(
             activate, "validate_transition"
         ), patch.object(
+            activate, "materialize_release", return_value=TARGET_RELEASE
+        ), patch.object(
             activate, "install_release_assets"
         ), patch.object(activate, "write_status"), patch.object(
             activate.time, "time", return_value=1234
@@ -112,6 +122,10 @@ class OtaActivatorTests(unittest.TestCase):
             activate, "validate_transition"
         ), patch.object(
             activate,
+            "materialize_release",
+            side_effect=[TARGET_RELEASE, PREVIOUS_RELEASE],
+        ), patch.object(
+            activate,
             "install_release_assets",
             side_effect=[activate.ActivationError("bad unit"), None],
         ) as assets, patch.object(
@@ -126,10 +140,13 @@ class OtaActivatorTests(unittest.TestCase):
                 activate.schedule(PREVIOUS, TARGET, TAG)
 
         reset.assert_called_once_with(PREVIOUS)
-        requirements.assert_called_once_with()
+        requirements.assert_called_once_with(PREVIOUS_RELEASE)
         self.assertEqual(
             assets.call_args_list,
-            [call(harden=True), call(harden=True)],
+            [
+                call(TARGET_RELEASE, harden=True),
+                call(PREVIOUS_RELEASE, harden=True),
+            ],
         )
 
     def test_hardening_initializes_trust_before_restricting_sudoers(self):
@@ -137,11 +154,19 @@ class OtaActivatorTests(unittest.TestCase):
         with patch.object(
             activate,
             "install_release_assets",
-            side_effect=lambda **kwargs: order.append(("assets", kwargs["harden"])),
+            side_effect=lambda release, **kwargs: order.append(
+                ("assets", release, kwargs["harden"])
+            ),
         ), patch.object(
             activate,
             "initialize_trust_state",
             side_effect=lambda: (order.append(("trust", True)) or (PREVIOUS, TAG)),
+        ), patch.object(
+            activate,
+            "materialize_release",
+            side_effect=lambda commit: (
+                order.append(("materialize", commit)) or PREVIOUS_RELEASE
+            ),
         ), patch.object(
             activate,
             "harden_sudoers",
@@ -152,13 +177,22 @@ class OtaActivatorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             order,
-            [("assets", False), ("trust", True), ("sudoers", True)],
+            [
+                ("trust", True),
+                ("materialize", PREVIOUS),
+                ("assets", PREVIOUS_RELEASE, False),
+                ("sudoers", True),
+            ],
         )
 
     def test_restart_failure_also_triggers_rollback(self):
         statuses = []
         with patch.object(activate, "verify_release"), patch.object(
             activate, "validate_transition"
+        ), patch.object(
+            activate,
+            "materialize_release",
+            side_effect=[TARGET_RELEASE, PREVIOUS_RELEASE],
         ), patch.object(
             activate,
             "restart_services",

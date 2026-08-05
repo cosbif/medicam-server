@@ -8,8 +8,14 @@ import os
 import pwd
 import re
 import shutil
+import base64
+import hashlib
+import secrets
+import ssl
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -21,6 +27,10 @@ REPO = Path("/home/radxa/medicam-server")
 STATE_DIR = Path("/var/lib/medicam-ota")
 STATE_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "update.log"
+RELEASES_DIR = STATE_DIR / "releases"
+MEDICAM_STATE_DIR = Path("/var/lib/medicam")
+PROVISION_FILE = MEDICAM_STATE_DIR / "provision.json"
+PROVISION_LOCK_FILE = MEDICAM_STATE_DIR / "provision.lock"
 SYSTEM_SIGNERS = Path("/etc/medicam/ota_allowed_signers")
 SYSTEM_IMAGE_VERSION = Path("/etc/medicam/image-version")
 TRUSTED_COMMIT_FILE = Path("/etc/medicam/ota-current-commit")
@@ -28,6 +38,16 @@ HIGHEST_VERSION_FILE = Path("/etc/medicam/ota-highest-version")
 INSTALLED_HELPER = Path("/usr/local/sbin/medicam-ota-activate")
 SUDOERS_FILE = Path("/etc/sudoers.d/medicam")
 DROP_IN = Path("/etc/systemd/system/medicam.service.d/runtime.conf")
+PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
+TLS_DIR = Path("/etc/medicam/tls")
+TLS_KEY_FILE = TLS_DIR / "key.pem"
+TLS_CERT_FILE = TLS_DIR / "cert.pem"
+BLE_ROOT = Path("/opt/medicam/ble")
+BLE_VENV = Path("/opt/medicam/venv")
+BLE_REQUIREMENTS_MARKER = Path("/opt/medicam/.requirements-sha256")
+NFTABLES_FILE = Path("/etc/nftables.conf")
+SSH_DROP_IN = Path("/etc/ssh/sshd_config.d/99-medicam.conf")
+AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
 SYSTEMD_ASSETS = {
     "medicam.service": Path("/etc/systemd/system/medicam.service"),
     "medicam-ble.service": Path("/etc/systemd/system/medicam-ble.service"),
@@ -47,7 +67,8 @@ PERSISTENT_FILES = (
 SUDOERS_CONTENT = """# Managed by Medicam signed OTA. Do not edit manually.
 Cmnd_Alias MEDICAM_BLE = /bin/systemctl start medicam-ble.service, /bin/systemctl restart medicam-ble.service
 Cmnd_Alias MEDICAM_OTA = /usr/local/sbin/medicam-ota-activate schedule *
-radxa ALL=(root) NOPASSWD: MEDICAM_BLE, MEDICAM_OTA
+Cmnd_Alias MEDICAM_PAIRING_INFO = /usr/local/sbin/medicam-ota-activate pairing-info
+radxa ALL=(root) NOPASSWD: MEDICAM_BLE, MEDICAM_OTA, MEDICAM_PAIRING_INFO
 """
 
 RUNTIME_DROP_IN = """[Service]
@@ -73,13 +94,20 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run(command: list[str], *, timeout: float = 120, check: bool = True):
+def run(
+    command: list[str],
+    *,
+    timeout: float = 120,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+):
     result = subprocess.run(
         command,
         text=True,
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
     if check and result.returncode != 0:
         raise ActivationError(
@@ -90,22 +118,41 @@ def run(command: list[str], *, timeout: float = 120, check: bool = True):
 
 
 def git(*arguments: str, check: bool = True):
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": "/var/empty",
+        }
+    )
     return run(
         [
-            "git",
+            "/usr/bin/git",
             "-c",
             f"safe.directory={REPO}",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "gpg.ssh.program=/usr/bin/ssh-keygen",
+            "-c",
+            "core.sshCommand=/usr/bin/ssh",
             "-C",
             str(REPO),
             *arguments,
         ],
         check=check,
+        env=environment,
     )
 
 
 def _radxa_ids() -> tuple[int, int]:
-    account = pwd.getpwnam("radxa")
-    return account.pw_uid, account.pw_gid
+    try:
+        account = pwd.getpwnam("radxa")
+        return account.pw_uid, account.pw_gid
+    except KeyError:
+        return os.getuid(), os.getgid()
 
 
 def _chown_radxa(path: Path) -> None:
@@ -116,9 +163,72 @@ def _chown_radxa(path: Path) -> None:
         pass
 
 
+def _safe_atomic_write(
+    path: Path,
+    content: bytes,
+    *,
+    mode: int,
+    owner: tuple[int, int] | None = None,
+) -> None:
+    """Atomically replace a file without following attacker-controlled names."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(path.parent, directory_flags)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=directory,
+        )
+        os.fchmod(descriptor, mode)
+        if owner is not None:
+            os.fchown(descriptor, *owner)
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
+def _safe_read_regular(path: Path, maximum_size: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum_size:
+            raise ActivationError(f"unsafe file: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as value:
+            return value.read(maximum_size + 1)
+    finally:
+        os.close(descriptor)
+
+
 def read_status() -> dict:
     try:
-        value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        value = json.loads(_safe_read_regular(STATE_FILE, 1024 * 1024))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
@@ -135,14 +245,17 @@ def write_status(state: str, progress: int, message: str, **fields) -> dict:
         "updated_at": utc_now(),
         **fields,
     }
-    temporary = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp")
-    with open(temporary, "w", encoding="utf-8") as output:
-        json.dump(payload, output, ensure_ascii=False, sort_keys=True, indent=2)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, STATE_FILE)
-    os.chmod(STATE_FILE, 0o664)
-    _chown_radxa(STATE_FILE)
+    _safe_atomic_write(
+        STATE_FILE,
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ).encode("utf-8"),
+        mode=0o660,
+        owner=_radxa_ids(),
+    )
     append_log(
         f"state={state} progress={payload['progress']} message={message} "
         f"error={payload.get('error') or ''}"
@@ -152,10 +265,20 @@ def write_status(state: str, progress: int, message: str, **fields) -> dict:
 
 def append_log(message: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as output:
-        output.write(f"{utc_now()} {message}\n")
-    os.chmod(LOG_FILE, 0o664)
-    _chown_radxa(LOG_FILE)
+    descriptor = os.open(
+        LOG_FILE,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o660,
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ActivationError("OTA log is not a regular file")
+        os.fchmod(descriptor, 0o660)
+        os.fchown(descriptor, *_radxa_ids())
+        os.write(descriptor, f"{utc_now()} {message}\n".encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def verify_release(tag: str, target: str) -> None:
@@ -184,6 +307,70 @@ def verify_release(tag: str, target: str) -> None:
     head = git("rev-parse", "HEAD").stdout.strip()
     if head != target:
         raise ActivationError("working tree does not match signed target commit")
+    dirty = git(
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    ).stdout.strip()
+    if dirty:
+        raise ActivationError("tracked working tree differs from signed target commit")
+
+
+def materialize_release(target: str) -> Path:
+    """Extract only bytes stored in the verified commit into a root-owned tree."""
+    if not SHA_PATTERN.fullmatch(target):
+        raise ActivationError("invalid release commit")
+    RELEASES_DIR.mkdir(parents=True, exist_ok=True)
+    # Release bytes are immutable/root-owned but world-readable so the
+    # unprivileged backend installer can consume signed requirements without
+    # ever granting it write access to the trusted release tree.
+    os.chmod(RELEASES_DIR, 0o755)
+    final = RELEASES_DIR / target
+    if final.is_dir():
+        marker = final / ".medicam-commit"
+        try:
+            if marker.read_text(encoding="ascii").strip() == target:
+                os.chmod(final, 0o755)
+                return final
+        except OSError:
+            pass
+        shutil.rmtree(final)
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{target[:12]}-", dir=RELEASES_DIR))
+    archive = staging / ".release.tar"
+    try:
+        git(
+            "archive",
+            "--format=tar",
+            f"--output={archive}",
+            target,
+        )
+        with tarfile.open(archive, mode="r:") as package:
+            for member in package.getmembers():
+                relative = Path(member.name)
+                if (
+                    member.name.startswith("/")
+                    or ".." in relative.parts
+                    or member.issym()
+                    or member.islnk()
+                    or member.isdev()
+                ):
+                    raise ActivationError(
+                        f"unsafe path in signed release archive: {member.name}"
+                    )
+            package.extractall(staging)
+        archive.unlink()
+        _safe_atomic_write(
+            staging / ".medicam-commit",
+            f"{target}\n".encode("ascii"),
+            mode=0o400,
+        )
+        os.chmod(staging, 0o755)
+        os.replace(staging, final)
+        return final
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def tag_version(tag: str) -> tuple[int, int, int]:
@@ -243,11 +430,7 @@ def initialize_trust_state() -> tuple[str, str]:
 
 
 def _atomic_install_text(path: Path, content: str, mode: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.chmod(temporary, mode)
-    os.replace(temporary, path)
+    _safe_atomic_write(path, content.encode("utf-8"), mode=mode)
 
 
 def _remove_legacy_sudoers_rules() -> None:
@@ -313,39 +496,322 @@ def harden_sudoers() -> None:
         raise ActivationError(f"system sudoers validation failed: {validation.stderr}")
 
 
-def install_release_assets(*, harden: bool = True) -> None:
-    source_helper = REPO / "scripts" / "medicam_ota_activate.py"
-    source_signers = REPO / "deploy" / "ota_allowed_signers"
-    source_image = REPO / "deploy" / "image-version"
+def _device_id() -> str:
+    source = ""
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        try:
+            source = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if source:
+            break
+    source = source or os.uname().nodename
+    return hashlib.sha256(f"medicam:{source}".encode("utf-8")).hexdigest()[:8].upper()
+
+
+def ensure_security_identity() -> None:
+    uid, gid = _radxa_ids()
+    MEDICAM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chown(MEDICAM_STATE_DIR, 0, gid)
+    os.chmod(MEDICAM_STATE_DIR, 0o770)
+
+    legacy_provision = REPO / "provision.json"
+    if not PROVISION_FILE.exists():
+        try:
+            provision = _safe_read_regular(legacy_provision, 1024 * 1024)
+            json.loads(provision)
+        except (OSError, ValueError, json.JSONDecodeError, ActivationError):
+            provision = b'{"provisioned":false,"info":{}}'
+        _safe_atomic_write(
+            PROVISION_FILE,
+            provision,
+            mode=0o600,
+            owner=(uid, gid),
+        )
+    else:
+        descriptor = os.open(
+            PROVISION_FILE,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ActivationError("provision state is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, uid, gid)
+        finally:
+            os.close(descriptor)
+
+    PROVISION_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_descriptor = os.open(
+        PROVISION_LOCK_FILE,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o660,
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+            raise ActivationError("provision lock is not a regular file")
+        os.fchmod(lock_descriptor, 0o660)
+        os.fchown(lock_descriptor, 0, gid)
+    finally:
+        os.close(lock_descriptor)
+
+    if not PAIRING_SECRET_FILE.exists():
+        pairing_secret = base64.b32encode(secrets.token_bytes(16)).decode("ascii")
+        pairing_secret = pairing_secret.rstrip("=")
+        _safe_atomic_write(
+            PAIRING_SECRET_FILE,
+            f"{pairing_secret}\n".encode("ascii"),
+            mode=0o600,
+            owner=(0, 0),
+        )
+    else:
+        secret = _safe_read_regular(PAIRING_SECRET_FILE, 256).decode("ascii").strip()
+        if not re.fullmatch(r"[A-Z2-7]{26}", secret):
+            raise ActivationError("invalid existing pairing secret")
+        os.chmod(PAIRING_SECRET_FILE, 0o600, follow_symlinks=False)
+        os.chown(PAIRING_SECRET_FILE, 0, 0, follow_symlinks=False)
+
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chown(TLS_DIR, 0, gid)
+    os.chmod(TLS_DIR, 0o750)
+    if not TLS_KEY_FILE.exists() or not TLS_CERT_FILE.exists():
+        with tempfile.TemporaryDirectory(dir=TLS_DIR) as directory:
+            temporary_key = Path(directory) / "key.pem"
+            temporary_cert = Path(directory) / "cert.pem"
+            device_name = f"Medicam-{_device_id()[-6:]}"
+            run(
+                [
+                    "/usr/bin/openssl",
+                    "ecparam",
+                    "-name",
+                    "prime256v1",
+                    "-genkey",
+                    "-noout",
+                    "-out",
+                    str(temporary_key),
+                ]
+            )
+            run(
+                [
+                    "/usr/bin/openssl",
+                    "req",
+                    "-new",
+                    "-x509",
+                    "-sha256",
+                    "-days",
+                    "3650",
+                    "-key",
+                    str(temporary_key),
+                    "-out",
+                    str(temporary_cert),
+                    "-subj",
+                    f"/CN={device_name}",
+                    "-addext",
+                    f"subjectAltName=DNS:nom.local,DNS:{device_name.lower()}.local",
+                ]
+            )
+            _safe_atomic_write(
+                TLS_KEY_FILE,
+                temporary_key.read_bytes(),
+                mode=0o640,
+                owner=(0, gid),
+            )
+            _safe_atomic_write(
+                TLS_CERT_FILE,
+                temporary_cert.read_bytes(),
+                mode=0o644,
+                owner=(0, 0),
+            )
+    else:
+        os.chmod(TLS_KEY_FILE, 0o640, follow_symlinks=False)
+        os.chown(TLS_KEY_FILE, 0, gid, follow_symlinks=False)
+        os.chmod(TLS_CERT_FILE, 0o644, follow_symlinks=False)
+        os.chown(TLS_CERT_FILE, 0, 0, follow_symlinks=False)
+
+
+def install_ble_runtime(release_root: Path) -> None:
+    source_app = release_root / "app"
+    requirements = release_root / "requirements.txt"
+    if not source_app.is_dir() or not requirements.is_file():
+        raise ActivationError("signed BLE runtime source is missing")
+
+    BLE_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".ble-", dir=BLE_ROOT.parent))
+    try:
+        shutil.copytree(source_app, staging / "app")
+        if BLE_ROOT.exists():
+            shutil.rmtree(BLE_ROOT)
+        os.replace(staging, BLE_ROOT)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    requirement_bytes = requirements.read_bytes()
+    requirement_hash = hashlib.sha256(requirement_bytes).hexdigest()
+    installed_hash = ""
+    try:
+        installed_hash = BLE_REQUIREMENTS_MARKER.read_text(encoding="ascii").strip()
+    except OSError:
+        pass
+    if not (BLE_VENV / "bin" / "python3").is_file():
+        if BLE_VENV.exists():
+            shutil.rmtree(BLE_VENV)
+        run(["/usr/bin/python3", "-m", "venv", str(BLE_VENV)], timeout=180)
+        installed_hash = ""
+    if installed_hash != requirement_hash:
+        run(
+            [
+                str(BLE_VENV / "bin" / "pip"),
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "-r",
+                str(requirements),
+            ],
+            timeout=600,
+        )
+        _safe_atomic_write(
+            BLE_REQUIREMENTS_MARKER,
+            f"{requirement_hash}\n".encode("ascii"),
+            mode=0o444,
+            owner=(0, 0),
+        )
+
+
+def install_network_security(release_root: Path) -> None:
+    nft_source = release_root / "deploy" / "nftables" / "medicam.nft"
+    ssh_source = release_root / "deploy" / "ssh" / "medicam.conf"
+    avahi_source = release_root / "deploy" / "avahi" / "medicam.service"
+    if (
+        not nft_source.is_file()
+        or not ssh_source.is_file()
+        or not avahi_source.is_file()
+    ):
+        # Backward-compatible rollback to releases predating priority 7 keeps
+        # the already-installed policy instead of deleting it.
+        return
+
+    if (
+        not Path("/usr/sbin/nft").is_file()
+        or not Path("/usr/sbin/avahi-daemon").is_file()
+    ):
+        environment = os.environ.copy()
+        environment["DEBIAN_FRONTEND"] = "noninteractive"
+        run(["/usr/bin/apt-get", "update"], timeout=600, env=environment)
+        run(
+            [
+                "/usr/bin/apt-get",
+                "install",
+                "-y",
+                "--no-install-recommends",
+                "nftables",
+                "avahi-daemon",
+            ],
+            timeout=600,
+            env=environment,
+        )
+    run(["/usr/sbin/nft", "-c", "-f", str(nft_source)])
+    AVAHI_SERVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _safe_atomic_write(
+        NFTABLES_FILE,
+        nft_source.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
+    run(["/usr/sbin/nft", "-f", str(NFTABLES_FILE)])
+    run(["/bin/systemctl", "enable", "nftables.service"])
+
+    previous_ssh = None
+    try:
+        previous_ssh = _safe_read_regular(SSH_DROP_IN, 1024 * 1024)
+    except (OSError, ActivationError):
+        pass
+    _safe_atomic_write(
+        SSH_DROP_IN,
+        ssh_source.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
+    validation = run(["/usr/sbin/sshd", "-t"], check=False)
+    if validation.returncode != 0:
+        if previous_ssh is None:
+            SSH_DROP_IN.unlink(missing_ok=True)
+        else:
+            _safe_atomic_write(
+                SSH_DROP_IN,
+                previous_ssh,
+                mode=0o644,
+                owner=(0, 0),
+            )
+        raise ActivationError(f"refusing invalid SSH policy: {validation.stderr}")
+    run(["/bin/systemctl", "reload", "ssh.service"], check=False)
+
+    _safe_atomic_write(
+        AVAHI_SERVICE_FILE,
+        avahi_source.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
+    run(["/bin/systemctl", "enable", "--now", "avahi-daemon.service"])
+    run(["/bin/systemctl", "restart", "avahi-daemon.service"])
+
+    for unit in (
+        "cups.service",
+        "cups-browsed.service",
+        "dnsmasq.service",
+        "smbd.service",
+        "nmbd.service",
+        "samba-ad-dc.service",
+    ):
+        run(["/bin/systemctl", "disable", "--now", unit], check=False)
+
+
+def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
+    source_helper = release_root / "scripts" / "medicam_ota_activate.py"
+    source_signers = release_root / "deploy" / "ota_allowed_signers"
+    source_image = release_root / "deploy" / "image-version"
     for source in (source_helper, source_signers, source_image):
         if not source.is_file():
             raise ActivationError(f"signed release asset missing: {source}")
     for unit_name in SYSTEMD_ASSETS:
-        source = REPO / "deploy" / "systemd" / unit_name
+        source = release_root / "deploy" / "systemd" / unit_name
         if not source.is_file():
             raise ActivationError(f"signed systemd unit missing: {source}")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(STATE_DIR, 0o775)
-    _chown_radxa(STATE_DIR)
+    os.chown(STATE_DIR, 0, _radxa_ids()[1])
+    os.chmod(STATE_DIR, 0o770)
+    ensure_security_identity()
+    install_ble_runtime(release_root)
+    install_network_security(release_root)
     SYSTEM_SIGNERS.parent.mkdir(parents=True, exist_ok=True)
     INSTALLED_HELPER.parent.mkdir(parents=True, exist_ok=True)
     DROP_IN.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source_signers, SYSTEM_SIGNERS)
-    os.chmod(SYSTEM_SIGNERS, 0o644)
-    shutil.copyfile(source_image, SYSTEM_IMAGE_VERSION)
-    os.chmod(SYSTEM_IMAGE_VERSION, 0o644)
+    _safe_atomic_write(
+        SYSTEM_SIGNERS,
+        source_signers.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
+    _safe_atomic_write(
+        SYSTEM_IMAGE_VERSION,
+        source_image.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
     _atomic_install_text(DROP_IN, RUNTIME_DROP_IN, 0o644)
     for unit_name, destination in SYSTEMD_ASSETS.items():
-        source = REPO / "deploy" / "systemd" / unit_name
+        source = release_root / "deploy" / "systemd" / unit_name
         _atomic_install_text(destination, source.read_text(encoding="utf-8"), 0o644)
 
     # Install the next signed helper atomically. The currently running Python
     # process remains mapped, while the scheduled process uses this new file.
-    temporary_helper = INSTALLED_HELPER.with_name(f".{INSTALLED_HELPER.name}.tmp")
-    shutil.copyfile(source_helper, temporary_helper)
-    os.chmod(temporary_helper, 0o755)
-    os.replace(temporary_helper, INSTALLED_HELPER)
+    _safe_atomic_write(
+        INSTALLED_HELPER,
+        source_helper.read_bytes(),
+        mode=0o755,
+        owner=(0, 0),
+    )
     if harden:
         harden_sudoers()
     run(["/bin/systemctl", "daemon-reload"])
@@ -379,8 +845,11 @@ def reset_checkout(commit: str) -> None:
     )
 
 
-def install_python_requirements() -> None:
+def install_python_requirements(release_root: Path) -> None:
     pip = REPO / "medicam-venv" / "bin" / "pip"
+    requirements = release_root / "requirements.txt"
+    if not requirements.is_file():
+        raise ActivationError("signed requirements file is missing")
     run(
         [
             "/usr/sbin/runuser",
@@ -389,8 +858,10 @@ def install_python_requirements() -> None:
             "--",
             str(pip),
             "install",
+            "--disable-pip-version-check",
+            "--no-input",
             "-r",
-            str(REPO / "requirements.txt"),
+            str(requirements),
         ],
         timeout=300,
     )
@@ -425,17 +896,12 @@ def restore_persistent_files(
 ) -> None:
     for relative_path, (content, mode, uid, gid) in snapshot.items():
         path = REPO / relative_path
-        temporary = path.with_name(f".{path.name}.ota-root-tmp")
-        try:
-            with open(temporary, "wb") as output:
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-            os.chmod(temporary, mode)
-            os.chown(temporary, uid, gid)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _safe_atomic_write(
+            path,
+            content,
+            mode=mode,
+            owner=(uid, gid),
+        )
 
 
 def restart_services() -> None:
@@ -460,11 +926,26 @@ def wait_for_health(expected_commit: str, timeout: int = HEALTH_TIMEOUT_SECONDS)
     last_error = "backend did not answer"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(
-                "http://127.0.0.1:8000/ping",
-                timeout=2,
-            ) as response:
-                payload = json.load(response)
+            urls = [("http://127.0.0.1:8000/ping", None)]
+            if TLS_CERT_FILE.is_file():
+                context = ssl.create_default_context(cafile=str(TLS_CERT_FILE))
+                context.check_hostname = False
+                urls.insert(0, ("https://127.0.0.1:8000/ping", context))
+            last_connection_error = None
+            payload = None
+            for url, context in urls:
+                try:
+                    with urllib.request.urlopen(
+                        url,
+                        timeout=2,
+                        context=context,
+                    ) as response:
+                        payload = json.load(response)
+                    break
+                except Exception as error:
+                    last_connection_error = error
+            if payload is None:
+                raise last_connection_error or ActivationError("backend did not answer")
             if payload.get("status") != "ok":
                 last_error = f"unexpected ping payload: {payload}"
             elif payload.get("commit") != expected_commit:
@@ -502,6 +983,7 @@ def perform(previous: str, target: str, tag: str) -> None:
     try:
         verify_release(tag, target)
         validate_transition(previous, tag)
+        target_release = materialize_release(target)
         write_status(
             "restarting",
             85,
@@ -554,8 +1036,9 @@ def perform(previous: str, target: str, tag: str) -> None:
         )
         reset_checkout(previous)
         restore_persistent_files(persistent_files)
-        install_python_requirements()
-        install_release_assets(harden=True)
+        previous_release = materialize_release(previous)
+        install_python_requirements(previous_release)
+        install_release_assets(previous_release, harden=True)
         restart_services()
         restored, rollback_error = wait_for_health(previous)
         if not restored:
@@ -592,9 +1075,10 @@ def schedule(previous: str, target: str, tag: str) -> None:
         raise ActivationError("invalid previous commit")
     verify_release(tag, target)
     validate_transition(previous, tag)
+    target_release = materialize_release(target)
     persistent_files = snapshot_persistent_files()
     try:
-        install_release_assets(harden=True)
+        install_release_assets(target_release, harden=True)
         write_status(
             "restarting",
             82,
@@ -627,8 +1111,9 @@ def schedule(previous: str, target: str, tag: str) -> None:
         try:
             reset_checkout(previous)
             restore_persistent_files(persistent_files)
-            install_python_requirements()
-            install_release_assets(harden=True)
+            previous_release = materialize_release(previous)
+            install_python_requirements(previous_release)
+            install_release_assets(previous_release, harden=True)
         except Exception as restore_error:
             raise ActivationError(
                 f"activation scheduling failed: {activation_error}; "
@@ -645,10 +1130,19 @@ def main(arguments: list[str]) -> int:
         # Establish root-owned trust before removing the temporary migration
         # privilege. A malformed or unsigned checkout therefore cannot lock the
         # administrator out of retrying the one-time transition.
-        install_release_assets(harden=False)
         commit, tag = initialize_trust_state()
+        release_root = materialize_release(commit)
+        install_release_assets(release_root, harden=False)
         harden_sudoers()
         print(f"Medicam OTA hardened at {tag} ({commit})")
+        return 0
+    if len(arguments) == 2 and arguments[1] == "pairing-info":
+        ensure_security_identity()
+        secret = _safe_read_regular(PAIRING_SECRET_FILE, 256).decode("ascii").strip()
+        grouped = "-".join(secret[index:index + 4] for index in range(0, len(secret), 4))
+        print(f"Device ID: {_device_id()}")
+        print(f"Pairing code: {grouped}")
+        print(f"QR payload: medicam://pair?device_id={_device_id()}&code={secret}")
         return 0
     if len(arguments) == 5 and arguments[1] == "schedule":
         schedule(arguments[2], arguments[3], arguments[4])
@@ -659,7 +1153,7 @@ def main(arguments: list[str]) -> int:
         return 0
     print(
         "usage: medicam-ota-activate "
-        "{harden|schedule PREVIOUS TARGET TAG|perform PREVIOUS TARGET TAG}",
+        "{harden|pairing-info|schedule PREVIOUS TARGET TAG|perform PREVIOUS TARGET TAG}",
         file=sys.stderr,
     )
     return 2

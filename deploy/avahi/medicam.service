@@ -1,0 +1,11 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">%h Medicam</name>
+  <service>
+    <type>_https._tcp</type>
+    <port>8000</port>
+    <txt-record>service=medicam</txt-record>
+    <txt-record>protocol=4</txt-record>
+  </service>
+</service-group>

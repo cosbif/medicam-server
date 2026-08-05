@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet medicam_filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid drop
+        ct state established,related accept
+        iifname "lo" accept
+
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        meta nfproto ipv4 udp sport 67 udp dport 68 accept
+        meta nfproto ipv6 udp sport 547 udp dport 546 accept
+        udp dport 5353 accept
+
+        tcp dport 22 accept
+        tcp dport 8000 accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

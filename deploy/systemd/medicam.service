@@ -10,9 +10,23 @@ Group=radxa
 WorkingDirectory=/home/radxa/medicam-server
 Environment=SUDO_ASKPASS=/bin/true
 Environment=PATH=/home/radxa/medicam-server/medicam-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
+Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
+Environment=MEDICAM_TLS_CERT_FILE=/etc/medicam/tls/cert.pem
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile /etc/medicam/tls/key.pem --ssl-certfile /etc/medicam/tls/cert.pem
 Restart=always
 RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

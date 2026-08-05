@@ -19,7 +19,7 @@ class VersionInfoTests(unittest.TestCase):
 
         self.assertEqual(payload["server"]["release"], "medicam-v1.2.0")
         self.assertEqual(payload["protocols"]["app"], 4)
-        self.assertEqual(payload["protocols"]["ble"], 3)
+        self.assertEqual(payload["protocols"]["ble"], 4)
         self.assertEqual(payload["device_image"]["version"], "medicam-image-7")
         self.assertEqual(payload["camera"]["firmware_revision"], "0102")
         self.assertEqual(payload["uptime_seconds"], 123.4)

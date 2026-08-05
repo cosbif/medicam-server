@@ -92,6 +92,7 @@ class RouteSecurityTests(unittest.TestCase):
             "/wifi/status",
             "/provision/recovery/start",
             "/provision/recovery/stop",
+            "/auth/rotate",
         }
         update_paths = {
             "/update/check",
@@ -143,16 +144,38 @@ class RouteSecurityTests(unittest.TestCase):
 
         self.assertTrue(routes.require_api_auth(self._request(self._headers(token))))
 
-    def test_update_auth_allows_loopback_but_rejects_lan_without_token(self):
+    def test_update_auth_requires_token_even_from_loopback(self):
         with self.assertRaises(HTTPException) as context:
             routes.require_update_auth(self._request())
 
         self.assertEqual(context.exception.status_code, 403)
 
-        self.assertTrue(routes.require_update_auth(self._request(client_host="127.0.0.1")))
-
         token = self._provision()
+        with self.assertRaises(HTTPException) as loopback:
+            routes.require_update_auth(self._request(client_host="127.0.0.1"))
+        self.assertEqual(loopback.exception.status_code, 401)
         self.assertTrue(routes.require_update_auth(self._request(self._headers(token))))
+
+    def test_token_rotation_immediately_invalidates_old_token(self):
+        old_token = self._provision()
+        new_token = utils.generate_api_token()
+        request = self._request(self._headers(old_token))
+
+        result = asyncio.run(
+            routes.rotate_auth_token(
+                routes.TokenRotateRequest(new_token=new_token),
+                request,
+                _ok=True,
+            )
+        )
+
+        self.assertEqual(result["status"], "rotated")
+        self.assertFalse(utils.verify_api_token(old_token))
+        self.assertTrue(utils.verify_api_token(new_token))
+
+        with self.assertRaises(HTTPException) as stale:
+            routes.require_api_auth(request)
+        self.assertEqual(stale.exception.status_code, 401)
 
     def test_update_is_rejected_while_recording(self):
         with patch(

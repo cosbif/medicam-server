@@ -3,7 +3,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Qu
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from app import audio, camera, storage_manager, utils, updater, version_info
-import ipaddress
+import asyncio
 import math
 import os
 import platform
@@ -31,17 +31,7 @@ def require_api_auth(request: Request):
     return True
 
 
-def _is_loopback_request(request: Request):
-    client_host = request.client.host if request.client else ""
-    try:
-        return ipaddress.ip_address(client_host).is_loopback
-    except ValueError:
-        return client_host in {"localhost"}
-
-
 def require_update_auth(request: Request):
-    if _is_loopback_request(request):
-        return True
     return require_api_auth(request)
 
 router = APIRouter()
@@ -95,6 +85,10 @@ async def ping():
         "status": "ok",
         "service": "medicam",
         "hostname": socket.gethostname(),
+        "protocol": 4,
+        "transport": "https",
+        "device_id": utils.get_device_id(),
+        "tls_fingerprint": utils.get_tls_fingerprint(),
         **version_info.get_ping_version(),
     }
 
@@ -134,6 +128,31 @@ class StoragePolicyRequest(BaseModel):
 
 class StorageCleanupRequest(BaseModel):
     reclaim_gb: float = Field(gt=0, le=4096)
+
+
+class TokenRotateRequest(BaseModel):
+    new_token: str = Field(min_length=32, max_length=128)
+
+
+@router.post("/auth/rotate")
+async def rotate_auth_token(
+    payload: TokenRotateRequest,
+    request: Request,
+    _ok: bool = Depends(require_api_auth),
+):
+    try:
+        rotated = utils.rotate_api_token(
+            _token_from_request(request),
+            payload.new_token,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if not rotated:
+        raise HTTPException(status_code=409, detail="stale_api_token")
+    return {
+        "status": "rotated",
+        "device_id": utils.get_device_id(),
+    }
 
 
 def _video_sort_value(video: dict, sort: str):
@@ -537,21 +556,26 @@ async def wifi_status(_ok: bool = Depends(require_api_auth)):
 @router.get("/provision/status")
 async def provision_status(request: Request):
     authenticated = _is_authenticated(request)
+    wifi_connected = await asyncio.to_thread(utils.is_wifi_connected)
     payload = {
         "provisioned": utils.is_provisioned(),
         "device": {
             "id": utils.get_device_id(),
             "name": utils.get_device_name(),
         },
-        "protocol": 3,
+        "protocol": 4,
+        "transport": "https",
+        "tls_fingerprint": utils.get_tls_fingerprint(),
         "wifi": {
-            "connected": utils.is_wifi_connected(),
+            "connected": wifi_connected,
         },
     }
     if authenticated:
         payload["info"] = utils.get_provision_info()
-        payload["wifi"]["ssid"] = utils.get_wifi_ssid()
-        payload["wifi"]["ip"] = utils.get_primary_ipv4()
+        payload["wifi"]["ssid"], payload["wifi"]["ip"] = await asyncio.gather(
+            asyncio.to_thread(utils.get_wifi_ssid),
+            asyncio.to_thread(utils.get_primary_ipv4),
+        )
         payload["ble_service"] = _systemctl_status(BLE_SERVICE)
         payload["recovery"] = {
             "active": utils.is_ble_recovery_active(),

@@ -7,6 +7,10 @@ import os
 import sys
 import threading
 import traceback
+import hashlib
+import hmac
+import secrets
+from concurrent.futures import ThreadPoolExecutor
 
 # подключаем project root, чтобы импортировать app.utils
 project_root = Path(__file__).resolve().parents[1]
@@ -26,8 +30,17 @@ else:
 SERVICE_UUID = "3f7d1000-6f4b-4e21-9a63-7b9c3f1d0001"
 CMD_CHAR_UUID = "3f7d1001-6f4b-4e21-9a63-7b9c3f1d0001"
 RESP_CHAR_UUID = "3f7d1002-6f4b-4e21-9a63-7b9c3f1d0001"
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_COMMAND_BYTES = 8192
+PAIRING_NONCE_TTL_SECONDS = 120
+PAIRING_SESSION_TTL_SECONDS = 300
+PAIRING_FAILURE_LIMIT = 5
+PAIRING_BLOCK_SECONDS = 60
+MAX_PENDING_COMMANDS = 4
+MAX_PENDING_RESPONSES = 8
+MAX_RESPONSE_BYTES = 8192
+MAX_NOTIFICATION_VALUE_BYTES = 150
+NOTIFICATION_BODY_BYTES = 120
 
 PROVISION_FILE = utils._provision_path()
 
@@ -36,6 +49,27 @@ TEST_MODE = os.getenv("MEDICAM_BLE_TEST_MODE", "").lower() in {
     "true",
     "yes",
 }
+
+
+def encode_notification_frames(payload: bytes, frame_id: str | None = None):
+    """Return ATT-safe protocol-4 notifications for one bounded response."""
+    if len(payload) > MAX_RESPONSE_BYTES:
+        payload = b'{"error":"response_too_large"}'
+    if len(payload) <= MAX_NOTIFICATION_VALUE_BYTES:
+        return [payload]
+    frame_id = frame_id or secrets.token_hex(4)
+    total = (len(payload) + NOTIFICATION_BODY_BYTES - 1) // NOTIFICATION_BODY_BYTES
+    frames = []
+    for sequence in range(total):
+        body = payload[
+            sequence * NOTIFICATION_BODY_BYTES:
+            (sequence + 1) * NOTIFICATION_BODY_BYTES
+        ]
+        frame = f"M4|{frame_id}|{sequence}|{total}|".encode("ascii") + body
+        if len(frame) > MAX_NOTIFICATION_VALUE_BYTES:
+            raise ValueError("notification_frame_too_large")
+        frames.append(frame)
+    return frames
 
 # ---------------------------
 # Helper: adapter MAC
@@ -137,8 +171,8 @@ class ProvisionService:
                 uuid=RESP_CHAR_UUID,
                 value=[],
                 notifying=False,
-                flags=["read", "notify"],
-                read_callback=self.on_read_response,
+                flags=["notify"],
+                read_callback=None,
                 write_callback=None,
                 notify_callback=None
             )
@@ -150,8 +184,8 @@ class ProvisionService:
                 uuid=RESP_CHAR_UUID,
                 value=[],
                 notifying=False,
-                flags=["read", "notify"],
-                read_callback=self.on_read_response,
+                flags=["notify"],
+                read_callback=None,
                 write_callback=None,
                 notify_callback=None
             )
@@ -164,6 +198,26 @@ class ProvisionService:
         self._resp_lock = threading.Lock()
         # buffer for fragmented incoming writes (persistent across calls)
         self._cmd_buffer = bytearray()
+        self._executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="medicam-ble-command",
+        )
+        self._notify_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="medicam-ble-response",
+        )
+        self._command_slots = threading.BoundedSemaphore(MAX_PENDING_COMMANDS)
+        self._notify_slots = threading.BoundedSemaphore(MAX_PENDING_RESPONSES)
+        self._pairing_lock = threading.Lock()
+        self._pairing_nonce = ""
+        self._pairing_nonce_issued = 0.0
+        self._pairing_failures = 0
+        self._pairing_blocked_until = 0.0
+        self._session_id = ""
+        self._session_key = ""
+        self._session_expires = 0.0
+        self._session_counter = -1
+        self._rotate_pairing_nonce_locked()
 
     # ---------------------------
     # Read callback for RESP
@@ -190,12 +244,25 @@ class ProvisionService:
             payload = json.dumps(response_dict).encode()
         except Exception:
             payload = str(response_dict).encode()
+        if len(payload) > MAX_RESPONSE_BYTES:
+            payload = json.dumps(
+                {
+                    "error": "response_too_large",
+                    **({"request_id": request_id} if request_id else {}),
+                }
+            ).encode()
 
-        value_list = list(payload)
         with self._resp_lock:
             self.response_value = payload
 
-        # Попытка установить value и послать notify — всё в try/except
+        for frame in encode_notification_frames(payload):
+            self._notify_value(frame)
+            if len(payload) > MAX_NOTIFICATION_VALUE_BYTES:
+                time.sleep(0.015)
+
+    def _notify_value(self, value):
+        """Publish one MTU-bounded notification value without logging data."""
+        value_list = list(value)
         try:
             if self.resp_char is not None:
                 # try to use direct API
@@ -238,15 +305,19 @@ class ProvisionService:
                     except Exception:
                         continue
         except Exception as e:
-            print("[WARN] _set_response notify block error:", e)
+            print("[WARN] BLE notify block error:", e)
 
     def _set_response_async(self, response_dict, request_id=None):
-        threading.Thread(
-            target=self._set_response,
-            args=(response_dict,),
-            kwargs={"request_id": request_id},
-            daemon=True,
-        ).start()
+        if not self._notify_slots.acquire(blocking=False):
+            return
+
+        def run_response():
+            try:
+                self._set_response(response_dict, request_id=request_id)
+            finally:
+                self._notify_slots.release()
+
+        self._notify_executor.submit(run_response)
 
     def _dispatch_command(self, data):
         """
@@ -257,11 +328,31 @@ class ProvisionService:
         Write Response. iOS then times out the write. Returning from the write
         callback immediately keeps the GATT transaction healthy.
         """
-        threading.Thread(
-            target=self._handle_command,
-            args=(data,),
-            daemon=True,
-        ).start()
+        if not self._command_slots.acquire(blocking=False):
+            self._set_response_async({"error": "busy"}, request_id=data.get("request_id"))
+            return
+
+        def run_command():
+            try:
+                self._handle_command(data)
+            finally:
+                self._command_slots.release()
+
+        self._executor.submit(run_command)
+
+    def _rotate_pairing_nonce_locked(self):
+        self._pairing_nonce = secrets.token_urlsafe(24)
+        self._pairing_nonce_issued = time.monotonic()
+
+    def _public_pairing_nonce(self):
+        with self._pairing_lock:
+            if (
+                not self._pairing_nonce
+                or time.monotonic() - self._pairing_nonce_issued
+                >= PAIRING_NONCE_TTL_SECONDS
+            ):
+                self._rotate_pairing_nonce_locked()
+            return self._pairing_nonce
 
     def _status_payload(self):
         return {
@@ -271,17 +362,132 @@ class ProvisionService:
             "device_id": utils.get_device_id(),
             "device_name": utils.get_device_name(),
             "provisioned": utils.is_provisioned(),
-            "wifi_connected": is_wifi_connected(),
-            "ssid": get_wifi_ssid(),
-            "ip": "" if TEST_MODE else utils.get_primary_ipv4(),
-            "recovery_active": utils.is_ble_recovery_active(),
+            "pairing_nonce": self._public_pairing_nonce(),
+            "pairing_nonce_ttl": PAIRING_NONCE_TTL_SECONDS,
             "capabilities": [
+                "physical_pairing_code",
+                "mutual_pairing_proof",
+                "session_hmac",
+                "client_generated_token",
+                "tls_pinning",
                 "wifi_scan",
                 "wifi_connect",
-                "session_token",
                 "recovery_window",
             ],
         }
+
+    @staticmethod
+    def _canonical_session_command(data):
+        authenticated = {
+            key: value
+            for key, value in data.items()
+            if key != "auth"
+        }
+        return json.dumps(
+            authenticated,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _unlock_pairing(self, data, request_id=None):
+        nonce = data.get("nonce")
+        proof = data.get("proof")
+        now = time.monotonic()
+        device_id = utils.get_device_id()
+        fingerprint = utils.get_tls_fingerprint()
+        with self._pairing_lock:
+            if now < self._pairing_blocked_until:
+                self._set_response(
+                    {
+                        "error": "pairing_throttled",
+                        "retry_after": max(1, int(self._pairing_blocked_until - now)),
+                    },
+                    request_id=request_id,
+                )
+                return
+            valid_nonce = (
+                isinstance(nonce, str)
+                and hmac.compare_digest(nonce, self._pairing_nonce)
+                and now - self._pairing_nonce_issued < PAIRING_NONCE_TTL_SECONDS
+            )
+            valid_proof = bool(
+                valid_nonce
+                and isinstance(proof, str)
+                and utils.verify_pairing_client_proof(nonce, device_id, proof)
+            )
+            if not valid_proof or not fingerprint:
+                self._pairing_failures += 1
+                if self._pairing_failures >= PAIRING_FAILURE_LIMIT:
+                    self._pairing_blocked_until = now + PAIRING_BLOCK_SECONDS
+                    self._pairing_failures = 0
+                self._rotate_pairing_nonce_locked()
+                self._set_response(
+                    {
+                        "error": "invalid_pairing_proof",
+                        "pairing_nonce": self._pairing_nonce,
+                    },
+                    request_id=request_id,
+                )
+                return
+
+            self._pairing_failures = 0
+            self._pairing_blocked_until = 0.0
+            self._session_id = secrets.token_urlsafe(18)
+            self._session_key = utils.pairing_session_key(nonce, device_id)
+            self._session_expires = now + PAIRING_SESSION_TTL_SECONDS
+            self._session_counter = -1
+            server_proof = utils.pairing_server_proof(
+                nonce,
+                device_id,
+                fingerprint,
+            )
+            self._rotate_pairing_nonce_locked()
+
+        self._set_response(
+            {
+                "status": "unlocked",
+                "session_id": self._session_id,
+                "expires_in": PAIRING_SESSION_TTL_SECONDS,
+                "device_id": device_id,
+                "device_name": utils.get_device_name(),
+                "tls_fingerprint": fingerprint,
+                "server_proof": server_proof,
+            },
+            request_id=request_id,
+        )
+
+    def _verify_session_command(self, data):
+        session_id = data.get("session_id")
+        counter = data.get("counter")
+        supplied = data.get("auth")
+        with self._pairing_lock:
+            if (
+                not self._session_id
+                or time.monotonic() >= self._session_expires
+                or not isinstance(session_id, str)
+                or not hmac.compare_digest(session_id, self._session_id)
+                or not isinstance(counter, int)
+                or counter <= self._session_counter
+                or not isinstance(supplied, str)
+            ):
+                return False
+            expected = hmac.new(
+                bytes.fromhex(self._session_key),
+                self._canonical_session_command(data),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(supplied, expected):
+                return False
+            self._session_counter = counter
+            return True
+
+    def _clear_session(self):
+        with self._pairing_lock:
+            self._session_id = ""
+            self._session_key = ""
+            self._session_expires = 0.0
+            self._session_counter = -1
 
     # ---------------------------
     # Long-running workers
@@ -295,24 +501,28 @@ class ProvisionService:
             print("[ERR] worker_scan_wifi:", e, traceback.format_exc())
             self._set_response({"error": str(e)}, request_id=request_id)
 
-    def _worker_connect_wifi(self, ssid, password, request_id=None):
+    def _worker_connect_wifi(self, ssid, password, api_token, request_id=None):
         try:
             result = self.connect_wifi(ssid, password)
             ok = bool(result.get("ok"))
             ip = result.get("ip", "")
             if ok:
-                utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-                api_token = utils.get_api_token()
+                utils.set_provisioned(
+                    True,
+                    {"ssid": ssid, "ip": ip},
+                    api_token=api_token,
+                )
                 self._set_response(
                     {
                         "status": "connected",
                         "ip": ip,
-                        "api_token": api_token,
                         "device_id": utils.get_device_id(),
                         "device_name": utils.get_device_name(),
+                        "tls_fingerprint": utils.get_tls_fingerprint(),
                     },
                     request_id=request_id,
                 )
+                self._clear_session()
             else:
                 self._set_response(
                     {
@@ -385,21 +595,49 @@ class ProvisionService:
             self._set_response(self._status_payload(), request_id=request_id)
             return
 
+        if cmd == "UNLOCK":
+            self._unlock_pairing(data, request_id=request_id)
+            return
+
         if cmd == "SCAN_WIFI":
+            if not self._verify_session_command(data):
+                self._set_response(
+                    {"error": "pairing_required"},
+                    request_id=request_id,
+                )
+                return
             self._worker_scan_wifi(request_id=request_id)
             return
 
         if cmd == "CONNECT_WIFI":
+            if not self._verify_session_command(data):
+                self._set_response(
+                    {"error": "pairing_required"},
+                    request_id=request_id,
+                )
+                return
             ssid = data.get("ssid")
             password = data.get("password")
+            api_token = data.get("api_token")
             if not isinstance(ssid, str) or not ssid:
                 self._set_response(
                     {"error": "ssid_required"},
                     request_id=request_id,
                 )
                 return
+            if not utils.is_valid_api_token(api_token):
+                self._set_response(
+                    {"error": "invalid_api_token"},
+                    request_id=request_id,
+                )
+                return
 
-            self._worker_connect_wifi(ssid, password, request_id=request_id)
+            self._worker_connect_wifi(
+                ssid,
+                password,
+                api_token,
+                request_id=request_id,
+            )
             return
 
         self._set_response(
@@ -430,7 +668,8 @@ class ProvisionService:
                 text=True,
                 encoding="utf-8",
                 errors="ignore",
-                check=True
+                check=True,
+                timeout=15,
             )
             by_ssid = {}
             for line in result.stdout.splitlines():
@@ -495,6 +734,8 @@ class ProvisionService:
         except KeyboardInterrupt:
             pass
         finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._notify_executor.shutdown(wait=False, cancel_futures=True)
             self.stop()
 
     def stop(self):

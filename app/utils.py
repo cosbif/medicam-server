@@ -5,7 +5,12 @@ import secrets
 import subprocess
 import hashlib
 import socket
+import ssl
 import threading
+import fcntl
+import pwd
+import stat
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -21,6 +26,11 @@ DEFAULT_BLE_RECOVERY_SECONDS = 10 * 60
 MAX_BLE_RECOVERY_SECONDS = 30 * 60
 BOOT_PAIRING_WINDOW_SECONDS = 5 * 60
 MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
+PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
+TLS_CERT_FILE = Path("/etc/medicam/tls/cert.pem")
+PAIRING_CLIENT_CONTEXT = "medicam-client-v1"
+PAIRING_SERVER_CONTEXT = "medicam-server-v1"
+PAIRING_SESSION_CONTEXT = "medicam-session-v1"
 
 _VIDEO_METADATA_CACHE = {}
 _VIDEO_INDEX_CACHE = None
@@ -492,6 +502,7 @@ def is_wifi_connected() -> bool:
             text=True,
             encoding="utf-8",
             errors="ignore",
+            timeout=5,
         ).strip()
         for line in status.splitlines():
             parts = split_nmcli_escaped(line)
@@ -510,6 +521,7 @@ def get_wifi_ssid() -> str:
             text=True,
             encoding="utf-8",
             errors="ignore",
+            timeout=5,
         )
         for line in ssid_lines.splitlines():
             parts = split_nmcli_escaped(line)
@@ -528,6 +540,7 @@ def get_primary_ipv4() -> str:
             text=True,
             encoding="utf-8",
             errors="ignore",
+            timeout=5,
         )
         match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
         return match.group(1) if match else ""
@@ -644,88 +657,190 @@ def classify_nmcli_error(stderr: str) -> str:
 
 
 def _provision_path():
-    # файл хранится в корне проекта (один уровень выше app/)
+    configured = os.getenv("MEDICAM_PROVISION_FILE", "").strip()
+    if configured:
+        return Path(configured)
+    # Development/test fallback. Production systemd always points at
+    # /var/lib/medicam/provision.json.
     project_root = Path(__file__).resolve().parents[1]
     return project_root / PROVISION_FILENAME
 
-def is_provisioned() -> bool:
-    """Возвращает True если устройство provisioned (подключено к Wi-Fi и помечено)."""
-    path = _provision_path()
-    try:
-        if not path.exists():
-            return False
-        with open(path, "r") as f:
-            data = json.load(f)
-        return bool(data.get("provisioned", False))
-    except Exception:
-        return False
 
-def set_provisioned(value: bool, info: dict | None = None):
-    """Записывает статус provisioned и доп.инфо (ssid, ip, timestamp)."""
+def _provision_lock_path() -> Path:
+    configured = os.getenv("MEDICAM_PROVISION_LOCK_FILE", "").strip()
+    if configured:
+        return Path(configured)
     path = _provision_path()
-    data = {}
-    if path.exists():
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    data["provisioned"] = bool(value)
-    if info is not None and value:
-        data.setdefault("info", {}).update(info)
-    elif info is not None:
-        data["info"] = dict(info)
-    if value:
-        data["api_token"] = data.get("api_token") or generate_api_token()
-    else:
-        data.pop("api_token", None)
-    data.pop("ble_recovery_until", None)
-    # добавим timestamp
-    from datetime import datetime
-    data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
+    return path.with_name(f".{path.name}.lock")
 
-    # Root-owned BLE service and radxa-owned HTTP service both update this file.
-    # Write through a temp file + rename so a radxa process can replace an older
-    # root-owned file as long as the project directory itself is writable.
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+def _radxa_ids() -> tuple[int, int] | None:
     try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp_path, path)
-        _normalize_provision_file_permissions(path)
+        account = pwd.getpwnam("radxa")
+        return account.pw_uid, account.pw_gid
+    except KeyError:
+        return None
+
+
+@contextmanager
+def _provision_lock(*, exclusive: bool):
+    """Cross-process lock that cannot be redirected through a symlink."""
+    path = _provision_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("provision_lock_not_regular")
+        fcntl.flock(
+            descriptor,
+            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+        yield
     finally:
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _open_provision_directory(path: Path) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path.parent, flags)
+
+
+def _read_provision_data_unlocked(path: Path) -> dict:
+    try:
+        directory = _open_provision_directory(path)
+    except OSError:
+        return {}
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path.name, flags, dir_fd=directory)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                return {}
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as value:
+                data = json.load(value)
+            return data if isinstance(data, dict) else {}
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    finally:
+        os.close(directory)
+
+
+def _atomic_write_provision_data_unlocked(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = _open_provision_directory(path)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory)
+        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            owner = _radxa_ids()
+            if owner is not None:
+                os.fchown(descriptor, *owner)
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
             pass
+        os.close(directory)
+
+def is_provisioned() -> bool:
+    """Возвращает True если устройство provisioned (подключено к Wi-Fi и помечено)."""
+    return bool(_read_provision_data().get("provisioned", False))
+
+def set_provisioned(
+    value: bool,
+    info: dict | None = None,
+    *,
+    api_token: str | None = None,
+):
+    """Записывает статус provisioned и доп.инфо (ssid, ip, timestamp)."""
+    path = _provision_path()
+    if value and api_token is not None and not is_valid_api_token(api_token):
+        raise ValueError("invalid_api_token_format")
+    with _provision_lock(exclusive=True):
+        data = _read_provision_data_unlocked(path)
+        data["provisioned"] = bool(value)
+        if info is not None and value:
+            data.setdefault("info", {}).update(info)
+        elif info is not None:
+            data["info"] = dict(info)
+        if value:
+            data["api_token"] = api_token or data.get("api_token") or generate_api_token()
+        else:
+            data.pop("api_token", None)
+        data.pop("ble_recovery_until", None)
+        data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
+        _atomic_write_provision_data_unlocked(path, data)
 
 
 def _normalize_provision_file_permissions(path: Path):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
     try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("provision_file_not_regular")
+        os.fchmod(descriptor, 0o600)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            project_owner = path.parent.stat()
-            os.chown(path, project_owner.st_uid, project_owner.st_gid)
-        os.chmod(path, 0o664)
-    except Exception:
-        pass
+            owner = _radxa_ids()
+            if owner is not None:
+                os.fchown(descriptor, *owner)
+    finally:
+        os.close(descriptor)
 
 
 def generate_api_token() -> str:
     return secrets.token_urlsafe(API_TOKEN_BYTES)
 
 
+def is_valid_api_token(token: str | None) -> bool:
+    return bool(
+        isinstance(token, str)
+        and 32 <= len(token) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_-]+", token)
+    )
+
+
 def get_api_token() -> str:
-    path = _provision_path()
-    try:
-        if not path.exists():
-            return ""
-        with open(path, "r") as f:
-            data = json.load(f)
-        token = data.get("api_token", "")
-        return token if isinstance(token, str) else ""
-    except Exception:
-        return ""
+    token = _read_provision_data().get("api_token", "")
+    return token if isinstance(token, str) else ""
 
 
 def verify_api_token(token: str | None) -> bool:
@@ -733,6 +848,100 @@ def verify_api_token(token: str | None) -> bool:
     if not expected or not token:
         return False
     return hmac.compare_digest(token, expected)
+
+
+def rotate_api_token(current_token: str | None, new_token: str) -> bool:
+    """Atomically replace the owner token only if the current token still matches."""
+    if not is_valid_api_token(new_token):
+        raise ValueError("invalid_new_api_token")
+    path = _provision_path()
+    with _provision_lock(exclusive=True):
+        data = _read_provision_data_unlocked(path)
+        expected = data.get("api_token", "")
+        if (
+            not data.get("provisioned")
+            or not isinstance(expected, str)
+            or not current_token
+            or not hmac.compare_digest(current_token, expected)
+        ):
+            return False
+        if hmac.compare_digest(new_token, expected):
+            raise ValueError("new_api_token_must_differ")
+        data["api_token"] = new_token
+        data.setdefault("info", {})["token_rotated_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        _atomic_write_provision_data_unlocked(path, data)
+        return True
+
+
+def _pairing_secret_path() -> Path:
+    return Path(
+        os.getenv("MEDICAM_PAIRING_SECRET_FILE", str(PAIRING_SECRET_FILE))
+    )
+
+
+def _tls_cert_path() -> Path:
+    return Path(os.getenv("MEDICAM_TLS_CERT_FILE", str(TLS_CERT_FILE)))
+
+
+def get_pairing_secret() -> str:
+    path = _pairing_secret_path()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise OSError("unsafe_pairing_secret_permissions")
+        with os.fdopen(descriptor, "r", encoding="ascii", closefd=False) as value:
+            secret = value.read(256).strip().replace("-", "").upper()
+    finally:
+        os.close(descriptor)
+    if not re.fullmatch(r"[A-Z2-7]{26}", secret):
+        raise OSError("invalid_pairing_secret")
+    return secret
+
+
+def _pairing_hmac(context: str, nonce: str, *values: str) -> str:
+    secret = get_pairing_secret().encode("ascii")
+    message = "\0".join((context, nonce, *values)).encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def pairing_client_proof(nonce: str, device_id: str) -> str:
+    return _pairing_hmac(PAIRING_CLIENT_CONTEXT, nonce, device_id)
+
+
+def pairing_server_proof(nonce: str, device_id: str, tls_fingerprint: str) -> str:
+    return _pairing_hmac(
+        PAIRING_SERVER_CONTEXT,
+        nonce,
+        device_id,
+        tls_fingerprint,
+    )
+
+
+def pairing_session_key(nonce: str, device_id: str) -> str:
+    return _pairing_hmac(PAIRING_SESSION_CONTEXT, nonce, device_id)
+
+
+def verify_pairing_client_proof(nonce: str, device_id: str, proof: str) -> bool:
+    try:
+        expected = pairing_client_proof(nonce, device_id)
+    except OSError:
+        return False
+    return bool(proof and hmac.compare_digest(proof, expected))
+
+
+def get_tls_fingerprint() -> str:
+    try:
+        pem = _tls_cert_path().read_text(encoding="ascii")
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        return hashlib.sha256(der).hexdigest()
+    except (OSError, ValueError):
+        return ""
 
 
 def get_device_id() -> str:
@@ -809,41 +1018,23 @@ def is_boot_pairing_window_active(
 def _read_provision_data() -> dict:
     path = _provision_path()
     try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+        with _provision_lock(exclusive=False):
+            return _read_provision_data_unlocked(path)
+    except OSError:
         return {}
 
 
 def _update_provision_fields(fields: dict, remove: tuple[str, ...]):
     path = _provision_path()
-    data = _read_provision_data()
-    data.update(fields)
-    for key in remove:
-        data.pop(key, None)
-
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp_path, path)
-        _normalize_provision_file_permissions(path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+    with _provision_lock(exclusive=True):
+        data = _read_provision_data_unlocked(path)
+        data.update(fields)
+        for key in remove:
+            data.pop(key, None)
+        _atomic_write_provision_data_unlocked(path, data)
 
 def get_provision_info() -> dict:
     """Возвращает словарь с инфо (ssid, ip и т.п.) или пустой словарь."""
-    path = _provision_path()
-    try:
-        if not path.exists():
-            return {}
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data.get("info", {}) if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data = _read_provision_data()
+    info = data.get("info", {})
+    return info if isinstance(info, dict) else {}
