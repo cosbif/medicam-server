@@ -55,23 +55,31 @@ def _rate(value):
 
 
 def _probe(path):
-    probe_timeout = max(120.0, path.stat().st_size / (2 * 1024 * 1024) + 120.0)
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "error",
-            "-count_frames",
+    def run_probe(count_frames=False):
+        command = ["ffprobe", "-v", "error"]
+        if count_frames:
+            command.append("-count_frames")
+        field = "nb_read_frames" if count_frames else "nb_frames"
+        command.extend([
             "-select_streams", "v:0",
             "-show_entries",
-            "stream=nb_read_frames,avg_frame_rate,width,height:format=duration",
+            f"stream={field},avg_frame_rate,width,height:format=duration",
             "-of", "json",
             str(path),
-        ],
-        text=True,
-        capture_output=True,
-        timeout=probe_timeout,
-        check=False,
-    )
+        ])
+        return subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=(
+                max(120.0, path.stat().st_size / (2 * 1024 * 1024) + 120.0)
+                if count_frames
+                else 120.0
+            ),
+            check=False,
+        )
+
+    result = run_probe()
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffprobe failed")
     data = json.loads(result.stdout)
@@ -79,9 +87,20 @@ def _probe(path):
     if not streams:
         raise RuntimeError("ffprobe found no video stream")
     stream = streams[0]
+    frame_value = stream.get("nb_frames")
+    if not str(frame_value or "").isdigit():
+        result = run_probe(count_frames=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffprobe failed")
+        data = json.loads(result.stdout)
+        streams = data.get("streams") or []
+        if not streams:
+            raise RuntimeError("ffprobe found no video stream")
+        stream = streams[0]
+        frame_value = stream.get("nb_read_frames")
     return {
         "duration_seconds": float((data.get("format") or {}).get("duration") or 0),
-        "frames": int(stream.get("nb_read_frames") or 0),
+        "frames": int(frame_value or 0),
         "avg_fps": _rate(stream.get("avg_frame_rate", "0/1")),
         "resolution": f"{stream.get('width')}x{stream.get('height')}",
     }
@@ -112,6 +131,7 @@ def _run_one(base_url, token, duration, poll_interval):
 
     started_monotonic = time.monotonic()
     latest = None
+    capture_error = None
     try:
         while True:
             elapsed = time.monotonic() - started_monotonic
@@ -120,7 +140,12 @@ def _run_one(base_url, token, duration, poll_interval):
             time.sleep(min(poll_interval, duration - elapsed))
             latest = _api(base_url, token, "GET", "/recording/status")
             if latest.get("state") != "recording" or not latest.get("capture_active"):
-                raise RuntimeError(f"capture became unhealthy after {elapsed:.1f}s: {latest}")
+                capture_error = (
+                    f"capture became unhealthy after {elapsed:.1f}s: {latest}"
+                )
+                break
+    except Exception as exc:
+        capture_error = str(exc)
     finally:
         stopped = _api(base_url, token, "POST", "/stop", timeout=3 * 60 * 60)
 
@@ -154,7 +179,8 @@ def _run_one(base_url, token, duration, poll_interval):
     missing_frames = max(0, expected_frames - probe["frames"])
     delivery = min(1.0, probe["frames"] / expected_frames)
     passed = (
-        probe["resolution"] == "1920x1080"
+        capture_error is None
+        and probe["resolution"] == "1920x1080"
         and probe["avg_fps"] >= MIN_AVG_FPS
         and delivery >= MIN_FRAME_DELIVERY
         and server_quality.get("healthy") is True
@@ -171,6 +197,7 @@ def _run_one(base_url, token, duration, poll_interval):
         "avg_fps": round(probe["avg_fps"], 3),
         "resolution": probe["resolution"],
         "server_quality": server_quality,
+        "capture_error": capture_error,
         "passed": passed,
     }
 

@@ -75,6 +75,33 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
+    @patch("app.camera.subprocess.run")
+    def test_recording_probe_uses_fast_mp4_frame_count(self, run_mock):
+        run_mock.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {
+                            "nb_frames": "1800",
+                            "avg_frame_rate": "30/1",
+                            "width": 1920,
+                            "height": 1080,
+                        }
+                    ],
+                    "format": {"duration": "60.0"},
+                }
+            ),
+            stderr="",
+        )
+
+        quality = camera._probe_recording("videos/test.mp4", 60.0, 30.0)
+
+        self.assertTrue(quality["healthy"])
+        self.assertEqual(quality["frame_count"], 1800)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertNotIn("-count_frames", run_mock.call_args.args[0])
+
     def test_long_recordings_receive_size_based_processing_timeout(self):
         with patch("app.camera._safe_file_size", return_value=8 * 1024 ** 3):
             timeout = camera._file_processing_timeout(

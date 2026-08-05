@@ -631,34 +631,53 @@ def _parse_rate(value):
         return 0.0
 
 
-def _probe_recording(path: str, elapsed_seconds: float, expected_fps: float):
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-count_frames",
-                "-select_streams", "v:0",
-                "-show_entries",
-                "stream=nb_read_frames,avg_frame_rate,width,height:format=duration",
-                "-of", "json",
-                path,
-            ],
-            text=True,
-            capture_output=True,
-            timeout=_file_processing_timeout(
+def _run_ffprobe(path: str, count_frames: bool = False):
+    frame_field = "nb_read_frames" if count_frames else "nb_frames"
+    command = [
+        "ffprobe",
+        "-v", "error",
+    ]
+    if count_frames:
+        command.append("-count_frames")
+    command.extend([
+        "-select_streams", "v:0",
+        "-show_entries",
+        f"stream={frame_field},avg_frame_rate,width,height:format=duration",
+        "-of", "json",
+        path,
+    ])
+    result = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        timeout=(
+            _file_processing_timeout(
                 path,
                 60.0,
                 PROBE_MIN_THROUGHPUT_BYTES_PER_SECOND,
-            ),
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ffprobe failed")
-        payload = json.loads(result.stdout)
+            )
+            if count_frames
+            else 60.0
+        ),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed")
+    return json.loads(result.stdout)
+
+
+def _probe_recording(path: str, elapsed_seconds: float, expected_fps: float):
+    try:
+        payload = _run_ffprobe(path)
         streams = payload.get("streams") or []
         stream = streams[0] if streams else {}
-        frame_count = int(stream.get("nb_read_frames") or 0)
+        frame_value = stream.get("nb_frames")
+        if not str(frame_value or "").isdigit():
+            payload = _run_ffprobe(path, count_frames=True)
+            streams = payload.get("streams") or []
+            stream = streams[0] if streams else {}
+            frame_value = stream.get("nb_read_frames")
+        frame_count = int(frame_value or 0)
         duration = float((payload.get("format") or {}).get("duration") or 0.0)
         avg_fps = _parse_rate(stream.get("avg_frame_rate", "0/1"))
         expected_frames = max(0, round(elapsed_seconds * expected_fps))
