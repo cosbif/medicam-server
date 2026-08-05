@@ -18,6 +18,12 @@ verification against the root-owned allowlist on the device.
    commit hash before enabling installation.
 5. After rollout, verify `/version` and `/update/status` on at least one device.
 
+Published version numbers are immutable and must never be reused. If an
+uninstalled release must be revoked, delete its remote tag; the next channel
+check prunes that local tag from devices. A release that reached any device
+must instead be superseded by a higher signed version because the root-owned
+anti-downgrade counter is advanced only after a successful healthcheck.
+
 The dedicated private key defaults to
 `~/.config/medicam/ota_signing_key`. It must never be committed or copied to a
 camera. Back it up in an encrypted offline secret store. Losing the key prevents

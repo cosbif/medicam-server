@@ -161,6 +161,7 @@ def _remote_release_tags() -> dict[str, str]:
 def _fetch_release_tags() -> None:
     result = _git(
         "fetch",
+        "--prune",
         "--force",
         "origin",
         "+refs/tags/medicam-v*:refs/tags/medicam-v*",

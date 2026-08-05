@@ -46,6 +46,19 @@ class UpdaterTests(unittest.TestCase):
             patcher.stop()
         self.tmp.cleanup()
 
+    def test_fetch_prunes_revoked_stable_tags(self):
+        with patch("app.updater._git", return_value=command_result()) as git:
+            updater._fetch_release_tags()
+
+        git.assert_called_once_with(
+            "fetch",
+            "--prune",
+            "--force",
+            "origin",
+            "+refs/tags/medicam-v*:refs/tags/medicam-v*",
+            timeout=180,
+        )
+
     def test_check_ignores_unsigned_tags_and_selects_latest_trusted_release(self):
         tags = {
             "medicam-v1.1.0": "1" * 40,
