@@ -27,6 +27,7 @@ REPO = Path("/home/radxa/medicam-server")
 STATE_DIR = Path("/var/lib/medicam-ota")
 STATE_FILE = STATE_DIR / "status.json"
 LOG_FILE = STATE_DIR / "update.log"
+REQUEST_FILE = STATE_DIR / "request.json"
 RELEASES_DIR = STATE_DIR / "releases"
 MEDICAM_STATE_DIR = Path("/var/lib/medicam")
 PROVISION_FILE = MEDICAM_STATE_DIR / "provision.json"
@@ -61,6 +62,15 @@ SYSTEMD_ASSETS = {
     "medicam-ble-manager.service": Path(
         "/etc/systemd/system/medicam-ble-manager.service"
     ),
+    "medicam-ota.path": Path("/etc/systemd/system/medicam-ota.path"),
+    "medicam-ota-request.service": Path(
+        "/etc/systemd/system/medicam-ota-request.service"
+    ),
+}
+REQUIRED_SYSTEMD_ASSETS = {
+    "medicam.service",
+    "medicam-ble.service",
+    "medicam-ble-manager.service",
 }
 TAG_PATTERN = re.compile(r"^medicam-v\d+\.\d+\.\d+$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -72,10 +82,7 @@ PERSISTENT_FILES = (
 )
 
 SUDOERS_CONTENT = """# Managed by Medicam signed OTA. Do not edit manually.
-Cmnd_Alias MEDICAM_BLE = /bin/systemctl start medicam-ble.service, /bin/systemctl restart medicam-ble.service
-Cmnd_Alias MEDICAM_OTA = /usr/local/sbin/medicam-ota-activate schedule *
-Cmnd_Alias MEDICAM_PAIRING_INFO = /usr/local/sbin/medicam-ota-activate pairing-info
-radxa ALL=(root) NOPASSWD: MEDICAM_BLE, MEDICAM_OTA, MEDICAM_PAIRING_INFO
+radxa ALL=(root) NOPASSWD: /usr/local/sbin/medicam-ota-activate pairing-info
 """
 
 RUNTIME_DROP_IN = """[Service]
@@ -821,7 +828,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
             raise ActivationError(f"signed release asset missing: {source}")
     for unit_name in SYSTEMD_ASSETS:
         source = release_root / "deploy" / "systemd" / unit_name
-        if not source.is_file():
+        if unit_name in REQUIRED_SYSTEMD_ASSETS and not source.is_file():
             raise ActivationError(f"signed systemd unit missing: {source}")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -849,6 +856,10 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     _atomic_install_text(DROP_IN, RUNTIME_DROP_IN, 0o644)
     for unit_name, destination in SYSTEMD_ASSETS.items():
         source = release_root / "deploy" / "systemd" / unit_name
+        if not source.is_file():
+            # Rollback to a release predating the root path activator keeps
+            # the installed idle path unit but restores every required unit.
+            continue
         _atomic_install_text(destination, source.read_text(encoding="utf-8"), 0o644)
 
     # Install the next signed helper atomically. The currently running Python
@@ -871,6 +882,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
             "medicam-ble-manager.service",
         ]
     )
+    run(["/bin/systemctl", "enable", "--now", "medicam-ota.path"])
 
 
 def reset_checkout(commit: str) -> None:
@@ -1185,6 +1197,80 @@ def schedule(previous: str, target: str, tag: str) -> None:
         ) from activation_error
 
 
+def _read_activation_request() -> dict:
+    descriptor = os.open(
+        REQUEST_FILE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        expected_uid = _radxa_ids()[0]
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_mode & 0o077
+            or metadata.st_size > 16 * 1024
+        ):
+            raise ActivationError("unsafe OTA activation request")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            raw = source.read(16 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationError("invalid OTA activation request JSON") from error
+    if not isinstance(payload, dict) or payload.get("format") != 1:
+        raise ActivationError("unsupported OTA activation request")
+    allowed = {
+        "format",
+        "job_id",
+        "previous_commit",
+        "target_commit",
+        "target_tag",
+        "requested_at",
+    }
+    if set(payload) - allowed:
+        raise ActivationError("unexpected OTA activation request fields")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("job_id") or "")):
+        raise ActivationError("invalid OTA activation job id")
+    if not SHA_PATTERN.fullmatch(str(payload.get("previous_commit") or "")):
+        raise ActivationError("invalid OTA previous commit")
+    if not SHA_PATTERN.fullmatch(str(payload.get("target_commit") or "")):
+        raise ActivationError("invalid OTA target commit")
+    if not TAG_PATTERN.fullmatch(str(payload.get("target_tag") or "")):
+        raise ActivationError("invalid OTA target tag")
+    return payload
+
+
+def consume_activation_request() -> None:
+    try:
+        request = _read_activation_request()
+        REQUEST_FILE.unlink(missing_ok=True)
+        append_log(
+            f"consuming activation request job={request['job_id']} "
+            f"tag={request['target_tag']}"
+        )
+        schedule(
+            request["previous_commit"],
+            request["target_commit"],
+            request["target_tag"],
+        )
+    except Exception as error:
+        REQUEST_FILE.unlink(missing_ok=True)
+        append_log(f"activation request failed: {error}")
+        write_status(
+            "failed",
+            100,
+            "OTA activation request failed",
+            error_code="activation_schedule_failed",
+            error=str(error),
+        )
+        if isinstance(error, ActivationError):
+            raise
+        raise ActivationError(str(error)) from error
+
+
 def main(arguments: list[str]) -> int:
     if len(arguments) == 2 and arguments[1] == "harden":
         # Establish root-owned trust before removing the temporary migration
@@ -1204,6 +1290,10 @@ def main(arguments: list[str]) -> int:
         print(f"Pairing code: {grouped}")
         print(f"QR payload: medicam://pair?device_id={_device_id()}&code={secret}")
         return 0
+    if len(arguments) == 2 and arguments[1] == "consume-request":
+        consume_activation_request()
+        print("Medicam OTA activation request consumed")
+        return 0
     if len(arguments) == 5 and arguments[1] == "schedule":
         schedule(arguments[2], arguments[3], arguments[4])
         print("Medicam OTA activation scheduled")
@@ -1213,7 +1303,8 @@ def main(arguments: list[str]) -> int:
         return 0
     print(
         "usage: medicam-ota-activate "
-        "{harden|pairing-info|schedule PREVIOUS TARGET TAG|perform PREVIOUS TARGET TAG}",
+        "{harden|pairing-info|consume-request|schedule PREVIOUS TARGET TAG|"
+        "perform PREVIOUS TARGET TAG}",
         file=sys.stderr,
     )
     return 2

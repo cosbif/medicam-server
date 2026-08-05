@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,55 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_root_path_consumer_validates_and_schedules_fixed_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / "request.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "format": 1,
+                        "job_id": "1" * 32,
+                        "previous_commit": PREVIOUS,
+                        "target_commit": TARGET,
+                        "target_tag": TAG,
+                        "requested_at": "2026-08-05T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            request.chmod(0o600)
+            with patch.object(activate, "REQUEST_FILE", request), patch.object(
+                activate, "schedule"
+            ) as schedule, patch.object(activate, "append_log"):
+                activate.consume_activation_request()
+
+        schedule.assert_called_once_with(PREVIOUS, TARGET, TAG)
+        self.assertFalse(request.exists())
+
+    def test_root_path_consumer_rejects_group_writable_or_extra_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / "request.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "format": 1,
+                        "job_id": "1" * 32,
+                        "previous_commit": PREVIOUS,
+                        "target_commit": TARGET,
+                        "target_tag": TAG,
+                        "unexpected": "value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            request.chmod(0o660)
+            with patch.object(activate, "REQUEST_FILE", request):
+                with self.assertRaisesRegex(activate.ActivationError, "unsafe"):
+                    activate._read_activation_request()
+                request.chmod(0o600)
+                with self.assertRaisesRegex(activate.ActivationError, "unexpected"):
+                    activate._read_activation_request()
+
     def test_usb_power_policy_installs_rule_and_protects_attached_camera(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

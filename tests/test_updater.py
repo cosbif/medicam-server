@@ -36,7 +36,7 @@ class UpdaterTests(unittest.TestCase):
             patch.object(updater, "STATE_FILE", self.state),
             patch.object(updater, "UPDATE_LOG_FILE", self.log),
             patch.object(updater, "ALLOWED_SIGNERS_FILE", self.repo / "allowed"),
-            patch.object(updater, "ACTIVATOR", "/usr/local/sbin/medicam-ota-activate"),
+            patch.object(updater, "ACTIVATION_REQUEST_FILE", self.state.with_name("request.json")),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -144,7 +144,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse(result["update_available"])
         ancestor.assert_not_called()
 
-    def test_run_update_verifies_hash_installs_and_schedules_root_activator(self):
+    def test_run_update_verifies_hash_and_writes_fixed_activation_request(self):
         release = {
             "ok": True,
             "update_available": True,
@@ -171,18 +171,12 @@ class UpdaterTests(unittest.TestCase):
             result = updater.run_update("job-success")
 
         self.assertEqual(result["state"], "restarting")
-        self.assertIn(
-            [
-                "sudo",
-                "-n",
-                "/usr/local/sbin/medicam-ota-activate",
-                "schedule",
-                PREVIOUS,
-                TARGET,
-                TAG,
-            ],
-            commands,
-        )
+        request = json.loads(updater.ACTIVATION_REQUEST_FILE.read_text())
+        self.assertEqual(request["previous_commit"], PREVIOUS)
+        self.assertEqual(request["target_commit"], TARGET)
+        self.assertEqual(request["target_tag"], TAG)
+        self.assertEqual(updater.ACTIVATION_REQUEST_FILE.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(any(command and command[0] == "sudo" for command in commands))
         self.assertNotIn(["git", "reset", "--hard", "origin/main"], commands)
 
     def test_signature_commit_mismatch_fails_before_checkout(self):

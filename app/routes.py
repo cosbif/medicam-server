@@ -59,27 +59,6 @@ def _systemctl_status(unit: str):
         }
 
 
-def _systemctl_action(action: str, unit: str):
-    try:
-        proc = subprocess.run(
-            ["sudo", "/bin/systemctl", action, unit],
-            text=True,
-            capture_output=True,
-            timeout=10,
-        )
-        return {
-            "ok": proc.returncode == 0,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "stdout": "",
-            "stderr": str(e),
-        }
-
-
 @router.get("/ping")
 async def ping():
     return {
@@ -631,11 +610,12 @@ async def provision_recovery_start(
     _ok: bool = Depends(require_api_auth),
 ):
     expires_at = utils.start_ble_recovery(duration_seconds)
-    start = _systemctl_action("start", BLE_SERVICE)
     return {
         "status": "recovery_started",
         "expires_at": expires_at,
-        "ble_start": start,
+        # The root BLE manager observes the recovery state within ten seconds.
+        # The sandboxed HTTP API never invokes sudo.
+        "ble_start": {"ok": True, "status": "requested"},
         "ble_service": _systemctl_status(BLE_SERVICE),
     }
 
@@ -654,10 +634,9 @@ async def provision_reset(request: Request):
         raise HTTPException(status_code=401, detail="invalid_api_token")
     # Rotate ownership credentials and expose BLE for the next owner.
     utils.set_provisioned(False, {})
-    restart = _systemctl_action("restart", BLE_SERVICE)
     return {
         "status": "reset",
-        "ble_restart": restart,
+        "ble_restart": {"ok": True, "status": "requested"},
         "ble_service": _systemctl_status(BLE_SERVICE),
     }
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Consume a verified Medicam OTA activation request
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/medicam-ota-activate consume-request
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false

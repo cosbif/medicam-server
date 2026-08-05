@@ -48,6 +48,14 @@ restart, healthcheck и rollback. Внешний root-owned активатор �
 60 секунд; при ошибке автоматически восстанавливает предыдущий commit,
 зависимости и systemd units. Причина сохраняется и показывается приложением.
 
+Sandbox backend сохраняется полностью: API не вызывает `sudo`. После проверки
+и checkout подписанного commit он атомарно создаёт запрос с фиксированной схемой
+в `/var/lib/medicam-ota/request.json`. Root-owned `medicam-ota.path` запускает
+одноразовый helper, который независимо повторяет проверку подписи/hash,
+anti-downgrade и root-owned trust state. Sudoers не содержит OTA-команд.
+BLE recovery/reset также не использует sudo: root-owned BLE manager замечает
+атомарно сохранённое состояние максимум за десять секунд и включает GATT.
+
 Release-процесс и хранение ключа описаны в
 [`docs/ota-release.md`](docs/ota-release.md). Подписанный тег создаётся командой:
 

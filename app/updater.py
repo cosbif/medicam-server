@@ -29,9 +29,11 @@ ALLOWED_SIGNERS_FILE = Path(
 STATE_DIR = Path(os.environ.get("MEDICAM_OTA_STATE_DIR", "/var/lib/medicam-ota"))
 STATE_FILE = STATE_DIR / "status.json"
 UPDATE_LOG_FILE = STATE_DIR / "update.log"
-ACTIVATOR = os.environ.get(
-    "MEDICAM_OTA_ACTIVATOR",
-    "/usr/local/sbin/medicam-ota-activate",
+ACTIVATION_REQUEST_FILE = Path(
+    os.environ.get(
+        "MEDICAM_OTA_REQUEST_FILE",
+        STATE_DIR / "request.json",
+    )
 )
 ACTIVE_STATES = {
     "queued",
@@ -283,6 +285,7 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         json.dump(payload, output, ensure_ascii=False, sort_keys=True, indent=2)
         output.flush()
         os.fsync(output.fileno())
+    os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
 
@@ -481,24 +484,21 @@ def run_update(job_id: str) -> dict:
             job_id=job_id,
             message="Camera is restarting into the signed release",
         )
-        schedule = _run(
-            [
-                "sudo",
-                "-n",
-                ACTIVATOR,
-                "schedule",
-                str(previous_commit),
-                target_commit,
-                target_tag,
-            ],
-            timeout=30,
-            cwd=None,
+        # The sandboxed backend cannot and must not use sudo. A root-owned
+        # systemd.path unit consumes this fixed-schema request and the helper
+        # independently repeats signature, hash, anti-downgrade, and trust
+        # validation before it installs anything privileged.
+        _atomic_write_json(
+            ACTIVATION_REQUEST_FILE,
+            {
+                "format": 1,
+                "job_id": job_id,
+                "previous_commit": str(previous_commit),
+                "target_commit": target_commit,
+                "target_tag": target_tag,
+                "requested_at": _utc_now(),
+            },
         )
-        if not schedule["ok"]:
-            raise UpdateError(
-                "activation_schedule_failed",
-                schedule["stderr"] or "Could not schedule release activation",
-            )
         return get_update_status()
     except UpdateError as error:
         if previous_commit and target_commit and get_local_commit() != previous_commit:
