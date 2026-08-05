@@ -135,6 +135,35 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["rms_dbfs"], -35.0)
 
+    def test_network_passes_when_router_filters_optional_icmp(self):
+        route = {
+            "ok": True,
+            "returncode": 0,
+            "stdout": "default via 192.168.1.1 dev wlan0",
+            "stderr": "",
+        }
+        blocked_ping = {
+            "ok": False,
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "timeout",
+        }
+        with patch(
+            "app.diagnostics._wifi_health",
+            return_value={
+                "connected": True,
+                "ssid": "Home",
+                "ip": "192.168.1.20",
+            },
+        ), patch("app.diagnostics.shutil.which", side_effect=["/usr/bin/ip", "/bin/ping"]), patch(
+            "app.diagnostics._command", side_effect=[route, blocked_ping]
+        ):
+            result = diagnostics._network_test()
+
+        self.assertEqual(result["status"], "passed")
+        self.assertFalse(result["gateway_reachable"])
+        self.assertEqual(result["gateway_check"], "icmp_unavailable_or_filtered")
+
 
 if __name__ == "__main__":
     unittest.main()

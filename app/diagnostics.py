@@ -469,9 +469,18 @@ def _network_test() -> dict:
         ping = shutil.which("ping")
         if ping:
             reachable = _command([ping, "-c", "1", "-W", "2", gateway], timeout=4)["ok"]
-    status = "passed" if reachable is not False else "warning"
     return _test_result(
-        "network", status, started, **wifi, gateway=gateway, gateway_reachable=reachable
+        "network",
+        "passed",
+        started,
+        **wifi,
+        gateway=gateway,
+        gateway_reachable=reachable,
+        gateway_check=(
+            "reachable"
+            if reachable is True
+            else ("icmp_unavailable_or_filtered" if reachable is False else "not_tested")
+        ),
     )
 
 
