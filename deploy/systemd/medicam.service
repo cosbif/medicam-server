@@ -17,7 +17,9 @@ ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --hos
 Restart=always
 RestartSec=5
 UMask=0077
-NoNewPrivileges=true
+# The authenticated OTA route must invoke the tightly scoped sudoers helper.
+# All other privilege escalation remains blocked by the exact command policy.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
 ProtectKernelTunables=true
