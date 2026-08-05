@@ -48,6 +48,13 @@ BLE_REQUIREMENTS_MARKER = Path("/opt/medicam/.requirements-sha256")
 NFTABLES_FILE = Path("/etc/nftables.conf")
 SSH_DROP_IN = Path("/etc/ssh/sshd_config.d/99-medicam.conf")
 AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
+USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
+USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
+USB_POWER_IDS = {
+    ("eba4", "6579"),
+    ("2109", "2817"),
+    ("2109", "0817"),
+}
 SYSTEMD_ASSETS = {
     "medicam.service": Path("/etc/systemd/system/medicam.service"),
     "medicam-ble.service": Path("/etc/systemd/system/medicam-ble.service"),
@@ -777,6 +784,34 @@ def install_network_security(release_root: Path) -> None:
         run(["/bin/systemctl", "disable", "--now", unit], check=False)
 
 
+def install_usb_power_policy(release_root: Path) -> None:
+    source = release_root / "deploy" / "udev" / "99-medicam-usb-power.rules"
+    if not source.is_file():
+        # Rollbacks to releases before diagnostics keep the harmless installed
+        # protection rather than re-enabling autosuspend mid-capture.
+        return
+    _safe_atomic_write(
+        USB_POWER_RULES_FILE,
+        source.read_bytes(),
+        mode=0o644,
+        owner=(0, 0),
+    )
+    run(["/usr/bin/udevadm", "control", "--reload-rules"])
+
+    # udev applies the rule on the next add event. Protect devices that are
+    # already attached as part of this OTA without logically unplugging them.
+    for device in USB_SYSFS_DIR.glob("*"):
+        try:
+            identity = (
+                (device / "idVendor").read_text(encoding="ascii").strip().lower(),
+                (device / "idProduct").read_text(encoding="ascii").strip().lower(),
+            )
+            if identity in USB_POWER_IDS:
+                (device / "power" / "control").write_text("on\n", encoding="ascii")
+        except OSError:
+            continue
+
+
 def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     source_helper = release_root / "scripts" / "medicam_ota_activate.py"
     source_signers = release_root / "deploy" / "ota_allowed_signers"
@@ -795,6 +830,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     ensure_security_identity()
     install_ble_runtime(release_root)
     install_network_security(release_root)
+    install_usb_power_policy(release_root)
     SYSTEM_SIGNERS.parent.mkdir(parents=True, exist_ok=True)
     INSTALLED_HELPER.parent.mkdir(parents=True, exist_ok=True)
     DROP_IN.parent.mkdir(parents=True, exist_ok=True)

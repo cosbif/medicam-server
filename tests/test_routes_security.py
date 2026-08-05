@@ -87,6 +87,9 @@ class RouteSecurityTests(unittest.TestCase):
             "/settings",
             "/audio/devices",
             "/audio/test",
+            "/diagnostics/health",
+            "/diagnostics/self-test",
+            "/diagnostics/bundle",
             "/wifi",
             "/wifi/connect",
             "/wifi/status",
@@ -192,6 +195,17 @@ class RouteSecurityTests(unittest.TestCase):
             "recording_in_progress",
         )
         apply_mock.assert_not_called()
+
+    def test_recording_start_is_rejected_while_self_test_owns_hardware(self):
+        with patch("app.routes.diagnostics.begin_recording_start", return_value=False), patch(
+            "app.routes.diagnostics.is_self_test_running", return_value=True
+        ), patch("app.routes.camera.start_recording") as start_mock:
+            with self.assertRaises(HTTPException) as context:
+                routes.start_recording(_ok=True)
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(context.exception.detail["code"], "self_test_in_progress")
+        start_mock.assert_not_called()
 
     def test_storage_cleanup_is_rejected_while_recording(self):
         with patch(

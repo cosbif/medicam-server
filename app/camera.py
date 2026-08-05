@@ -170,6 +170,20 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
         time.sleep(0.25)
 
 
+def find_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
+    """Return the stable Linux camera path for diagnostics and recording."""
+    if platform.system() == "Linux":
+        return _find_linux_camera_device(timeout=timeout)
+    if platform.system() == "Windows":
+        return "video=AT025"
+    return None
+
+
+def count_mjpeg_frames(path: str) -> int:
+    """Count complete JPEG frames in a raw MJPEG file without decoding them."""
+    return _count_mjpeg_frames(path)
+
+
 def _build_audio_temp_file(output_file: str):
     # PCM is tiny compared with FullHD MJPEG but frequent synchronous writes to
     # the same microSD can starve ALSA for several seconds. systemd creates the

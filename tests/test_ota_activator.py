@@ -14,6 +14,36 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_usb_power_policy_installs_rule_and_protects_attached_camera(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            source = release / "deploy" / "udev" / activate.USB_POWER_RULES_FILE.name
+            source.parent.mkdir(parents=True)
+            source.write_text("test rule\n", encoding="utf-8")
+            destination = root / "rules" / activate.USB_POWER_RULES_FILE.name
+            sysfs = root / "sysfs"
+            camera = sysfs / "1-1.2"
+            (camera / "power").mkdir(parents=True)
+            (camera / "idVendor").write_text("eba4\n", encoding="ascii")
+            (camera / "idProduct").write_text("6579\n", encoding="ascii")
+            (camera / "power" / "control").write_text("auto\n", encoding="ascii")
+
+            with patch.object(activate, "USB_POWER_RULES_FILE", destination), patch.object(
+                activate, "USB_SYSFS_DIR", sysfs
+            ), patch.object(activate.os, "fchown"), patch.object(activate, "run") as run:
+                activate.install_usb_power_policy(release)
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "test rule\n")
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(
+                (camera / "power" / "control").read_text(encoding="ascii"),
+                "on\n",
+            )
+            run.assert_called_once_with(
+                ["/usr/bin/udevadm", "control", "--reload-rules"]
+            )
+
     def test_root_restore_preserves_content_mode_and_ownership_metadata(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             activate, "REPO", Path(directory)

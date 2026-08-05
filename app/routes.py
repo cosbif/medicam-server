@@ -2,8 +2,9 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from app import audio, camera, storage_manager, utils, updater, version_info
+from app import audio, camera, diagnostics, storage_manager, utils, updater, version_info
 import asyncio
+import io
 import math
 import os
 import platform
@@ -102,7 +103,17 @@ async def version(_ok: bool = Depends(require_api_auth)):
 # -------------------
 @router.post("/start")
 def start_recording(_ok: bool = Depends(require_api_auth)):
-    return camera.start_recording()
+    if not diagnostics.begin_recording_start():
+        code = (
+            "self_test_in_progress"
+            if diagnostics.is_self_test_running()
+            else "hardware_busy"
+        )
+        raise HTTPException(status_code=409, detail={"code": code})
+    try:
+        return camera.start_recording()
+    finally:
+        diagnostics.end_recording_start()
 
 @router.post("/stop")
 def stop_recording(_ok: bool = Depends(require_api_auth)):
@@ -489,6 +500,36 @@ async def audio_test(
             status_code=status_code,
             detail=error.code,
         ) from error
+
+
+# -------------------
+# 🩺 Диагностика и support
+# -------------------
+@router.get("/diagnostics/health")
+async def diagnostic_health(_ok: bool = Depends(require_api_auth)):
+    return await asyncio.to_thread(diagnostics.get_health)
+
+
+@router.post("/diagnostics/self-test")
+async def diagnostic_self_test(_ok: bool = Depends(require_api_auth)):
+    try:
+        return await asyncio.to_thread(diagnostics.run_self_test)
+    except diagnostics.SelfTestBusyError as error:
+        raise HTTPException(status_code=409, detail={"code": str(error)}) from error
+
+
+@router.get("/diagnostics/bundle")
+async def diagnostic_bundle(_ok: bool = Depends(require_api_auth)):
+    content, filename = await asyncio.to_thread(diagnostics.build_diagnostic_bundle)
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(content)),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # -------------------
