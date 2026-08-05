@@ -730,6 +730,12 @@ def _read_provision_data_unlocked(path: Path) -> dict:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
                 return {}
+            # Devices upgraded from early Medicam releases may still have a
+            # group/world-readable provision.json. It contains the owner API
+            # token, so tighten inherited permissions through the already
+            # verified, O_NOFOLLOW file descriptor before reading any data.
+            if metadata.st_mode & 0o077:
+                os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as value:
                 data = json.load(value)
             return data if isinstance(data, dict) else {}

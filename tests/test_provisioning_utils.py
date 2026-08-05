@@ -104,6 +104,21 @@ class ProvisionFileTests(unittest.TestCase):
         self.assertEqual(data["info"]["ssid"], "New")
         self.assertEqual(mode, 0o600)
 
+    def test_read_tightens_inherited_provision_file_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provision_path = Path(tmp) / "provision.json"
+            token = utils.generate_api_token()
+            provision_path.write_text(
+                json.dumps({"provisioned": True, "api_token": token}),
+                encoding="utf-8",
+            )
+            provision_path.chmod(0o664)
+
+            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+                self.assertEqual(utils.get_api_token(), token)
+
+            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o600)
+
     def test_provision_write_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             provision_path = Path(tmp) / "provision.json"
