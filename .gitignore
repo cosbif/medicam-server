@@ -14,5 +14,9 @@ videos/
 recording-long-run-report.json
 recording-long-run-*.json
 storage_policy.json
+camera_settings.json
+ffmpeg.log
+provision.json
+restart_service.sh
 .github_token
 update_debug.log

@@ -59,6 +59,28 @@ class UpdaterTests(unittest.TestCase):
             timeout=180,
         )
 
+    def test_persistent_runtime_files_survive_checkout_restore(self):
+        settings = self.repo / "camera_settings.json"
+        provision = self.repo / "provision.json"
+        settings.write_text('{"audio_enabled": true}', encoding="utf-8")
+        provision.write_text('{"api_token": "secret"}', encoding="utf-8")
+        settings.chmod(0o640)
+
+        snapshot = updater._snapshot_persistent_files()
+        settings.write_text("repository default", encoding="utf-8")
+        provision.unlink()
+        updater._restore_persistent_files(snapshot)
+
+        self.assertEqual(
+            settings.read_text(encoding="utf-8"),
+            '{"audio_enabled": true}',
+        )
+        self.assertEqual(
+            provision.read_text(encoding="utf-8"),
+            '{"api_token": "secret"}',
+        )
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
+
     def test_check_ignores_unsigned_tags_and_selects_latest_trusted_release(self):
         tags = {
             "medicam-v1.1.0": "1" * 40,

@@ -38,6 +38,11 @@ SYSTEMD_ASSETS = {
 TAG_PATTERN = re.compile(r"^medicam-v\d+\.\d+\.\d+$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HEALTH_TIMEOUT_SECONDS = 60
+PERSISTENT_FILES = (
+    ("camera_settings.json", 1024 * 1024),
+    ("provision.json", 1024 * 1024),
+    ("ffmpeg.log", 16 * 1024 * 1024),
+)
 
 SUDOERS_CONTENT = """# Managed by Medicam signed OTA. Do not edit manually.
 Cmnd_Alias MEDICAM_BLE = /bin/systemctl start medicam-ble.service, /bin/systemctl restart medicam-ble.service
@@ -391,6 +396,48 @@ def install_python_requirements() -> None:
     )
 
 
+def snapshot_persistent_files() -> dict[str, tuple[bytes, int, int, int]]:
+    snapshot = {}
+    for relative_path, maximum_size in PERSISTENT_FILES:
+        path = REPO / relative_path
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            metadata = path.stat()
+            if metadata.st_size > maximum_size:
+                append_log(
+                    f"persistent file too large to snapshot: {relative_path}"
+                )
+                continue
+            snapshot[relative_path] = (
+                path.read_bytes(),
+                metadata.st_mode & 0o777,
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+        except OSError as error:
+            append_log(f"persistent snapshot failed for {relative_path}: {error}")
+    return snapshot
+
+
+def restore_persistent_files(
+    snapshot: dict[str, tuple[bytes, int, int, int]],
+) -> None:
+    for relative_path, (content, mode, uid, gid) in snapshot.items():
+        path = REPO / relative_path
+        temporary = path.with_name(f".{path.name}.ota-root-tmp")
+        try:
+            with open(temporary, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, mode)
+            os.chown(temporary, uid, gid)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def restart_services() -> None:
     run(
         [
@@ -451,6 +498,7 @@ def collect_failure_reason(health_error: str) -> str:
 
 
 def perform(previous: str, target: str, tag: str) -> None:
+    persistent_files = snapshot_persistent_files()
     try:
         verify_release(tag, target)
         validate_transition(previous, tag)
@@ -505,6 +553,7 @@ def perform(previous: str, target: str, tag: str) -> None:
             rollback=True,
         )
         reset_checkout(previous)
+        restore_persistent_files(persistent_files)
         install_python_requirements()
         install_release_assets(harden=True)
         restart_services()
@@ -543,6 +592,7 @@ def schedule(previous: str, target: str, tag: str) -> None:
         raise ActivationError("invalid previous commit")
     verify_release(tag, target)
     validate_transition(previous, tag)
+    persistent_files = snapshot_persistent_files()
     try:
         install_release_assets(harden=True)
         write_status(
@@ -576,6 +626,7 @@ def schedule(previous: str, target: str, tag: str) -> None:
         # the failure to the still-running backend.
         try:
             reset_checkout(previous)
+            restore_persistent_files(persistent_files)
             install_python_requirements()
             install_release_assets(harden=True)
         except Exception as restore_error:

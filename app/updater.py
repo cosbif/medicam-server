@@ -43,6 +43,11 @@ ACTIVE_STATES = {
     "healthchecking",
     "rolling_back",
 }
+PERSISTENT_FILES = (
+    ("camera_settings.json", 1024 * 1024),
+    ("provision.json", 1024 * 1024),
+    ("ffmpeg.log", 16 * 1024 * 1024),
+)
 
 _UPDATE_LOCK = threading.RLock()
 
@@ -340,8 +345,49 @@ def get_update_status() -> dict:
     }
 
 
-def _restore_previous_checkout(previous_commit: str) -> None:
+def _snapshot_persistent_files() -> dict[str, tuple[bytes, int]]:
+    snapshot = {}
+    for relative_path, maximum_size in PERSISTENT_FILES:
+        path = REPO_DIR / relative_path
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            metadata = path.stat()
+            if metadata.st_size > maximum_size:
+                _append_log(
+                    f"persistent file too large to snapshot: {relative_path}"
+                )
+                continue
+            snapshot[relative_path] = (
+                path.read_bytes(),
+                metadata.st_mode & 0o777,
+            )
+        except OSError as error:
+            _append_log(f"persistent snapshot failed for {relative_path}: {error}")
+    return snapshot
+
+
+def _restore_persistent_files(snapshot: dict[str, tuple[bytes, int]]) -> None:
+    for relative_path, (content, mode) in snapshot.items():
+        path = REPO_DIR / relative_path
+        temporary = path.with_name(f".{path.name}.ota-tmp")
+        try:
+            with open(temporary, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _restore_previous_checkout(
+    previous_commit: str,
+    persistent_files: dict[str, tuple[bytes, int]],
+) -> None:
     _git("reset", "--hard", previous_commit, timeout=60)
+    _restore_persistent_files(persistent_files)
     pip = REPO_DIR / "medicam-venv" / "bin" / "pip"
     if pip.is_file():
         _run(
@@ -352,6 +398,7 @@ def _restore_previous_checkout(previous_commit: str) -> None:
 
 def run_update(job_id: str) -> dict:
     previous_commit = get_local_commit()
+    persistent_files = _snapshot_persistent_files()
     target_commit = None
     target_tag = None
     try:
@@ -410,6 +457,7 @@ def run_update(job_id: str) -> dict:
                 "release_checkout_failed",
                 checkout["stderr"] or "Could not activate release checkout",
             )
+        _restore_persistent_files(persistent_files)
         _set_status(
             "installing",
             65,
@@ -454,7 +502,7 @@ def run_update(job_id: str) -> dict:
         return get_update_status()
     except UpdateError as error:
         if previous_commit and target_commit and get_local_commit() != previous_commit:
-            _restore_previous_checkout(previous_commit)
+            _restore_previous_checkout(previous_commit, persistent_files)
         return _set_status(
             "failed",
             100,
@@ -468,7 +516,7 @@ def run_update(job_id: str) -> dict:
         )
     except Exception as error:
         if previous_commit and target_commit and get_local_commit() != previous_commit:
-            _restore_previous_checkout(previous_commit)
+            _restore_previous_checkout(previous_commit, persistent_files)
         return _set_status(
             "failed",
             100,

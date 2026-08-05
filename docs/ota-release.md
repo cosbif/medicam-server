@@ -43,6 +43,13 @@ restores the previous checkout, Python dependencies, systemd units, and image
 metadata. The reason and journal tail are persisted in
 `/var/lib/medicam-ota/status.json` and shown in the app.
 
+Device-owned `camera_settings.json`, `provision.json`, and `ffmpeg.log` are not
+release artifacts. The backend snapshots them before checkout and the root
+activator restores their content, permissions, and ownership during both
+activation-preparation failure and healthcheck rollback. They are ignored by
+Git so an OTA cannot replace customer Wi-Fi credentials or camera settings with
+repository defaults.
+
 The service user has no general passwordless sudo. It can only request a
 strictly validated signed activation and start/restart the BLE provisioning
 unit.

@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import call, patch
 
 from scripts import medicam_ota_activate as activate
@@ -10,6 +12,23 @@ TAG = "medicam-v1.2.0"
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_root_restore_preserves_content_mode_and_ownership_metadata(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            activate, "REPO", Path(directory)
+        ):
+            settings = Path(directory) / "camera_settings.json"
+            settings.write_text('{"fps": "30"}', encoding="utf-8")
+            settings.chmod(0o640)
+            snapshot = activate.snapshot_persistent_files()
+            settings.write_text("default", encoding="utf-8")
+            activate.restore_persistent_files(snapshot)
+
+            self.assertEqual(
+                settings.read_text(encoding="utf-8"),
+                '{"fps": "30"}',
+            )
+            self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
+
     def test_known_legacy_sudoers_rules_are_removed_by_policy_matchers(self):
         legacy = [
             "radxa ALL=(ALL) NOPASSWD: ALL",
