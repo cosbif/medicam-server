@@ -81,6 +81,8 @@ class RouteSecurityTests(unittest.TestCase):
             "/delete/{filename}",
             "/videos/clear",
             "/storage",
+            "/storage/policy",
+            "/storage/cleanup",
             "/settings",
             "/audio/devices",
             "/audio/test",
@@ -165,6 +167,23 @@ class RouteSecurityTests(unittest.TestCase):
             "recording_in_progress",
         )
         apply_mock.assert_not_called()
+
+    def test_storage_cleanup_is_rejected_while_recording(self):
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={"recording": True, "state": "recording"},
+        ), patch("app.routes.storage_manager.reclaim_space") as cleanup_mock:
+            with self.assertRaises(HTTPException) as context:
+                asyncio.run(
+                    routes.cleanup_storage(
+                        routes.StorageCleanupRequest(reclaim_gb=1),
+                        _ok=True,
+                    )
+                )
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(context.exception.detail["code"], "recording_in_progress")
+        cleanup_mock.assert_not_called()
 
     def test_update_can_repair_an_interrupted_recording(self):
         with patch(

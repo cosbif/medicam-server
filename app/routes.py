@@ -2,11 +2,10 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from app import audio, camera, utils, updater
+from app import audio, camera, storage_manager, utils, updater
 import ipaddress
 import math
 import os
-import shutil
 import platform
 import socket
 import subprocess
@@ -121,6 +120,15 @@ def recording_status(_ok: bool = Depends(require_api_auth)):
 # -------------------
 class DeleteVideosRequest(BaseModel):
     filenames: list[str] = Field(min_length=1, max_length=100)
+
+
+class StoragePolicyRequest(BaseModel):
+    mode: Literal["off", "low_space", "keep_last_gb", "keep_last_days"]
+    value: float | None = None
+
+
+class StorageCleanupRequest(BaseModel):
+    reclaim_gb: float = Field(gt=0, le=4096)
 
 
 def _video_sort_value(video: dict, sort: str):
@@ -371,14 +379,30 @@ async def clear_all_videos(_ok: bool = Depends(require_api_auth)):
 # -------------------
 @router.get("/storage")
 async def get_storage_info(_ok: bool = Depends(require_api_auth)):
-    total, used, free = shutil.disk_usage(".")
-    free_gb = round(free / (1024 ** 3), 2)
-    return {
-        "total": round(total / (1024 ** 3), 2),
-        "used": round(used / (1024 ** 3), 2),
-        "free": free_gb,
-        "low_space": free_gb < 1,
-    }
+    return storage_manager.get_storage_info()
+
+
+@router.post("/storage/policy")
+async def update_storage_policy(
+    request: StoragePolicyRequest,
+    _ok: bool = Depends(require_api_auth),
+):
+    try:
+        policy = storage_manager.update_policy(request.mode, request.value)
+    except storage_manager.StoragePolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "updated", "policy": policy}
+
+
+@router.post("/storage/cleanup")
+async def cleanup_storage(
+    request: StorageCleanupRequest,
+    _ok: bool = Depends(require_api_auth),
+):
+    _ensure_library_mutation_allowed()
+    return storage_manager.reclaim_space(
+        round(request.reclaim_gb * storage_manager.GIB)
+    )
 
 # -------------------
 # ⚙️ Настройки камеры

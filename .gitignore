@@ -12,3 +12,4 @@ __pycache__/
 # runtime recordings and hardware-test reports
 videos/
 recording-long-run-report.json
+storage_policy.json

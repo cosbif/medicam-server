@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 
-from app import audio, utils
+from app import audio, storage_manager, utils
 
 
 SETTINGS_FILE = "camera_settings.json"
@@ -870,6 +870,7 @@ def start_recording():
             video_size = SUPPORTED_RESOLUTIONS[resolution_key]
             fps = normalized["fps"]
 
+        storage_cleanup = storage_manager.apply_policy(trigger="recording_start")
         system = platform.system()
         output_file = utils.get_output_filename()
         free_bytes = shutil.disk_usage(utils.VIDEOS_DIR).free
@@ -1143,6 +1144,7 @@ def start_recording():
                 "sample_rate": audio.AUDIO_SAMPLE_RATE if audio_command else None,
                 "channels": audio.AUDIO_CHANNELS if audio_command else None,
             },
+            "storage_cleanup": storage_cleanup,
         }
 
 
@@ -1361,6 +1363,17 @@ def stop_recording():
             )
             _persist_recording_state_locked()
 
+    storage_cleanup = None
+    if return_code == 0:
+        try:
+            protected = {os.path.basename(output_file)} if output_file else set()
+            storage_cleanup = storage_manager.apply_policy(
+                trigger="recording_stopped",
+                protected_filenames=protected,
+            )
+        except OSError as error:
+            warning_parts.append(f"Storage cleanup failed: {error}")
+
     response = {
         "status": "recording_stopped",
         "file": output_file,
@@ -1377,6 +1390,8 @@ def stop_recording():
         response["quality"] = quality
     if warning_parts:
         response["warning"] = "; ".join(warning_parts)
+    if storage_cleanup is not None:
+        response["storage_cleanup"] = storage_cleanup
     return response
 
 
