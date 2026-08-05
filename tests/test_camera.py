@@ -188,15 +188,16 @@ class CameraCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ac") + 1], "1")
         self.assertEqual(command[command.index("-ss") + 1], "0.125000")
         self.assertIn("s16le", command)
-        self.assertIn("aresample=async=1:first_pts=0", command)
+        self.assertIn("aresample=async=1:first_pts=0,apad", command)
         self.assertIn("-shortest", command)
         self.assertNotIn("-an", command)
         self.assertNotIn("libx264", command)
 
     @patch("app.camera._remove_file")
+    @patch("app.camera._safe_file_size", return_value=9600)
     @patch("app.camera.open", new_callable=mock_open)
     @patch("app.camera.time.sleep")
-    @patch("app.camera.time.monotonic", side_effect=[10.0, 11.0])
+    @patch("app.camera.time.monotonic", side_effect=[10.0, 11.0, 11.2])
     @patch("app.camera.subprocess.Popen")
     def test_audio_capture_retries_a_transient_busy_device(
         self,
@@ -204,6 +205,7 @@ class CameraCommandTests(unittest.TestCase):
         _monotonic,
         sleep_mock,
         _open_mock,
+        _safe_file_size_mock,
         remove_file_mock,
     ):
         busy_process = Mock()
@@ -220,10 +222,10 @@ class CameraCommandTests(unittest.TestCase):
         )
 
         self.assertIs(process, active_process)
-        self.assertEqual(started_at, 11.0)
+        self.assertAlmostEqual(started_at, 11.1)
         self.assertIn("retrying", log.getvalue())
         remove_file_mock.assert_called_once_with("test.wav")
-        self.assertEqual(sleep_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 1)
 
 
 class CameraLifecycleTests(unittest.TestCase):

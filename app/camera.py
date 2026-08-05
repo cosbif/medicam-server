@@ -28,8 +28,10 @@ REMUX_MIN_THROUGHPUT_BYTES_PER_SECOND = 4 * 1024 * 1024
 PROBE_MIN_THROUGHPUT_BYTES_PER_SECOND = 2 * 1024 * 1024
 FILE_PROCESSING_TIMEOUT_MARGIN = 120.0
 AUDIO_OPEN_ATTEMPTS = 8
-AUDIO_OPEN_PROBE_DELAY = 0.15
+AUDIO_DATA_START_TIMEOUT = 3.0
+AUDIO_DATA_POLL_INTERVAL = 0.02
 AUDIO_OPEN_RETRY_DELAY = 0.35
+AUDIO_BYTES_PER_SAMPLE = 2
 AUDIO_TEMP_DIR = os.environ.get("MEDICAM_AUDIO_TEMP_DIR", "/run/medicam")
 RECORDING_STATE_FILE = os.environ.get(
     "MEDICAM_RECORDING_STATE_FILE",
@@ -252,7 +254,11 @@ def _build_linux_command(
             "-b:a", audio.AUDIO_BITRATE,
             "-ar", str(audio.AUDIO_SAMPLE_RATE),
             "-ac", str(audio.AUDIO_CHANNELS),
-            "-af", "aresample=async=1:first_pts=0",
+            # Audio is not allowed to shorten an otherwise intact video. USB
+            # capture can occasionally miss samples while UVC initializes;
+            # aresample repairs timestamp drift and apad fills only the
+            # missing tail with silence until the video stream ends.
+            "-af", "aresample=async=1:first_pts=0,apad",
             "-shortest",
         ])
     else:
@@ -280,7 +286,7 @@ def _build_windows_command(video_size: str, fps: str, output_file: str):
 
 
 def _start_audio_capture(command, log_file, audio_file):
-    """Open ALSA before UVC, tolerating short desktop audio probes."""
+    """Open ALSA before UVC and timestamp the first real PCM samples."""
     last_return_code = None
     for attempt in range(1, AUDIO_OPEN_ATTEMPTS + 1):
         with open(audio_file, "wb") as audio_output:
@@ -289,11 +295,36 @@ def _start_audio_capture(command, log_file, audio_file):
                 stdout=audio_output,
                 stderr=log_file,
             )
-        started_at = time.monotonic()
-        time.sleep(AUDIO_OPEN_PROBE_DELAY)
-        last_return_code = process.poll()
-        if last_return_code is None:
-            return process, started_at
+        launched_at = time.monotonic()
+        deadline = launched_at + AUDIO_DATA_START_TIMEOUT
+        while True:
+            last_return_code = process.poll()
+            if last_return_code is not None:
+                break
+
+            captured_bytes = _safe_file_size(audio_file)
+            if captured_bytes > 0:
+                observed_at = time.monotonic()
+                captured_seconds = captured_bytes / (
+                    audio.AUDIO_SAMPLE_RATE
+                    * audio.AUDIO_CHANNELS
+                    * AUDIO_BYTES_PER_SAMPLE
+                )
+                # arecord writes complete ALSA periods. Subtracting the data
+                # already present estimates when capture actually began and
+                # avoids treating device-open latency as recorded audio.
+                started_at = max(launched_at, observed_at - captured_seconds)
+                return process, started_at
+
+            if time.monotonic() >= deadline:
+                last_return_code = _stop_capture_process(process)
+                log_file.write(
+                    f"[WARN] Audio open attempt {attempt} produced no PCM "
+                    f"within {AUDIO_DATA_START_TIMEOUT:.1f}s\n"
+                )
+                log_file.flush()
+                break
+            time.sleep(AUDIO_DATA_POLL_INTERVAL)
 
         _remove_file(audio_file)
         if attempt < AUDIO_OPEN_ATTEMPTS:
