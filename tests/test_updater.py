@@ -224,6 +224,35 @@ class UpdaterTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, "update_in_progress")
 
+    def test_start_update_clears_previous_rollback_diagnostics(self):
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text(
+            json.dumps(
+                {
+                    "state": "rolled_back",
+                    "failed_commit": TARGET,
+                    "failed_tag": TAG,
+                    "error": "old failure",
+                    "error_code": "updated_backend_unhealthy",
+                    "rollback": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("app.updater.get_local_commit", return_value=PREVIOUS), patch(
+            "app.updater.threading.Thread"
+        ) as thread:
+            status = updater.start_update()
+
+        self.assertEqual(status["state"], "queued")
+        self.assertIsNone(status["failed_commit"])
+        self.assertIsNone(status["failed_tag"])
+        self.assertIsNone(status["error"])
+        self.assertIsNone(status["error_code"])
+        self.assertFalse(status["rollback"])
+        thread.return_value.start.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

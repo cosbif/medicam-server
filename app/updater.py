@@ -503,6 +503,8 @@ def start_update() -> dict:
             previous_commit=get_local_commit(),
             target_commit=None,
             target_tag=None,
+            failed_commit=None,
+            failed_tag=None,
             rollback=False,
         )
         thread = threading.Thread(
