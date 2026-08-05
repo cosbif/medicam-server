@@ -15,6 +15,52 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_provision_migration_removes_legacy_secret_after_secure_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            legacy = repo / "provision.json"
+            legacy.write_text(
+                '{"provisioned": true, "api_token": "legacy-secret"}',
+                encoding="utf-8",
+            )
+            state = root / "state"
+            provision = state / "provision.json"
+            lock = state / "provision.lock"
+
+            with patch.object(activate, "REPO", repo), patch.object(
+                activate, "PROVISION_FILE", provision
+            ), patch.object(
+                activate, "PROVISION_LOCK_FILE", lock
+            ), patch.object(activate.os, "fchown"):
+                activate.migrate_provision_state(1000, 1000)
+
+            self.assertFalse(legacy.exists())
+            self.assertTrue(json.loads(provision.read_text())["provisioned"])
+            self.assertEqual(provision.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o660)
+
+    def test_provision_migration_keeps_legacy_secret_if_secure_copy_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            legacy = repo / "provision.json"
+            legacy.write_text('{"provisioned": true}', encoding="utf-8")
+            state = root / "state"
+            state.mkdir()
+            provision = state / "provision.json"
+            provision.write_text("invalid", encoding="utf-8")
+
+            with patch.object(activate, "REPO", repo), patch.object(
+                activate, "PROVISION_FILE", provision
+            ):
+                with self.assertRaisesRegex(activate.ActivationError, "invalid JSON"):
+                    activate.migrate_provision_state(1000, 1000)
+
+            self.assertTrue(legacy.exists())
+
     def test_root_git_verification_disables_optional_index_locks(self):
         with patch.object(activate, "run") as run:
             activate.git("status", "--porcelain")

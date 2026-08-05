@@ -47,7 +47,6 @@ ACTIVE_STATES = {
 }
 PERSISTENT_FILES = (
     ("camera_settings.json", 1024 * 1024),
-    ("provision.json", 1024 * 1024),
     ("ffmpeg.log", 16 * 1024 * 1024),
 )
 

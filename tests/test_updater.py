@@ -59,7 +59,7 @@ class UpdaterTests(unittest.TestCase):
             timeout=180,
         )
 
-    def test_persistent_runtime_files_survive_checkout_restore(self):
+    def test_runtime_snapshot_preserves_settings_but_excludes_legacy_credentials(self):
         settings = self.repo / "camera_settings.json"
         provision = self.repo / "provision.json"
         settings.write_text('{"audio_enabled": true}', encoding="utf-8")
@@ -76,9 +76,10 @@ class UpdaterTests(unittest.TestCase):
             '{"audio_enabled": true}',
         )
         self.assertEqual(
-            provision.read_text(encoding="utf-8"),
-            '{"api_token": "secret"}',
+            snapshot.keys(),
+            {"camera_settings.json"},
         )
+        self.assertFalse(provision.exists())
         self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
 
     def test_check_ignores_unsigned_tags_and_selects_latest_trusted_release(self):

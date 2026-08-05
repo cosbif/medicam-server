@@ -77,7 +77,6 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HEALTH_TIMEOUT_SECONDS = 60
 PERSISTENT_FILES = (
     ("camera_settings.json", 1024 * 1024),
-    ("provision.json", 1024 * 1024),
     ("ffmpeg.log", 16 * 1024 * 1024),
 )
 
@@ -526,12 +525,8 @@ def _device_id() -> str:
     return hashlib.sha256(f"medicam:{source}".encode("utf-8")).hexdigest()[:8].upper()
 
 
-def ensure_security_identity() -> None:
-    uid, gid = _radxa_ids()
-    MEDICAM_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    os.chown(MEDICAM_STATE_DIR, 0, gid)
-    os.chmod(MEDICAM_STATE_DIR, 0o770)
-
+def migrate_provision_state(uid: int, gid: int) -> None:
+    """Move legacy credentials out of the checkout and remove the duplicate."""
     legacy_provision = REPO / "provision.json"
     if not PROVISION_FILE.exists():
         try:
@@ -545,18 +540,29 @@ def ensure_security_identity() -> None:
             mode=0o600,
             owner=(uid, gid),
         )
-    else:
-        descriptor = os.open(
-            PROVISION_FILE,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise ActivationError("provision state is not a regular file")
-            os.fchmod(descriptor, 0o600)
-            os.fchown(descriptor, uid, gid)
-        finally:
-            os.close(descriptor)
+
+    descriptor = os.open(
+        PROVISION_FILE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ActivationError("provision state is not a regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as value:
+            provision = json.load(value)
+        if not isinstance(provision, dict):
+            raise ActivationError("provision state is not a JSON object")
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, uid, gid)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise ActivationError("provision state is invalid JSON") from error
+    finally:
+        os.close(descriptor)
+
+    # The production service reads only /var/lib/medicam/provision.json.
+    # Keeping the migrated token in the writable Git checkout creates an
+    # unnecessary second secret and can preserve legacy world-readable modes.
+    legacy_provision.unlink(missing_ok=True)
 
     PROVISION_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_descriptor = os.open(
@@ -571,6 +577,15 @@ def ensure_security_identity() -> None:
         os.fchown(lock_descriptor, 0, gid)
     finally:
         os.close(lock_descriptor)
+
+
+def ensure_security_identity() -> None:
+    uid, gid = _radxa_ids()
+    MEDICAM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chown(MEDICAM_STATE_DIR, 0, gid)
+    os.chmod(MEDICAM_STATE_DIR, 0o770)
+
+    migrate_provision_state(uid, gid)
 
     if not PAIRING_SECRET_FILE.exists():
         pairing_secret = base64.b32encode(secrets.token_bytes(16)).decode("ascii")
