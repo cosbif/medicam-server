@@ -730,7 +730,7 @@ def install_network_security(release_root: Path) -> None:
         owner=(0, 0),
     )
     run(["/usr/sbin/nft", "-f", str(NFTABLES_FILE)])
-    run(["/bin/systemctl", "enable", "nftables.service"])
+    run(["/bin/systemctl", "enable", "--now", "nftables.service"])
 
     previous_ssh = None
     try:
