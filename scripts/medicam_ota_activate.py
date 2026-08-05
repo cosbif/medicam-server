@@ -632,6 +632,17 @@ def ensure_security_identity() -> None:
 def install_ble_runtime(release_root: Path) -> None:
     source_app = release_root / "app"
     requirements = release_root / "requirements.txt"
+    ble_unit = release_root / "deploy" / "systemd" / "medicam-ble.service"
+    try:
+        uses_root_owned_runtime = "/opt/medicam/" in ble_unit.read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        uses_root_owned_runtime = False
+    if not uses_root_owned_runtime:
+        # Releases before priority 7 execute BLE from the unprivileged checkout;
+        # do not build an unused root runtime while rolling back to them.
+        return
     if not source_app.is_dir() or not requirements.is_file():
         raise ActivationError("signed BLE runtime source is missing")
 
@@ -984,6 +995,19 @@ def perform(previous: str, target: str, tag: str) -> None:
         verify_release(tag, target)
         validate_transition(previous, tag)
         target_release = materialize_release(target)
+        write_status(
+            "installing",
+            83,
+            "Preparing signed security assets",
+            previous_commit=previous,
+            target_commit=target,
+            target_tag=tag,
+        )
+        # The schedule command may still be running an older helper that does
+        # not know how to create TLS identity or the root-owned BLE runtime.
+        # Reinstalling from the verified materialized commit here makes the
+        # migration safe and idempotent across helper generations.
+        install_release_assets(target_release, harden=True)
         write_status(
             "restarting",
             85,
