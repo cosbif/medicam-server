@@ -1,5 +1,8 @@
 import io
+import json
 import os
+import tempfile
+import time
 import unittest
 from unittest.mock import Mock, mock_open, patch
 
@@ -178,6 +181,12 @@ class CameraCommandTests(unittest.TestCase):
 
 class CameraLifecycleTests(unittest.TestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_cwd = os.getcwd()
+        self.old_state_file = camera.RECORDING_STATE_FILE
+        os.chdir(self.tmp.name)
+        os.makedirs("videos", exist_ok=True)
+        camera.RECORDING_STATE_FILE = "videos/.recording-state.json"
         camera.capture_process = None
         camera.audio_process = None
         camera.ffmpeg_process = None
@@ -188,6 +197,16 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_audio_device = None
         camera.recording_audio_lead_seconds = 0.0
         camera.recording_remux_command = None
+        camera.recording_phase = "idle"
+        camera.recording_started_at_monotonic = None
+        camera.recording_started_at_utc = None
+        camera.recording_camera_device = None
+        camera.recording_video_size = None
+        camera.recording_fps = None
+        camera.recording_capture_format = None
+        camera.recording_generation = 0
+        camera.last_recording_error = None
+        camera.recovery_state_loaded = True
 
     def tearDown(self):
         camera.capture_process = None
@@ -200,6 +219,18 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_audio_device = None
         camera.recording_audio_lead_seconds = 0.0
         camera.recording_remux_command = None
+        camera.recording_phase = "idle"
+        camera.recording_started_at_monotonic = None
+        camera.recording_started_at_utc = None
+        camera.recording_camera_device = None
+        camera.recording_video_size = None
+        camera.recording_fps = None
+        camera.recording_capture_format = None
+        camera.last_recording_error = None
+        camera.recovery_state_loaded = False
+        camera.RECORDING_STATE_FILE = self.old_state_file
+        os.chdir(self.old_cwd)
+        self.tmp.cleanup()
 
     @patch("app.camera.utils.get_output_filename", return_value="videos/test.mp4")
     @patch("app.camera._find_linux_camera_device", return_value=None)
@@ -229,6 +260,154 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertEqual(response["returncode"], 1)
         self.assertIn("already exited", response["warning"])
         self.assertIsNone(camera.ffmpeg_process)
+
+    def test_fast_second_start_is_idempotent(self):
+        process = Mock()
+        process.poll.return_value = None
+        camera.capture_process = process
+        camera.recording_phase = "recording"
+        camera.recording_output_file = "videos/active.mp4"
+
+        response = camera.start_recording()
+
+        self.assertEqual(response["status"], "already_recording")
+        self.assertEqual(response["file"], "videos/active.mp4")
+
+    def test_second_stop_during_finalization_is_idempotent(self):
+        camera.recording_phase = "finalizing"
+        camera.recording_output_file = "videos/active.mp4"
+
+        response = camera.stop_recording()
+
+        self.assertEqual(response["status"], "already_finalizing")
+        self.assertEqual(response["file"], "videos/active.mp4")
+
+    @patch("app.camera.platform.system", return_value="Linux")
+    @patch("app.camera._find_linux_camera_device", return_value="/dev/video0")
+    def test_health_status_reports_runtime_and_storage(
+        self,
+        _find_camera,
+        _system,
+    ):
+        process = Mock()
+        process.poll.return_value = None
+        camera.capture_process = process
+        camera.recording_phase = "recording"
+        camera.recording_output_file = "videos/active.mp4"
+        camera.recording_raw_file = "videos/active.mp4.mjpeg"
+        camera.recording_started_at_monotonic = time.monotonic() - 12
+        camera.recording_camera_device = "/dev/video0"
+        camera.recording_video_size = "1920x1080"
+        camera.recording_fps = "30"
+        with open(camera.recording_raw_file, "wb") as raw:
+            raw.write(b"frame-data")
+
+        status = camera.get_recording_status()
+
+        self.assertEqual(status["state"], "recording")
+        self.assertTrue(status["recording"])
+        self.assertTrue(status["capture_active"])
+        self.assertGreaterEqual(status["duration_seconds"], 12)
+        self.assertEqual(status["current_size_bytes"], 10)
+        self.assertGreater(status["free_space_bytes"], 0)
+        self.assertEqual(status["resolution"], "1920x1080")
+        self.assertEqual(status["fps"], "30")
+        self.assertTrue(status["camera"]["available"])
+
+    @patch("app.camera.platform.system", return_value="Linux")
+    @patch("app.camera._find_linux_camera_device", return_value="/dev/video0")
+    def test_backend_restart_restores_raw_recording(
+        self,
+        _find_camera,
+        _system,
+    ):
+        raw_file = "videos/interrupted.mp4.mjpeg"
+        with open(raw_file, "wb") as raw:
+            raw.write(b"recoverable frames")
+        with open(camera.RECORDING_STATE_FILE, "w", encoding="utf-8") as state:
+            json.dump(
+                {
+                    "phase": "recording",
+                    "output_file": "videos/interrupted.mp4",
+                    "raw_file": raw_file,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "video_size": "1920x1080",
+                    "fps": "30",
+                },
+                state,
+            )
+        camera.recovery_state_loaded = False
+
+        status = camera.get_recording_status()
+
+        self.assertEqual(status["state"], "interrupted")
+        self.assertTrue(status["recording"])
+        self.assertTrue(status["recoverable"])
+        self.assertEqual(status["last_error"]["code"], "backend_restarted")
+
+    @patch("app.camera._probe_recording")
+    @patch("app.camera.subprocess.run")
+    def test_stop_finalizes_recovered_raw_video(self, run_mock, probe_mock):
+        raw_file = "videos/interrupted.mp4.mjpeg"
+        with open(raw_file, "wb") as raw:
+            raw.write(b"recoverable frames")
+        run_mock.return_value = Mock(returncode=0)
+        probe_mock.return_value = {
+            "valid": True,
+            "healthy": True,
+            "frame_count": 300,
+            "expected_frames": 300,
+            "avg_fps": 30.0,
+        }
+        camera.recording_phase = "interrupted"
+        camera.recording_output_file = "videos/interrupted.mp4"
+        camera.recording_raw_file = raw_file
+        camera.recording_fps = "30"
+        camera.recording_remux_command = ["ffmpeg", "recover"]
+
+        response = camera.stop_recording()
+
+        self.assertEqual(response["status"], "recording_stopped")
+        self.assertEqual(response["returncode"], 0)
+        self.assertTrue(response["recovered"])
+        self.assertFalse(os.path.exists(raw_file))
+        self.assertEqual(camera.recording_phase, "idle")
+
+    @patch("app.camera.subprocess.run", return_value=Mock(returncode=1))
+    def test_failed_recovery_preserves_raw_source(self, _run):
+        raw_file = "videos/interrupted.mp4.mjpeg"
+        with open(raw_file, "wb") as raw:
+            raw.write(b"recoverable frames")
+        camera.recording_phase = "interrupted"
+        camera.recording_output_file = "videos/interrupted.mp4"
+        camera.recording_raw_file = raw_file
+        camera.recording_fps = "30"
+        camera.recording_remux_command = ["ffmpeg", "recover"]
+
+        response = camera.stop_recording()
+
+        self.assertNotEqual(response["returncode"], 0)
+        self.assertTrue(response["recoverable"])
+        self.assertTrue(os.path.exists(raw_file))
+        self.assertEqual(camera.recording_phase, "interrupted")
+
+    @patch("app.camera._stop_capture_process")
+    def test_video_disconnect_marks_interrupted_and_stops_audio(self, stop_mock):
+        video = Mock()
+        video.poll.return_value = 1
+        microphone = Mock()
+        microphone.poll.return_value = None
+        camera.capture_process = video
+        camera.audio_process = microphone
+        camera.recording_phase = "recording"
+        camera.recording_output_file = "videos/interrupted.mp4"
+        camera.recording_raw_file = "videos/interrupted.mp4.mjpeg"
+
+        camera._refresh_recording_state_locked()
+
+        self.assertEqual(camera.recording_phase, "interrupted")
+        self.assertEqual(camera.last_recording_error["code"], "video_capture_exited")
+        stop_mock.assert_called_once_with(microphone)
 
     @patch("app.camera.glob.glob")
     @patch("app.camera._is_character_device", return_value=True)

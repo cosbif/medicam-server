@@ -429,6 +429,16 @@ async def update_apply(_ok: bool = Depends(require_update_auth)):
     """
     Выполняет git pull (fetch + reset) и перезапуск сервиса.
     """
+    recording = camera.get_recording_status()
+    if recording["recording"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "recording_in_progress",
+                "state": recording["state"],
+                "message": "Stop or recover the current recording before updating",
+            },
+        )
     result = updater.apply_update()
     if not result["ok"]:
         raise HTTPException(status_code=500, detail=result)

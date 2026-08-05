@@ -1,12 +1,14 @@
 '''Camera settings and video recording lifecycle.'''
 
 from fastapi import HTTPException
+from datetime import datetime, timezone
 import glob
 import json
 import os
 import platform
 import shlex
 import signal
+import shutil
 import stat
 import subprocess
 import threading
@@ -25,6 +27,16 @@ AUDIO_OPEN_ATTEMPTS = 8
 AUDIO_OPEN_PROBE_DELAY = 0.15
 AUDIO_OPEN_RETRY_DELAY = 0.35
 AUDIO_TEMP_DIR = os.environ.get("MEDICAM_AUDIO_TEMP_DIR", "/run/medicam")
+RECORDING_STATE_FILE = os.environ.get(
+    "MEDICAM_RECORDING_STATE_FILE",
+    os.path.join(utils.VIDEOS_DIR, ".recording-state.json"),
+)
+MIN_RECORDING_FREE_BYTES = int(
+    os.environ.get("MEDICAM_MIN_RECORDING_FREE_BYTES", 1024 * 1024 * 1024)
+)
+WATCHDOG_INTERVAL_SECONDS = 0.5
+HEALTHY_FRAME_DELIVERY_RATIO = 0.995
+HEALTHY_AVG_FPS = 29.5
 
 camera_settings = {
     "resolution": "FHD",
@@ -60,7 +72,17 @@ recording_audio_file = None
 recording_audio_device = None
 recording_audio_lead_seconds = 0.0
 recording_remux_command = None
-recording_lock = threading.Lock()
+recording_phase = "idle"
+recording_started_at_monotonic = None
+recording_started_at_utc = None
+recording_camera_device = None
+recording_video_size = None
+recording_fps = None
+recording_capture_format = None
+recording_generation = 0
+last_recording_error = None
+recovery_state_loaded = False
+recording_lock = threading.RLock()
 
 
 def _normalize_settings(settings: dict | None):
@@ -299,7 +321,10 @@ def _clear_recording_state():
     global capture_process, audio_process, ffmpeg_process
     global recording_output_file, recording_raw_file, recording_audio_file
     global recording_audio_device, recording_audio_lead_seconds
-    global recording_remux_command
+    global recording_remux_command, recording_phase
+    global recording_started_at_monotonic, recording_started_at_utc
+    global recording_camera_device, recording_video_size, recording_fps
+    global recording_capture_format, recording_generation
 
     capture_process = None
     audio_process = None
@@ -310,6 +335,14 @@ def _clear_recording_state():
     recording_audio_device = None
     recording_audio_lead_seconds = 0.0
     recording_remux_command = None
+    recording_phase = "idle"
+    recording_started_at_monotonic = None
+    recording_started_at_utc = None
+    recording_camera_device = None
+    recording_video_size = None
+    recording_fps = None
+    recording_capture_format = None
+    recording_generation += 1
 
 
 def _stop_capture_process(process, timeout: float = 3.0):
@@ -359,6 +392,332 @@ def _log_tail(max_lines: int = 20):
         return ""
 
 
+def _utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _path_is_within(path: str | None, directory: str):
+    if not path:
+        return False
+    try:
+        return os.path.commonpath(
+            [os.path.realpath(path), os.path.realpath(directory)]
+        ) == os.path.realpath(directory)
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_file_size(path: str | None):
+    if not path:
+        return 0
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _recording_duration_seconds():
+    if recording_started_at_monotonic is not None:
+        return max(0.0, time.monotonic() - recording_started_at_monotonic)
+    if recording_started_at_utc:
+        try:
+            started = datetime.fromisoformat(recording_started_at_utc)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            return max(
+                0.0,
+                (datetime.now(timezone.utc) - started).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _set_last_error_locked(code: str, message: str, recoverable: bool = False):
+    global last_recording_error
+    last_recording_error = {
+        "code": code,
+        "message": str(message),
+        "at": _utc_now_iso(),
+        "recoverable": bool(recoverable),
+    }
+
+
+def _persist_recording_state_locked():
+    os.makedirs(os.path.dirname(RECORDING_STATE_FILE) or ".", exist_ok=True)
+    if recording_phase == "idle" and last_recording_error is None:
+        _remove_file(RECORDING_STATE_FILE)
+        _remove_file(f"{RECORDING_STATE_FILE}.tmp")
+        return
+
+    payload = {
+        "version": 1,
+        "phase": recording_phase,
+        "output_file": recording_output_file,
+        "raw_file": recording_raw_file,
+        "audio_file": recording_audio_file,
+        "audio_device": recording_audio_device,
+        "audio_lead_seconds": recording_audio_lead_seconds,
+        "started_at": recording_started_at_utc,
+        "camera_device": recording_camera_device,
+        "video_size": recording_video_size,
+        "fps": recording_fps,
+        "capture_format": recording_capture_format,
+        "last_error": last_recording_error,
+        "updated_at": _utc_now_iso(),
+    }
+    temporary = f"{RECORDING_STATE_FILE}.tmp"
+    with open(temporary, "w", encoding="utf-8") as state_file:
+        json.dump(payload, state_file, ensure_ascii=False)
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    os.replace(temporary, RECORDING_STATE_FILE)
+
+
+def _restore_recording_state_locked():
+    global recovery_state_loaded, recording_phase
+    global recording_output_file, recording_raw_file, recording_audio_file
+    global recording_audio_device, recording_audio_lead_seconds
+    global recording_remux_command, recording_started_at_utc
+    global recording_camera_device, recording_video_size, recording_fps
+    global recording_capture_format, last_recording_error
+
+    if recovery_state_loaded:
+        return
+    recovery_state_loaded = True
+
+    saved = {}
+    try:
+        with open(RECORDING_STATE_FILE, "r", encoding="utf-8") as state_file:
+            loaded = json.load(state_file)
+            if isinstance(loaded, dict):
+                saved = loaded
+    except (OSError, json.JSONDecodeError, TypeError):
+        saved = {}
+
+    saved_error = saved.get("last_error")
+    if isinstance(saved_error, dict):
+        last_recording_error = dict(saved_error)
+
+    output_file = saved.get("output_file")
+    if not _path_is_within(output_file, utils.VIDEOS_DIR):
+        output_file = None
+    if output_file and not output_file.lower().endswith(".mp4"):
+        output_file = None
+
+    raw_file = f"{output_file}.mjpeg" if output_file else None
+    if not raw_file or not os.path.isfile(raw_file):
+        orphaned = sorted(
+            glob.glob(os.path.join(utils.VIDEOS_DIR, "*.mp4.mjpeg")),
+            key=lambda path: os.path.getmtime(path),
+        )
+        raw_file = orphaned[-1] if orphaned else None
+        output_file = raw_file[:-len(".mjpeg")] if raw_file else None
+
+    if raw_file and output_file:
+        audio_file = saved.get("audio_file")
+        valid_audio_location = (
+            _path_is_within(audio_file, AUDIO_TEMP_DIR)
+            or _path_is_within(audio_file, utils.VIDEOS_DIR)
+        )
+        if not valid_audio_location or not os.path.isfile(audio_file):
+            audio_file = None
+
+        recording_output_file = output_file
+        recording_raw_file = raw_file
+        recording_audio_file = audio_file
+        recording_audio_device = saved.get("audio_device")
+        recording_audio_lead_seconds = float(
+            saved.get("audio_lead_seconds") or 0.0
+        )
+        recording_started_at_utc = saved.get("started_at")
+        if not recording_started_at_utc:
+            recording_started_at_utc = datetime.fromtimestamp(
+                os.path.getmtime(raw_file), timezone.utc
+            ).isoformat()
+        recording_camera_device = saved.get("camera_device")
+        recording_video_size = saved.get("video_size") or "1920x1080"
+        recording_fps = str(saved.get("fps") or "30")
+        recording_capture_format = saved.get("capture_format") or "v4l2_mjpeg_raw"
+        recording_remux_command = _build_linux_command(
+            raw_file,
+            recording_fps,
+            output_file,
+            audio_file=audio_file,
+            audio_lead_seconds=recording_audio_lead_seconds,
+        )
+        recording_phase = "interrupted"
+        if last_recording_error is None:
+            _set_last_error_locked(
+                "backend_restarted",
+                "Backend restarted before the recording was finalized",
+                recoverable=True,
+            )
+        _persist_recording_state_locked()
+        return
+
+    if saved.get("phase") in {"starting", "recording", "finalizing", "interrupted"}:
+        recording_phase = "idle"
+        _set_last_error_locked(
+            "recovery_source_missing",
+            "Interrupted recording source file is no longer available",
+            recoverable=False,
+        )
+        _persist_recording_state_locked()
+
+
+def _parse_rate(value):
+    try:
+        numerator, denominator = str(value).split("/", maxsplit=1)
+        denominator_value = float(denominator)
+        return float(numerator) / denominator_value if denominator_value else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _probe_recording(path: str, elapsed_seconds: float, expected_fps: float):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-count_frames",
+                "-select_streams", "v:0",
+                "-show_entries",
+                "stream=nb_read_frames,avg_frame_rate,width,height:format=duration",
+                "-of", "json",
+                path,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ffprobe failed")
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams") or []
+        stream = streams[0] if streams else {}
+        frame_count = int(stream.get("nb_read_frames") or 0)
+        duration = float((payload.get("format") or {}).get("duration") or 0.0)
+        avg_fps = _parse_rate(stream.get("avg_frame_rate", "0/1"))
+        expected_frames = max(0, round(elapsed_seconds * expected_fps))
+        if expected_frames == 0 and duration > 0:
+            # After a backend restart monotonic time is unavailable. The file
+            # duration still lets us validate that the recovered stream is
+            # decodable and maintains the configured frame rate.
+            expected_frames = max(1, round(duration * expected_fps))
+        missing_frames = max(0, expected_frames - frame_count)
+        delivery_ratio = (
+            min(1.0, frame_count / expected_frames) if expected_frames else 0.0
+        )
+        return {
+            "valid": frame_count > 0 and duration > 0,
+            "duration_seconds": round(duration, 3),
+            "wall_duration_seconds": round(elapsed_seconds, 3),
+            "frame_count": frame_count,
+            "expected_frames": expected_frames,
+            "missing_frames": missing_frames,
+            "frame_delivery_ratio": round(delivery_ratio, 6),
+            "avg_fps": round(avg_fps, 3),
+            "resolution": (
+                f"{stream.get('width')}x{stream.get('height')}"
+                if stream.get("width") and stream.get("height")
+                else ""
+            ),
+            "healthy": (
+                frame_count > 0
+                and duration > 0
+                and delivery_ratio >= HEALTHY_FRAME_DELIVERY_RATIO
+                and avg_fps >= min(expected_fps - 0.5, HEALTHY_AVG_FPS)
+            ),
+        }
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        RuntimeError,
+        subprocess.SubprocessError,
+    ) as error:
+        return {
+            "valid": False,
+            "healthy": False,
+            "error": str(error),
+        }
+
+
+def _mark_interrupted_locked(code: str, message: str):
+    global recording_phase
+    if recording_phase != "recording":
+        return
+    recording_phase = "interrupted"
+    _set_last_error_locked(code, message, recoverable=True)
+    _persist_recording_state_locked()
+
+
+def _refresh_recording_state_locked():
+    if recording_phase != "recording":
+        return
+    video_process = ffmpeg_process or capture_process
+    if video_process is None:
+        _mark_interrupted_locked(
+            "video_capture_missing",
+            "Video capture process disappeared unexpectedly",
+        )
+        _stop_capture_process(audio_process)
+        return
+    video_return_code = video_process.poll()
+    if video_return_code is not None:
+        _mark_interrupted_locked(
+            "video_capture_exited",
+            f"Video capture exited unexpectedly with code {video_return_code}",
+        )
+        _stop_capture_process(audio_process)
+        return
+    if recording_audio_file is not None:
+        if audio_process is None:
+            _mark_interrupted_locked(
+                "audio_capture_missing",
+                "Audio capture process disappeared unexpectedly",
+            )
+            _stop_capture_process(video_process)
+            return
+        audio_return_code = audio_process.poll()
+        if audio_return_code is not None:
+            _mark_interrupted_locked(
+                "audio_capture_exited",
+                f"Audio capture exited unexpectedly with code {audio_return_code}",
+            )
+            _stop_capture_process(video_process)
+
+
+def _watch_recording(generation: int):
+    while True:
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
+        processes_to_stop = []
+        with recording_lock:
+            if generation != recording_generation or recording_phase != "recording":
+                return
+            previous_phase = recording_phase
+            _refresh_recording_state_locked()
+            if previous_phase == "recording" and recording_phase == "interrupted":
+                processes_to_stop = [capture_process, audio_process, ffmpeg_process]
+        if processes_to_stop:
+            for process in processes_to_stop:
+                _stop_capture_process(process)
+            return
+
+
+def _start_watchdog_locked():
+    thread = threading.Thread(
+        target=_watch_recording,
+        args=(recording_generation,),
+        name=f"medicam-recording-watchdog-{recording_generation}",
+        daemon=True,
+    )
+    thread.start()
+
+
 if os.path.exists(SETTINGS_FILE):
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
@@ -371,27 +730,40 @@ def start_recording():
     global capture_process, audio_process, ffmpeg_process, ffmpeg_log_file
     global recording_output_file, recording_raw_file, recording_audio_file
     global recording_audio_device, recording_audio_lead_seconds
-    global recording_remux_command
+    global recording_remux_command, recording_phase
+    global recording_started_at_monotonic, recording_started_at_utc
+    global recording_camera_device, recording_video_size, recording_fps
+    global recording_capture_format, recording_generation
+    global last_recording_error
 
     with recording_lock:
+        _restore_recording_state_locked()
+        _refresh_recording_state_locked()
         processes = [
             process
             for process in (ffmpeg_process, capture_process, audio_process)
             if process is not None
         ]
-        if processes:
-            if any(process.poll() is None for process in processes):
-                return {
-                    "status": "already_recording",
-                    "file": recording_output_file,
-                }
-            # Preserve interrupted source files until /stop remuxes them. This
-            # can recover everything captured before a USB disconnect.
+        if recording_phase == "finalizing":
             return {
-                "status": "recording_interrupted",
+                "status": "already_finalizing",
                 "file": recording_output_file,
-                "details": "Finalize the interrupted recording with /stop",
             }
+        if recording_phase == "interrupted" or (
+            recording_raw_file and os.path.isfile(recording_raw_file)
+        ):
+            return {
+                "status": "recovery_required",
+                "file": recording_output_file,
+                "details": "Finalize the interrupted recording with /stop before starting a new one",
+            }
+        if processes and any(process.poll() is None for process in processes):
+            return {
+                "status": "already_recording",
+                "file": recording_output_file,
+            }
+        if processes:
+            _clear_recording_state()
 
         resolution_key = camera_settings.get("resolution", "FHD")
         video_size = SUPPORTED_RESOLUTIONS.get(resolution_key)
@@ -406,6 +778,21 @@ def start_recording():
 
         system = platform.system()
         output_file = utils.get_output_filename()
+        free_bytes = shutil.disk_usage(utils.VIDEOS_DIR).free
+        if free_bytes < MIN_RECORDING_FREE_BYTES:
+            _set_last_error_locked(
+                "insufficient_storage",
+                f"Only {free_bytes} bytes are free; at least "
+                f"{MIN_RECORDING_FREE_BYTES} bytes are required",
+            )
+            _persist_recording_state_locked()
+            return {
+                "status": "error",
+                "error_code": "insufficient_storage",
+                "details": last_recording_error["message"],
+                "free_space_bytes": free_bytes,
+                "required_free_bytes": MIN_RECORDING_FREE_BYTES,
+            }
         selected_audio_device = None
         audio_file = None
         audio_command = None
@@ -414,9 +801,15 @@ def start_recording():
             camera_device = _find_linux_camera_device()
             if camera_device is None:
                 _remove_file(output_file)
+                _set_last_error_locked(
+                    "camera_unavailable",
+                    "Camera capture device is not available",
+                )
+                _persist_recording_state_locked()
                 return {
                     "status": "error",
-                    "details": "Camera capture device is not available",
+                    "error_code": "camera_unavailable",
+                    "details": last_recording_error["message"],
                 }
             raw_file = f"{output_file}.mjpeg"
             if audio_enabled:
@@ -425,10 +818,15 @@ def start_recording():
                 )
                 if selected_audio_device is None:
                     _remove_file(output_file)
+                    _set_last_error_locked(
+                        "audio_device_unavailable",
+                        "Configured audio capture device is not available",
+                    )
+                    _persist_recording_state_locked()
                     return {
                         "status": "error",
                         "error_code": "audio_device_unavailable",
-                        "details": "Configured audio capture device is not available",
+                        "details": last_recording_error["message"],
                     }
                 audio_file = _build_audio_temp_file(output_file)
                 audio_command = audio.build_arecord_command(
@@ -455,7 +853,32 @@ def start_recording():
             capture_format = "h264"
         else:
             _remove_file(output_file)
-            return {"status": "error", "details": f"Unsupported OS: {system}"}
+            _set_last_error_locked(
+                "unsupported_os",
+                f"Unsupported OS: {system}",
+            )
+            _persist_recording_state_locked()
+            return {
+                "status": "error",
+                "error_code": "unsupported_os",
+                "details": last_recording_error["message"],
+            }
+
+        recording_output_file = output_file
+        recording_raw_file = raw_file
+        recording_audio_file = audio_file
+        recording_audio_device = selected_audio_device
+        recording_audio_lead_seconds = 0.0
+        recording_camera_device = camera_device
+        recording_video_size = video_size
+        recording_fps = fps
+        recording_capture_format = capture_format
+        recording_started_at_monotonic = None
+        recording_started_at_utc = _utc_now_iso()
+        recording_phase = "starting"
+        recording_generation += 1
+        last_recording_error = None
+        _persist_recording_state_locked()
 
         try:
             ffmpeg_log_file = open(FFMPEG_LOG_FILE, "w", encoding="utf-8")
@@ -514,7 +937,7 @@ def start_recording():
                     stdout=ffmpeg_log_file,
                     stderr=ffmpeg_log_file,
                 )
-            recording_output_file = output_file
+                video_started_at = time.monotonic()
         except audio.AudioError as error:
             _stop_capture_process(capture_process)
             _stop_capture_process(audio_process)
@@ -524,10 +947,15 @@ def start_recording():
             _remove_file(output_file)
             _remove_file(raw_file)
             _remove_file(audio_file)
+            _set_last_error_locked(
+                error.code,
+                details or error.details or str(error),
+            )
+            _persist_recording_state_locked()
             return {
                 "status": "error",
                 "error_code": error.code,
-                "details": details or error.details or str(error),
+                "details": last_recording_error["message"],
             }
         except (OSError, subprocess.SubprocessError) as error:
             _stop_capture_process(capture_process)
@@ -537,7 +965,13 @@ def start_recording():
             _remove_file(output_file)
             _remove_file(raw_file)
             _remove_file(audio_file)
-            return {"status": "error", "details": str(error)}
+            _set_last_error_locked("capture_start_failed", str(error))
+            _persist_recording_state_locked()
+            return {
+                "status": "error",
+                "error_code": "capture_start_failed",
+                "details": str(error),
+            }
 
         time.sleep(FFMPEG_STARTUP_DELAY)
         capture_return_code = (
@@ -574,10 +1008,22 @@ def start_recording():
                 return_code = audio_return_code
             else:
                 return_code = capture_return_code
+            _set_last_error_locked(
+                "capture_start_failed",
+                details or f"Capture exited with code {return_code}",
+            )
+            _persist_recording_state_locked()
             return {
                 "status": "error",
-                "details": details or f"FFmpeg exited with code {return_code}",
+                "error_code": "capture_start_failed",
+                "details": last_recording_error["message"],
             }
+
+        recording_started_at_monotonic = video_started_at
+        recording_started_at_utc = _utc_now_iso()
+        recording_phase = "recording"
+        _persist_recording_state_locked()
+        _start_watchdog_locked()
 
         return {
             "status": "recording_started",
@@ -597,102 +1043,232 @@ def start_recording():
 
 
 def stop_recording():
-    global capture_process, audio_process, ffmpeg_process
+    global recording_phase, recording_generation, last_recording_error
 
     with recording_lock:
-        if capture_process is None and ffmpeg_process is None and audio_process is None:
+        _restore_recording_state_locked()
+        _refresh_recording_state_locked()
+        if recording_phase == "finalizing":
+            return {
+                "status": "already_finalizing",
+                "file": recording_output_file,
+            }
+
+        has_process = any(
+            process is not None
+            for process in (capture_process, ffmpeg_process, audio_process)
+        )
+        has_recovery_source = bool(
+            recording_raw_file and os.path.isfile(recording_raw_file)
+        )
+        if not has_process and not has_recovery_source:
             return {"status": "no_recording_running"}
 
         process = ffmpeg_process
         capture = capture_process
         audio_capture = audio_process
         output_file = recording_output_file
-        capture_return_code = None
-        audio_return_code = None
-        return_code = None
-        warning = None
+        raw_file = recording_raw_file
+        audio_file = recording_audio_file
+        remux_command = recording_remux_command
+        fps = float(recording_fps or camera_settings.get("fps", "30"))
+        elapsed_seconds = (
+            _recording_duration_seconds()
+            if recording_started_at_monotonic is not None
+            else 0.0
+        )
+        was_interrupted = recording_phase == "interrupted"
+        previous_error = dict(last_recording_error) if last_recording_error else None
+        recording_phase = "finalizing"
+        recording_generation += 1
+        _persist_recording_state_locked()
 
-        if capture is not None:
-            capture_was_running = capture.poll() is None
-            audio_was_running = (
-                audio_capture is not None and audio_capture.poll() is None
+    capture_return_code = None
+    audio_return_code = None
+    return_code = None
+    warning_parts = []
+    quality = None
+    audio_recovered = bool(audio_file)
+
+    if raw_file:
+        capture_was_running = capture is not None and capture.poll() is None
+        audio_was_running = (
+            audio_capture is not None and audio_capture.poll() is None
+        )
+        capture_return_code = _stop_capture_process(capture)
+        audio_return_code = _stop_capture_process(audio_capture)
+        if capture is not None and not capture_was_running:
+            warning_parts.append(
+                f"Video capture ended before stop (code {capture_return_code})"
             )
-            capture_return_code = _stop_capture_process(capture)
-            audio_return_code = _stop_capture_process(audio_capture)
-            if not capture_was_running:
-                warning = (
-                    "Video capture ended before stop "
-                    f"(code {capture_return_code})"
+            was_interrupted = True
+        elif capture_return_code not in (None, 0, -signal.SIGINT):
+            warning_parts.append(
+                f"Video capture exited with code {capture_return_code}"
+            )
+            was_interrupted = True
+
+        audio_stopped_normally = (
+            audio_return_code in (None, 0, -signal.SIGINT)
+            or (audio_return_code == 1 and audio_was_running)
+        )
+        if audio_capture is not None and not audio_stopped_normally:
+            warning_parts.append(
+                f"Audio capture exited with code {audio_return_code}"
+            )
+            was_interrupted = True
+
+        owned_log = None
+        log_output = ffmpeg_log_file
+        try:
+            if log_output is None or log_output.closed:
+                owned_log = open(FFMPEG_LOG_FILE, "a", encoding="utf-8")
+                log_output = owned_log
+            if not raw_file or not os.path.isfile(raw_file) or _safe_file_size(raw_file) == 0:
+                raise OSError("Raw MJPEG recovery file is missing or empty")
+            if remux_command is None:
+                remux_command = _build_linux_command(
+                    raw_file,
+                    str(int(fps)),
+                    output_file,
+                    audio_file=audio_file if os.path.isfile(audio_file or "") else None,
+                    audio_lead_seconds=recording_audio_lead_seconds,
                 )
-            elif capture_return_code not in (None, 0, -signal.SIGINT):
-                warning = f"Video capture exited with code {capture_return_code}"
-            # arecord returns 1 after handling SIGINT on this platform. When it
-            # stayed alive throughout recording, this is a normal requested
-            # stop rather than a capture failure.
-            audio_stopped_normally = (
-                audio_return_code in (None, 0, -signal.SIGINT)
-                or (audio_return_code == 1 and audio_was_running)
+            remux = subprocess.run(
+                remux_command,
+                stdout=log_output,
+                stderr=log_output,
+                timeout=FFMPEG_REMUX_TIMEOUT,
+                check=False,
             )
-            if not audio_stopped_normally:
-                audio_warning = f"Audio capture exited with code {audio_return_code}"
-                warning = f"{warning}; {audio_warning}" if warning else audio_warning
-            try:
-                remux = subprocess.run(
-                    recording_remux_command,
-                    stdout=ffmpeg_log_file,
-                    stderr=ffmpeg_log_file,
+            return_code = remux.returncode
+
+            # A damaged/missing audio tail must not make an otherwise intact
+            # video unrecoverable. Retry once with the raw MJPEG stream alone.
+            if return_code != 0 and audio_file:
+                warning_parts.append(
+                    "Audio could not be finalized; recovered video without audio"
+                )
+                audio_recovered = False
+                video_only_command = _build_linux_command(
+                    raw_file,
+                    str(int(fps)),
+                    output_file,
+                )
+                retry = subprocess.run(
+                    video_only_command,
+                    stdout=log_output,
+                    stderr=log_output,
                     timeout=FFMPEG_REMUX_TIMEOUT,
                     check=False,
                 )
-                return_code = remux.returncode
-            except (OSError, subprocess.SubprocessError) as error:
-                warning = f"FFmpeg remux failed: {error}"
-                return_code = 1
-            except subprocess.TimeoutExpired:
-                warning = "FFmpeg remux timed out"
-                return_code = 124
+                return_code = retry.returncode
+        except subprocess.TimeoutExpired:
+            warning_parts.append("FFmpeg remux timed out")
+            return_code = 124
+        except (OSError, subprocess.SubprocessError) as error:
+            warning_parts.append(f"FFmpeg remux failed: {error}")
+            return_code = 1
+        finally:
+            if owned_log is not None:
+                owned_log.close()
 
-            if return_code == 0:
-                _remove_file(recording_raw_file)
-                _remove_file(recording_audio_file)
-        else:
-            return_code = process.poll()
-            if return_code is None:
+        if return_code == 0:
+            quality = _probe_recording(output_file, elapsed_seconds, fps)
+            if not quality.get("valid"):
+                warning_parts.append(
+                    f"Output validation failed: {quality.get('error', 'invalid video')}"
+                )
+                return_code = 2
+            elif not quality.get("healthy"):
+                warning_parts.append(
+                    "Frame delivery was below the FullHD 30 fps health threshold"
+                )
+    elif process is not None:
+        return_code = process.poll()
+        if return_code is None:
+            try:
+                process.stdin.write(b"q\n")
+                process.stdin.flush()
+                return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                warning_parts.append(
+                    "FFmpeg did not stop cleanly and was terminated"
+                )
                 try:
-                    process.stdin.write(b"q\n")
-                    process.stdin.flush()
-                    return_code = process.wait(timeout=FFMPEG_STOP_TIMEOUT)
-                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                    warning = "FFmpeg did not stop cleanly and was terminated"
-                    try:
-                        process.terminate()
-                    except ProcessLookupError:
-                        return_code = process.poll()
+                    process.terminate()
+                except ProcessLookupError:
+                    return_code = process.poll()
 
-                try:
-                    if return_code is None:
-                        return_code = process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            try:
+                if return_code is None:
                     return_code = process.wait(timeout=3)
-            else:
-                warning = f"FFmpeg had already exited with code {return_code}"
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait(timeout=3)
+        else:
+            warning_parts.append(
+                f"FFmpeg had already exited with code {return_code}"
+            )
 
+    with recording_lock:
         _close_process_resources(process)
-        _clear_recording_state()
+        if return_code == 0:
+            _remove_file(raw_file)
+            _remove_file(audio_file)
+            _clear_recording_state()
+            if warning_parts:
+                code = (
+                    "recording_quality_degraded"
+                    if quality and not quality.get("healthy")
+                    else "recording_recovered_with_warning"
+                )
+                _set_last_error_locked(
+                    code,
+                    "; ".join(warning_parts),
+                    recoverable=False,
+                )
+            elif not was_interrupted:
+                # A fully healthy new recording clears errors from earlier runs.
+                last_recording_error = None
+            elif previous_error:
+                last_recording_error = previous_error
+                last_recording_error["recoverable"] = False
+            _persist_recording_state_locked()
+        elif raw_file and os.path.isfile(raw_file):
+            recording_phase = "interrupted"
+            _set_last_error_locked(
+                "recording_finalization_failed",
+                "; ".join(warning_parts) or f"FFmpeg exited with code {return_code}",
+                recoverable=True,
+            )
+            _persist_recording_state_locked()
+        else:
+            _clear_recording_state()
+            _set_last_error_locked(
+                "recording_finalization_failed",
+                "; ".join(warning_parts) or f"FFmpeg exited with code {return_code}",
+                recoverable=False,
+            )
+            _persist_recording_state_locked()
 
-        response = {
-            "status": "recording_stopped",
-            "file": output_file,
-            "returncode": return_code,
-        }
-        if capture_return_code is not None:
-            response["capture_returncode"] = capture_return_code
-        if audio_return_code is not None:
-            response["audio_capture_returncode"] = audio_return_code
-        if warning:
-            response["warning"] = warning
-        return response
+    response = {
+        "status": "recording_stopped",
+        "file": output_file,
+        "returncode": return_code,
+        "recovered": was_interrupted,
+        "recoverable": return_code != 0 and bool(raw_file and os.path.isfile(raw_file)),
+        "audio_recovered": audio_recovered,
+    }
+    if capture_return_code is not None:
+        response["capture_returncode"] = capture_return_code
+    if audio_return_code is not None:
+        response["audio_capture_returncode"] = audio_return_code
+    if quality is not None:
+        response["quality"] = quality
+    if warning_parts:
+        response["warning"] = "; ".join(warning_parts)
+    return response
 
 
 def get_settings():
@@ -700,26 +1276,78 @@ def get_settings():
 
 
 def get_recording_status():
-    video_process = ffmpeg_process or capture_process
-    capture_active = video_process is not None and video_process.poll() is None
-    audio_recording = audio_process is not None and audio_process.poll() is None
-    pending_finalization = (
-        recording_output_file is not None
-        and any(
-            process is not None
-            for process in (ffmpeg_process, capture_process, audio_process)
+    with recording_lock:
+        _restore_recording_state_locked()
+        _refresh_recording_state_locked()
+        video_process = ffmpeg_process or capture_process
+        capture_active = (
+            video_process is not None and video_process.poll() is None
         )
-    )
+        audio_recording = (
+            audio_process is not None and audio_process.poll() is None
+        )
+        recoverable = bool(
+            recording_raw_file and os.path.isfile(recording_raw_file)
+        )
+        active_state = recording_phase in {
+            "starting",
+            "recording",
+            "interrupted",
+            "finalizing",
+        }
+        duration_seconds = _recording_duration_seconds() if active_state else 0.0
+        raw_size = _safe_file_size(recording_raw_file)
+        output_size = _safe_file_size(recording_output_file)
+        audio_size = _safe_file_size(recording_audio_file)
+        phase = recording_phase
+        output_file = recording_output_file
+        camera_device = recording_camera_device
+        video_size = recording_video_size
+        fps = recording_fps
+        capture_format = recording_capture_format
+        error = dict(last_recording_error) if last_recording_error else None
+        audio_device = recording_audio_device
+        audio_lead = recording_audio_lead_seconds
+        audio_enabled_for_recording = recording_audio_file is not None
+
+    os.makedirs(utils.VIDEOS_DIR, exist_ok=True)
+    disk = shutil.disk_usage(utils.VIDEOS_DIR)
+    available_camera = None
+    if platform.system() == "Linux":
+        available_camera = _find_linux_camera_device(timeout=0.0)
+    elif platform.system() == "Windows":
+        available_camera = "video=AT025"
+
     return {
-        "recording": pending_finalization,
+        "status": "ok",
+        "state": phase,
+        "recording": active_state,
         "capture_active": capture_active,
-        "interrupted": pending_finalization and not capture_active,
-        "file": recording_output_file if pending_finalization else None,
+        "interrupted": phase == "interrupted",
+        "finalizing": phase == "finalizing",
+        "recoverable": recoverable,
+        "file": output_file if active_state else None,
+        "duration_seconds": round(duration_seconds, 3),
+        "current_size_bytes": raw_size or output_size,
+        "current_size_mb": round((raw_size or output_size) / (1024 * 1024), 2),
+        "source_size_bytes": raw_size,
+        "audio_size_bytes": audio_size,
+        "free_space_bytes": disk.free,
+        "free_space_gb": round(disk.free / (1024 ** 3), 2),
+        "minimum_free_space_bytes": MIN_RECORDING_FREE_BYTES,
+        "resolution": video_size,
+        "fps": fps,
+        "format": capture_format,
+        "camera": {
+            "available": available_camera is not None,
+            "device": camera_device or available_camera,
+        },
+        "last_error": error,
         "audio": {
-            "enabled": recording_audio_file is not None,
+            "enabled": audio_enabled_for_recording or audio_size > 0,
             "recording": audio_recording,
-            "device": recording_audio_device,
-            "lead_seconds": round(recording_audio_lead_seconds, 6),
+            "device": audio_device,
+            "lead_seconds": round(audio_lead, 6),
         },
     }
 

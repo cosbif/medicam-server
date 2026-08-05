@@ -9,3 +9,6 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+# runtime recordings and hardware-test reports
+videos/
+recording-long-run-report.json

@@ -148,6 +148,22 @@ class RouteSecurityTests(unittest.TestCase):
         token = self._provision()
         self.assertTrue(routes.require_update_auth(self._request(self._headers(token))))
 
+    def test_update_is_rejected_while_recording(self):
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={"recording": True, "state": "recording"},
+        ):
+            with patch("app.routes.updater.apply_update") as apply_mock:
+                with self.assertRaises(HTTPException) as context:
+                    asyncio.run(routes.update_apply(_ok=True))
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(
+            context.exception.detail["code"],
+            "recording_in_progress",
+        )
+        apply_mock.assert_not_called()
+
     def test_provision_status_redacts_private_fields_without_token(self):
         token = self._provision()
 
