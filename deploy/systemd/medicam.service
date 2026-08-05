@@ -1,0 +1,18 @@
+[Unit]
+Description=Medicam FastAPI Backend
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa/medicam-server
+Environment=SUDO_ASKPASS=/bin/true
+Environment=PATH=/home/radxa/medicam-server/medicam-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

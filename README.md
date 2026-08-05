@@ -31,6 +31,30 @@ BLE также включается автоматически, если Wi-Fi �
 ./scripts/install_ble_services.sh
 ```
 
+## Подписанные OTA-обновления
+
+`GET /version` возвращает commit и release backend, версии app/BLE-протоколов,
+версию образа Radxa, ревизию USB-камеры и uptime. `/ping` также содержит полный
+commit для независимого post-restart healthcheck.
+
+Устройство больше не обновляется с `origin/main`. `GET /update/check` видит
+только стабильные теги `medicam-vMAJOR.MINOR.PATCH`, подписанные выделенным
+Ed25519 OTA-ключом. Подпись одновременно подтверждает hash commit. Неподписанные
+и повреждённые теги игнорируются, downgrade запрещён root-owned trust state.
+
+`POST /update/apply` запускает фоновую установку, а `GET /update/status`
+возвращает состояние и прогресс: download, signature verification, install,
+restart, healthcheck и rollback. Внешний root-owned активатор ждёт новый backend
+60 секунд; при ошибке автоматически восстанавливает предыдущий commit,
+зависимости и systemd units. Причина сохраняется и показывается приложением.
+
+Release-процесс и хранение ключа описаны в
+[`docs/ota-release.md`](docs/ota-release.md). Подписанный тег создаётся командой:
+
+```bash
+./scripts/create_ota_release.sh 1.0.0
+```
+
 ## Проверка
 
 ```bash
@@ -62,11 +86,12 @@ medicam-venv/bin/python -m unittest discover -s tests -v
 оно не зависит от номера `/dev/snd/*`. Конкретный вход можно закрепить по его
 стабильному ALSA ID, например `plughw:CARD=HD,DEV=0`.
 
-`scripts/install_server_runtime.sh` устанавливает systemd drop-in с
-`RuntimeDirectory=medicam` и `RuntimeDirectoryPreserve=restart`.
-`/update/apply` запускает его автоматически перед перезапуском backend. PCM в
-RAM поэтому переживает рестарт сервиса; после полного отключения питания raw
-MJPEG всё равно восстанавливается в MP4, но без утраченного RAM-аудио.
+`scripts/install_server_runtime.sh` устанавливает первоначальный systemd
+runtime и независимый OTA-активатор. Дальше signed activator синхронизирует
+drop-in с `RuntimeDirectory=medicam` и `RuntimeDirectoryPreserve=restart` при
+каждом релизе или rollback. PCM в RAM поэтому переживает рестарт сервиса; после
+полного отключения питания raw MJPEG всё равно восстанавливается в MP4, но без
+утраченного RAM-аудио.
 
 ## Надёжность записи
 

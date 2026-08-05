@@ -1,0 +1,16 @@
+[Unit]
+Description=Medicam BLE Wi-Fi Provisioning
+After=bluetooth.service NetworkManager.service
+Wants=bluetooth.service NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/radxa/medicam-server
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/python3 /home/radxa/medicam-server/app/bluetooth_provision.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

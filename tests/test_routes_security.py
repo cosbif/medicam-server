@@ -83,6 +83,7 @@ class RouteSecurityTests(unittest.TestCase):
             "/storage",
             "/storage/policy",
             "/storage/cleanup",
+            "/version",
             "/settings",
             "/audio/devices",
             "/audio/test",
@@ -95,6 +96,7 @@ class RouteSecurityTests(unittest.TestCase):
         update_paths = {
             "/update/check",
             "/update/apply",
+            "/update/status",
         }
 
         route_by_path = {route.path: route for route in routes.router.routes}
@@ -157,7 +159,7 @@ class RouteSecurityTests(unittest.TestCase):
             "app.routes.camera.get_recording_status",
             return_value={"recording": True, "state": "recording"},
         ):
-            with patch("app.routes.updater.apply_update") as apply_mock:
+            with patch("app.routes.updater.start_update") as apply_mock:
                 with self.assertRaises(HTTPException) as context:
                     asyncio.run(routes.update_apply(_ok=True))
 
@@ -195,12 +197,12 @@ class RouteSecurityTests(unittest.TestCase):
             },
         ):
             with patch(
-                "app.routes.updater.apply_update",
-                return_value={"ok": True, "step": "done"},
+                "app.routes.updater.start_update",
+                return_value={"state": "queued", "job_id": "test"},
             ) as apply_mock:
                 response = asyncio.run(routes.update_apply(_ok=True))
 
-        self.assertTrue(response["ok"])
+        self.assertEqual(response["state"], "queued")
         apply_mock.assert_called_once_with()
 
     def test_provision_status_redacts_private_fields_without_token(self):

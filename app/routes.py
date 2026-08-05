@@ -2,7 +2,7 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from app import audio, camera, storage_manager, utils, updater
+from app import audio, camera, storage_manager, utils, updater, version_info
 import ipaddress
 import math
 import os
@@ -10,7 +10,6 @@ import platform
 import socket
 import subprocess
 from typing import Literal
-from app.updater import check_for_update, apply_update
 
 BLE_SERVICE = "medicam-ble.service"
 AUTH_HEADER = "x-medicam-token"
@@ -96,7 +95,13 @@ async def ping():
         "status": "ok",
         "service": "medicam",
         "hostname": socket.gethostname(),
+        **version_info.get_ping_version(),
     }
+
+
+@router.get("/version")
+async def version(_ok: bool = Depends(require_api_auth)):
+    return version_info.get_version_info()
 
 # -------------------
 # 📼 Запись
@@ -592,22 +597,21 @@ async def provision_reset(request: Request):
     }
 
 # -------------------
-# 🔄 OTA UPDATE (git pull)
+# 🔄 SIGNED OTA UPDATE
 # -------------------
 
 @router.get("/update/check")
 async def update_check(_ok: bool = Depends(require_update_auth)):
-    """
-    Возвращает текущий и удалённый git commit.
-    """
     return updater.check_for_update()
+
+
+@router.get("/update/status")
+async def update_status(_ok: bool = Depends(require_update_auth)):
+    return updater.get_update_status()
 
 
 @router.post("/update/apply")
 async def update_apply(_ok: bool = Depends(require_update_auth)):
-    """
-    Выполняет git pull (fetch + reset) и перезапуск сервиса.
-    """
     recording = camera.get_recording_status()
     if recording.get("capture_active") or recording.get("state") in {
         "starting",
@@ -622,8 +626,10 @@ async def update_apply(_ok: bool = Depends(require_update_auth)):
                 "message": "Stop or recover the current recording before updating",
             },
         )
-    result = updater.apply_update()
-    if not result["ok"]:
-        raise HTTPException(status_code=500, detail=result)
-
-    return result
+    try:
+        return updater.start_update()
+    except updater.UpdateBusyError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "message": error.message},
+        ) from error

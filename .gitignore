@@ -12,4 +12,7 @@ __pycache__/
 # runtime recordings and hardware-test reports
 videos/
 recording-long-run-report.json
+recording-long-run-*.json
 storage_policy.json
+.github_token
+update_debug.log

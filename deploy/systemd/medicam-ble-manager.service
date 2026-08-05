@@ -1,0 +1,16 @@
+[Unit]
+Description=Medicam BLE Provisioning Manager
+After=NetworkManager.service bluetooth.service
+Wants=NetworkManager.service bluetooth.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/radxa/medicam-server
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/python3 /home/radxa/medicam-server/app/manage_ble.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
