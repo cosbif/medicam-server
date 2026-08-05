@@ -1051,6 +1051,10 @@ def perform(previous: str, target: str, tag: str) -> None:
             target_commit=target,
             target_tag=tag,
         )
+        # Repeat dependency installation from root-owned, signed release bytes.
+        # This is idempotent and makes activation independent of the lifetime
+        # of the old sandboxed backend process.
+        install_python_requirements(target_release)
         # The schedule command may still be running an older helper that does
         # not know how to create TLS identity or the root-owned BLE runtime.
         # Reinstalling from the verified materialized commit here makes the

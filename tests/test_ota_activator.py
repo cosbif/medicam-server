@@ -134,6 +134,8 @@ class OtaActivatorTests(unittest.TestCase):
         ), patch.object(
             activate, "install_release_assets"
         ), patch.object(
+            activate, "install_python_requirements"
+        ), patch.object(
             activate, "wait_for_health", return_value=(True, "")
         ) as health, patch.object(
             activate, "write_trust_state"
