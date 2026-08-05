@@ -734,6 +734,21 @@ def _refresh_recording_state_locked():
         )
         _stop_capture_process(audio_process)
         return
+    try:
+        disk_free = shutil.disk_usage(utils.VIDEOS_DIR).free
+    except OSError:
+        disk_free = MIN_RECORDING_FREE_BYTES
+    finalization_reserve = (
+        _safe_file_size(recording_raw_file) + MIN_RECORDING_FREE_BYTES
+    )
+    if disk_free < finalization_reserve:
+        _mark_interrupted_locked(
+            "storage_reserve_reached",
+            "Recording stopped before the disk space required for MP4 finalization was exhausted",
+        )
+        _stop_capture_process(video_process)
+        _stop_capture_process(audio_process)
+        return
     if recording_audio_file is not None:
         if audio_process is None:
             _mark_interrupted_locked(
@@ -1410,6 +1425,9 @@ def get_recording_status():
         "free_space_bytes": disk.free,
         "free_space_gb": round(disk.free / (1024 ** 3), 2),
         "minimum_free_space_bytes": MIN_RECORDING_FREE_BYTES,
+        "required_finalization_space_bytes": (
+            raw_size + MIN_RECORDING_FREE_BYTES if active_state else 0
+        ),
         "resolution": video_size,
         "fps": fps,
         "format": capture_format,

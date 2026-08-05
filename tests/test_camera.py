@@ -429,6 +429,31 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertEqual(camera.last_recording_error["code"], "video_capture_exited")
         stop_mock.assert_called_once_with(microphone)
 
+    @patch("app.camera.shutil.disk_usage", return_value=Mock(free=0))
+    @patch("app.camera._stop_capture_process")
+    def test_storage_reserve_stops_capture_before_remux_space_is_lost(
+        self,
+        stop_mock,
+        _disk_usage,
+    ):
+        video = Mock()
+        video.poll.return_value = None
+        camera.capture_process = video
+        camera.recording_phase = "recording"
+        camera.recording_output_file = "videos/storage.mp4"
+        camera.recording_raw_file = "videos/storage.mp4.mjpeg"
+        with open(camera.recording_raw_file, "wb") as raw:
+            raw.write(b"frame")
+
+        camera._refresh_recording_state_locked()
+
+        self.assertEqual(camera.recording_phase, "interrupted")
+        self.assertEqual(
+            camera.last_recording_error["code"],
+            "storage_reserve_reached",
+        )
+        stop_mock.assert_any_call(video)
+
     @patch("app.camera.glob.glob")
     @patch("app.camera._is_character_device", return_value=True)
     def test_camera_discovery_prefers_stable_by_id_capture_link(
