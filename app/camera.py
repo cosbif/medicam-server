@@ -422,6 +422,18 @@ def _safe_file_size(path: str | None):
         return 0
 
 
+def _wait_for_first_capture_byte(path: str, process, launched_at: float):
+    """Return the closest observable timestamp to the first captured frame."""
+    deadline = launched_at + FFMPEG_STARTUP_DELAY
+    while time.monotonic() < deadline:
+        if _safe_file_size(path) > 0:
+            return time.monotonic()
+        if process.poll() is not None:
+            break
+        time.sleep(0.01)
+    return launched_at
+
+
 def _recording_duration_seconds():
     if recording_started_at_monotonic is not None:
         return max(0.0, time.monotonic() - recording_started_at_monotonic)
@@ -915,7 +927,12 @@ def start_recording():
                     stdout=subprocess.DEVNULL,
                     stderr=ffmpeg_log_file,
                 )
-                video_started_at = time.monotonic()
+                capture_launched_at = time.monotonic()
+                video_started_at = _wait_for_first_capture_byte(
+                    raw_file,
+                    capture_process,
+                    capture_launched_at,
+                )
                 if audio_command:
                     recording_audio_lead_seconds = max(
                         0.0,
@@ -982,7 +999,10 @@ def start_recording():
                 "details": str(error),
             }
 
-        time.sleep(FFMPEG_STARTUP_DELAY)
+        # _wait_for_first_capture_byte already covers the startup observation
+        # window on Linux. Windows still needs the original stability delay.
+        if not capture_command:
+            time.sleep(FFMPEG_STARTUP_DELAY)
         capture_return_code = (
             capture_process.poll()
             if capture_process is not None
