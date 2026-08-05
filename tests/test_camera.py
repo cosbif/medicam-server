@@ -75,6 +75,13 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
+    def test_mjpeg_frame_counter_uses_jpeg_start_markers(self):
+        with tempfile.NamedTemporaryFile() as raw:
+            raw.write(b"\xff\xd8frame-a\xff\xd9\xff\xd8frame-b\xff\xd9")
+            raw.flush()
+
+            self.assertEqual(camera._count_mjpeg_frames(raw.name), 2)
+
     def test_audio_temp_file_uses_memory_backed_storage(self):
         with patch.object(camera, "AUDIO_TEMP_DIR", "/run/medicam"):
             with patch("app.camera.os.path.isdir", return_value=True):

@@ -21,6 +21,7 @@ SETTINGS_FILE = "camera_settings.json"
 FFMPEG_LOG_FILE = "ffmpeg.log"
 CAMERA_DISCOVERY_TIMEOUT = 3.0
 FFMPEG_STARTUP_DELAY = 1.0
+CAPTURE_START_OBSERVATION_TIMEOUT = 3.0
 FFMPEG_STOP_TIMEOUT = 10.0
 FFMPEG_REMUX_TIMEOUT = 180.0
 AUDIO_OPEN_ATTEMPTS = 8
@@ -422,12 +423,35 @@ def _safe_file_size(path: str | None):
         return 0
 
 
-def _wait_for_first_capture_byte(path: str, process, launched_at: float):
+def _count_mjpeg_frames(path: str):
+    count = 0
+    previous = b""
+    try:
+        with open(path, "rb") as raw_file:
+            while chunk := raw_file.read(1024 * 1024):
+                data = previous + chunk
+                count += data.count(b"\xff\xd8")
+                previous = data[-1:]
+    except OSError:
+        return 0
+    return count
+
+
+def _wait_for_first_capture_byte(
+    path: str,
+    process,
+    launched_at: float,
+    fps: float,
+):
     """Return the closest observable timestamp to the first captured frame."""
-    deadline = launched_at + FFMPEG_STARTUP_DELAY
+    deadline = launched_at + CAPTURE_START_OBSERVATION_TIMEOUT
     while time.monotonic() < deadline:
         if _safe_file_size(path) > 0:
-            return time.monotonic()
+            frames = _count_mjpeg_frames(path)
+            observed_at = time.monotonic()
+            if frames > 0 and fps > 0:
+                return max(launched_at, observed_at - (frames / fps))
+            return observed_at
         if process.poll() is not None:
             break
         time.sleep(0.01)
@@ -932,6 +956,7 @@ def start_recording():
                     raw_file,
                     capture_process,
                     capture_launched_at,
+                    float(fps),
                 )
                 if audio_command:
                     recording_audio_lead_seconds = max(
