@@ -1,13 +1,16 @@
 '''app/routes.py'''
-from fastapi import APIRouter, HTTPException, Form, Depends, Request
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Query, Request
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from app import audio, camera, utils, updater
 import ipaddress
+import math
 import os
 import shutil
 import platform
 import socket
 import subprocess
+from typing import Literal
 from app.updater import check_for_update, apply_update
 
 BLE_SERVICE = "medicam-ble.service"
@@ -116,19 +119,144 @@ def recording_status(_ok: bool = Depends(require_api_auth)):
 # -------------------
 # 🎞 Управление видео
 # -------------------
+class DeleteVideosRequest(BaseModel):
+    filenames: list[str] = Field(min_length=1, max_length=100)
+
+
+def _video_sort_value(video: dict, sort: str):
+    if sort == "filename":
+        return str(video.get("filename", "")).lower()
+    if sort == "size":
+        return int(video.get("size_bytes", 0) or 0)
+    if sort == "duration":
+        return float(video.get("duration", 0) or 0)
+    if sort == "fps":
+        return float(video.get("fps", 0) or 0)
+    return str(video.get("created_at", ""))
+
+
+def _public_video_entry(video: dict) -> dict:
+    public_fields = {
+        "filename",
+        "size_bytes",
+        "size_mb",
+        "created_at",
+        "mtime_ns",
+        "metadata_status",
+        "thumbnail_ready",
+        "resolution",
+        "fps",
+        "duration",
+        "has_audio",
+        "audio_codec",
+        "audio_channels",
+        "audio_sample_rate",
+    }
+    return {key: value for key, value in video.items() if key in public_fields}
+
+
+def _ensure_library_mutation_allowed():
+    status = camera.get_recording_status()
+    if status.get("recording") or status.get("state") == "finalizing":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "recording_in_progress"},
+        )
+
+
 @router.get("/videos")
-async def list_videos(_ok: bool = Depends(require_api_auth)):
-    videos = utils.list_videos()
-    video_info = []
-    for f in videos:
-        path = utils.get_video_path(f)
-        meta = utils.get_video_metadata(path)
-        video_info.append({
-            "filename": f,
-            "size_mb": round(os.path.getsize(path) / (1024*1024), 2),
-            **meta
-        })
-    return {"videos": video_info}
+async def list_videos(
+    background_tasks: BackgroundTasks,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort: Literal["created_at", "filename", "size", "duration", "fps"] = "created_at",
+    order: Literal["asc", "desc"] = "desc",
+    refresh: bool = False,
+    _ok: bool = Depends(require_api_auth),
+):
+    videos = utils.scan_video_library(force_reload=refresh)
+    videos.sort(
+        key=lambda item: _video_sort_value(item, sort),
+        reverse=order == "desc",
+    )
+    total = len(videos)
+    total_pages = math.ceil(total / page_size) if total else 0
+    start = (page - 1) * page_size
+    page_videos = videos[start:start + page_size]
+    pending_names = [
+        item["filename"]
+        for item in page_videos
+        if item.get("metadata_status") == "loading"
+    ]
+    claimed = utils.claim_video_metadata_work(pending_names)
+    if claimed:
+        background_tasks.add_task(utils.populate_video_metadata, claimed)
+
+    return {
+        "videos": [_public_video_entry(video) for video in page_videos],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+        },
+        "sort": {"field": sort, "order": order},
+        "metadata_pending": len(pending_names),
+    }
+
+
+@router.get("/videos/{filename}/thumbnail")
+def get_video_thumbnail(filename: str, _ok: bool = Depends(require_api_auth)):
+    try:
+        filepath = utils.get_video_path(filename)
+        thumbnail = utils.get_video_thumbnail_path(filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_video_filename")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not thumbnail:
+        raise HTTPException(status_code=404, detail="thumbnail_not_available")
+    return FileResponse(
+        path=thumbnail,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
+def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
+    value = (range_header or "").strip().lower()
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("invalid_range")
+    start_text, separator, end_text = value[6:].partition("-")
+    if not separator or (not start_text and not end_text):
+        raise ValueError("invalid_range")
+
+    if not start_text:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise ValueError("invalid_range")
+        start = max(0, file_size - suffix_length)
+        end = file_size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+        end = min(end, file_size - 1)
+    if start < 0 or end < start or start >= file_size:
+        raise ValueError("invalid_range")
+    return start, end
+
+
+def _iter_file_range(filepath: str, start: int, end: int):
+    remaining = end - start + 1
+    with open(filepath, "rb") as source:
+        source.seek(start)
+        while remaining > 0:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
 
 @router.get("/videos/{filename}")
 async def get_video(filename: str, request: Request, _ok: bool = Depends(require_api_auth)):
@@ -143,40 +271,34 @@ async def get_video(filename: str, request: Request, _ok: bool = Depends(require
     range_header = request.headers.get("range")
 
     if range_header:
-        # Пример: Range: bytes=0-1023
         try:
-            range_value = range_header.strip().lower().replace("bytes=", "")
-            start, end = range_value.split("-") if "-" in range_value else (0, "")
-            start = int(start) if start else 0
-            end = int(end) if end else file_size - 1
-            end = min(end, file_size - 1)
-            if start < 0 or end < start or start >= file_size:
-                raise ValueError
-        except ValueError:
+            start, end = _parse_byte_range(range_header, file_size)
+        except (TypeError, ValueError):
             raise HTTPException(status_code=416, detail="invalid_range")
-
-        with open(filepath, "rb") as f:
-            f.seek(start)
-            data = f.read(end - start + 1)
 
         headers = {
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(end - start + 1),
-            "Content-Type": "video/mp4",
+            "Cache-Control": "private, no-cache",
         }
-        return Response(content=data, status_code=206, headers=headers)
+        return StreamingResponse(
+            _iter_file_range(filepath, start, end),
+            status_code=206,
+            media_type="video/mp4",
+            headers=headers,
+        )
 
-    # Без Range-запроса (например Android)
-    with open(filepath, "rb") as f:
-        data = f.read()
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(file_size),
-        "Content-Type": "video/mp4",
-    }
-    return Response(content=data, headers=headers)
+    # FileResponse streams in bounded chunks and also supports Range requests
+    # in current Starlette versions, avoiding a full multi-gigabyte MP4 read.
+    return FileResponse(
+        path=filepath,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, no-cache",
+        },
+    )
 
 
 @router.get("/download/{filename}")
@@ -191,6 +313,7 @@ async def download_video(filename: str, _ok: bool = Depends(require_api_auth)):
 
 @router.delete("/delete/{filename}")
 async def delete_video(filename: str, _ok: bool = Depends(require_api_auth)):
+    _ensure_library_mutation_allowed()
     try:
         filepath = utils.get_video_path(filename)
     except ValueError:
@@ -198,16 +321,48 @@ async def delete_video(filename: str, _ok: bool = Depends(require_api_auth)):
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
     os.remove(filepath)
+    utils.invalidate_video_cache(filename)
     return {"status": "deleted", "file": filename}
+
+
+@router.post("/videos/delete")
+async def delete_videos(
+    request: DeleteVideosRequest,
+    _ok: bool = Depends(require_api_auth),
+):
+    _ensure_library_mutation_allowed()
+    filenames = list(dict.fromkeys(request.filenames))
+    if not filenames or len(filenames) > 100:
+        raise HTTPException(status_code=400, detail="invalid_video_selection")
+
+    paths = []
+    for filename in filenames:
+        try:
+            paths.append((filename, utils.get_video_path(filename)))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_video_filename")
+
+    deleted = []
+    missing = []
+    for filename, filepath in paths:
+        if not os.path.exists(filepath):
+            missing.append(filename)
+            continue
+        os.remove(filepath)
+        utils.invalidate_video_cache(filename)
+        deleted.append(filename)
+    return {"status": "deleted", "files": deleted, "missing": missing}
 
 @router.delete("/videos/clear")
 async def clear_all_videos(_ok: bool = Depends(require_api_auth)):
+    _ensure_library_mutation_allowed()
     folder = utils.VIDEOS_DIR
     deleted = []
     if os.path.exists(folder):
         for f in utils.list_videos():
             path = utils.get_video_path(f)
             os.remove(path)
+            utils.invalidate_video_cache(f)
             deleted.append(f)
     return {"status": "all_deleted", "files": deleted}
 

@@ -137,7 +137,13 @@ class ProvisionFileTests(unittest.TestCase):
         self.assertNotIn("factory", first.lower())
         self.assertTrue(utils.get_device_name().startswith("Medicam-"))
     def test_get_video_path_rejects_traversal_and_non_video_names(self):
-        for filename in ("../secret.mp4", "nested/file.mp4", "clip.mjpeg", ""):
+        for filename in (
+            "../secret.mp4",
+            "nested/file.mp4",
+            "clip.mjpeg",
+            "a" * 256 + ".mp4",
+            "",
+        ):
             with self.subTest(filename=filename):
                 with self.assertRaises(ValueError):
                     utils.get_video_path(filename)

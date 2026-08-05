@@ -74,7 +74,9 @@ class RouteSecurityTests(unittest.TestCase):
             "/stop",
             "/recording/status",
             "/videos",
+            "/videos/{filename}/thumbnail",
             "/videos/{filename}",
+            "/videos/delete",
             "/download/{filename}",
             "/delete/{filename}",
             "/videos/clear",
@@ -275,7 +277,14 @@ class RouteSecurityTests(unittest.TestCase):
             )
         )
         self.assertEqual(partial.status_code, 206)
-        self.assertEqual(partial.body, b"2345")
+
+        async def read_stream():
+            chunks = []
+            async for chunk in partial.body_iterator:
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        self.assertEqual(asyncio.run(read_stream()), b"2345")
 
 
 if __name__ == "__main__":
