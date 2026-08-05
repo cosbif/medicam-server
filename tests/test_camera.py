@@ -88,7 +88,7 @@ class CameraCommandTests(unittest.TestCase):
             "/run/medicam/medicam-12-00-00_01.01.2026.mp4.pcm",
         )
 
-    def test_linux_capture_command_streams_camera_mjpeg_with_v4l2_ctl(self):
+    def test_linux_capture_command_streams_camera_mjpeg_with_ffmpeg(self):
         command = camera._build_linux_capture_command(
             "1920x1080",
             "30",
@@ -96,14 +96,17 @@ class CameraCommandTests(unittest.TestCase):
             "/dev/v4l/by-id/camera-video-index0",
         )
 
-        self.assertEqual(command[0], "v4l2-ctl")
-        self.assertIn("--silent", command)
-        self.assertIn("-d", command)
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("-thread_queue_size", command)
+        self.assertEqual(
+            command[command.index("-thread_queue_size") + 1],
+            camera.LINUX_INPUT_QUEUE_SIZE,
+        )
         self.assertIn("/dev/v4l/by-id/camera-video-index0", command)
-        self.assertIn("--set-fmt-video=width=1920,height=1080,pixelformat=MJPG", command)
-        self.assertIn("--set-parm=30", command)
-        self.assertIn("--stream-mmap=8", command)
-        self.assertIn("--stream-to=videos/test.mp4.mjpeg", command)
+        self.assertIn("1920x1080", command)
+        self.assertIn("30", command)
+        self.assertIn("videos/test.mp4.mjpeg", command)
+        self.assertIn("copy", command)
 
     def test_linux_ffmpeg_command_remuxes_mjpeg_file_without_reencoding(self):
         command = camera._build_linux_command(

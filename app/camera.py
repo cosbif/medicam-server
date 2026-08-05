@@ -60,7 +60,7 @@ LEGACY_RESOLUTION_MAP = {
 
 SUPPORTED_FPS = {"30"}
 LEGACY_FPS_MAP = {"15": "30", "60": "30"}
-LINUX_V4L2_BUFFER_COUNT = "8"
+LINUX_INPUT_QUEUE_SIZE = "1024"
 
 capture_process = None
 audio_process = None
@@ -164,11 +164,6 @@ def _find_linux_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
         time.sleep(0.25)
 
 
-def _split_video_size(video_size: str):
-    width, height = video_size.split("x", maxsplit=1)
-    return width, height
-
-
 def _build_audio_temp_file(output_file: str):
     # PCM is tiny compared with FullHD MJPEG but frequent synchronous writes to
     # the same microSD can starve ALSA for several seconds. systemd creates the
@@ -186,16 +181,27 @@ def _build_linux_capture_command(
     raw_file: str,
     camera_device: str,
 ):
-    width, height = _split_video_size(video_size)
-
     return [
-        "v4l2-ctl",
-        "--silent",
-        "-d", camera_device,
-        f"--set-fmt-video=width={width},height={height},pixelformat=MJPG",
-        f"--set-parm={fps}",
-        f"--stream-mmap={LINUX_V4L2_BUFFER_COUNT}",
-        f"--stream-to={raw_file}",
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostats",
+        "-y",
+        # v4l2-ctl loses large groups of buffers with this UVC device behind
+        # the Type-C hub. FFmpeg's dedicated v4l2 reader sustained exactly
+        # 900/900 frames in the same 30-second FullHD microSD test.
+        "-thread_queue_size", LINUX_INPUT_QUEUE_SIZE,
+        "-f", "v4l2",
+        "-input_format", "mjpeg",
+        "-framerate", fps,
+        "-video_size", video_size,
+        "-i", camera_device,
+        "-map", "0:v:0",
+        "-c:v", "copy",
+        "-an",
+        "-f", "mjpeg",
+        "-flush_packets", "1",
+        raw_file,
     ]
 
 
@@ -232,7 +238,7 @@ def _build_linux_command(
     command.extend([
         "-map", "0:v:0",
         # The UVC camera already produces compressed MJPEG. FFmpeg only remuxes
-        # the raw v4l2-ctl capture into MP4; it does not decode or re-encode.
+        # the raw V4L2 MJPEG capture into MP4; it does not decode or re-encode.
         "-c:v", "copy",
     ])
     if audio_file:
@@ -538,7 +544,9 @@ def _restore_recording_state_locked():
         recording_camera_device = saved.get("camera_device")
         recording_video_size = saved.get("video_size") or "1920x1080"
         recording_fps = str(saved.get("fps") or "30")
-        recording_capture_format = saved.get("capture_format") or "v4l2_mjpeg_raw"
+        recording_capture_format = (
+            saved.get("capture_format") or "ffmpeg_v4l2_mjpeg_raw"
+        )
         recording_remux_command = _build_linux_command(
             raw_file,
             recording_fps,
@@ -844,7 +852,7 @@ def start_recording():
                 output_file,
                 audio_file=audio_file,
             )
-            capture_format = "v4l2_mjpeg_raw"
+            capture_format = "ffmpeg_v4l2_mjpeg_raw"
         elif system == "Windows":
             camera_device = "video=AT025"
             raw_file = None
@@ -903,6 +911,7 @@ def start_recording():
                     )
                 capture_process = subprocess.Popen(
                     capture_command,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=ffmpeg_log_file,
                 )
@@ -1102,7 +1111,7 @@ def stop_recording():
                 f"Video capture ended before stop (code {capture_return_code})"
             )
             was_interrupted = True
-        elif capture_return_code not in (None, 0, -signal.SIGINT):
+        elif capture_return_code not in (None, 0, 255, -signal.SIGINT):
             warning_parts.append(
                 f"Video capture exited with code {capture_return_code}"
             )
