@@ -135,11 +135,24 @@ def _run_one(base_url, token, duration, poll_interval):
     if not video_path.is_file():
         raise RuntimeError(f"output file is missing: {video_path}")
 
-    probe = _probe(video_path)
+    server_quality = stopped.get("quality") or {}
+    if (
+        server_quality.get("valid")
+        and server_quality.get("frame_count") is not None
+    ):
+        # /stop already performs a full ffprobe -count_frames validation. Reuse
+        # that canonical result instead of decoding a long MJPEG file twice.
+        probe = {
+            "duration_seconds": float(server_quality["duration_seconds"]),
+            "frames": int(server_quality["frame_count"]),
+            "avg_fps": float(server_quality["avg_fps"]),
+            "resolution": server_quality.get("resolution", ""),
+        }
+    else:
+        probe = _probe(video_path)
     expected_frames = round(duration * FPS)
     missing_frames = max(0, expected_frames - probe["frames"])
     delivery = min(1.0, probe["frames"] / expected_frames)
-    server_quality = stopped.get("quality") or {}
     passed = (
         probe["resolution"] == "1920x1080"
         and probe["avg_fps"] >= MIN_AVG_FPS
