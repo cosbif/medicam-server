@@ -120,6 +120,21 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(list(Path(self.tmp.name).glob(".medicam-self-test-*")), [])
 
+    def test_audio_probe_transport_status_does_not_override_test_outcome(self):
+        measured = {
+            "status": "ok",
+            "device": {"id": "plughw:CARD=HD,DEV=0"},
+            "signal_detected": True,
+            "rms_dbfs": -35.0,
+        }
+        with patch("app.diagnostics.camera.get_settings", return_value={}), patch(
+            "app.diagnostics.audio.measure_audio_level", return_value=measured
+        ):
+            result = diagnostics._audio_test()
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["rms_dbfs"], -35.0)
+
 
 if __name__ == "__main__":
     unittest.main()

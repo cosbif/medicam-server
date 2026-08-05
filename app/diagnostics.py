@@ -349,12 +349,14 @@ def end_recording_start() -> None:
         _HARDWARE_OPERATION_LOCK.release()
 
 
-def _test_result(name: str, status: str, started: float, **fields) -> dict:
+def _test_result(name: str, outcome: str, started: float, **fields) -> dict:
     return {
         "name": name,
-        "status": status,
-        "duration_ms": round((time.monotonic() - started) * 1000),
         **fields,
+        # Nested probes may expose their own transport-level status="ok".
+        # The normalized self-test outcome must remain passed/warning/failed.
+        "status": outcome,
+        "duration_ms": round((time.monotonic() - started) * 1000),
     }
 
 
