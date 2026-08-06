@@ -267,11 +267,13 @@ class RouteSecurityTests(unittest.TestCase):
     def test_authenticated_owner_can_open_recovery_window(self):
         token = self._provision()
 
-        result = asyncio.run(routes.provision_recovery_start(120, _ok=True))
+        with patch("app.routes.utils.request_ble_refresh") as refresh:
+            result = asyncio.run(routes.provision_recovery_start(120, _ok=True))
 
         self.assertEqual(result["status"], "recovery_started")
         self.assertEqual(result["ble_start"]["status"], "requested")
         self.assertTrue(utils.is_ble_recovery_active())
+        refresh.assert_called_once_with()
 
         stopped = asyncio.run(routes.provision_recovery_stop(_ok=True))
         self.assertEqual(stopped["status"], "recovery_stopped")
@@ -282,14 +284,16 @@ class RouteSecurityTests(unittest.TestCase):
     def test_owner_reset_revokes_token_and_reopens_ble(self):
         token = self._provision()
 
-        result = asyncio.run(
-            routes.provision_reset(self._request(self._headers(token)))
-        )
+        with patch("app.routes.utils.request_ble_refresh") as refresh:
+            result = asyncio.run(
+                routes.provision_reset(self._request(self._headers(token)))
+            )
 
         self.assertEqual(result["status"], "reset")
         self.assertFalse(utils.is_provisioned())
         self.assertFalse(utils.verify_api_token(token))
         self.assertEqual(result["ble_restart"]["status"], "requested")
+        refresh.assert_called_once_with()
 
     def test_video_endpoints_reject_bad_names_and_authorize_streaming(self):
         token = self._provision()

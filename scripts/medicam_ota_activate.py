@@ -66,6 +66,12 @@ SYSTEMD_ASSETS = {
     "medicam-ota-request.service": Path(
         "/etc/systemd/system/medicam-ota-request.service"
     ),
+    "medicam-ble-refresh.path": Path(
+        "/etc/systemd/system/medicam-ble-refresh.path"
+    ),
+    "medicam-ble-refresh.service": Path(
+        "/etc/systemd/system/medicam-ble-refresh.service"
+    ),
 }
 REQUIRED_SYSTEMD_ASSETS = {
     "medicam.service",
@@ -922,6 +928,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
         ]
     )
     run(["/bin/systemctl", "enable", "--now", "medicam-ota.path"])
+    run(["/bin/systemctl", "enable", "--now", "medicam-ble-refresh.path"])
 
 
 def reset_checkout(commit: str) -> None:

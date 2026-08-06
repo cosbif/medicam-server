@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for authenticated Medicam BLE refresh requests
+
+[Path]
+PathExists=/var/lib/medicam/ble-refresh.request
+Unit=medicam-ble-refresh.service
+
+[Install]
+WantedBy=multi-user.target

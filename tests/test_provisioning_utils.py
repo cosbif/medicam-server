@@ -184,6 +184,20 @@ class ProvisionFileTests(unittest.TestCase):
                 utils.set_provisioned(True, {"ssid": "Office"})
                 self.assertFalse(utils.is_ble_recovery_active())
 
+    def test_ble_refresh_signal_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = Path(tmp) / "ble-refresh.request"
+            target = Path(tmp) / "target"
+            target.write_text("do-not-touch", encoding="utf-8")
+            request.symlink_to(target)
+
+            with patch.object(utils, "BLE_REFRESH_REQUEST_FILE", request):
+                utils.request_ble_refresh()
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "do-not-touch")
+            self.assertFalse(request.is_symlink())
+            self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+
     def test_device_identity_is_stable_and_not_raw_machine_id(self):
         with patch.dict("os.environ", {"MEDICAM_DEVICE_ID": "factory-secret"}):
             first = utils.get_device_id()
@@ -280,22 +294,11 @@ class BleManagerTests(unittest.TestCase):
             ],
         )
 
-    def test_new_recovery_window_restarts_active_ble_to_clear_stale_gatt(self):
+    def test_active_required_ble_is_not_restarted_by_polling_manager(self):
         with patch("app.manage_ble.systemctl", return_value=True) as control:
             reconcile_ble_service(
                 should_run=True,
                 status="active",
-                recovery_changed=True,
-            )
-
-        control.assert_called_once_with("restart")
-
-    def test_existing_recovery_window_does_not_restart_ble_repeatedly(self):
-        with patch("app.manage_ble.systemctl", return_value=True) as control:
-            reconcile_ble_service(
-                should_run=True,
-                status="active",
-                recovery_changed=False,
             )
 
         control.assert_not_called()

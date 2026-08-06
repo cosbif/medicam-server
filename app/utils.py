@@ -25,6 +25,12 @@ VIDEO_THUMBNAILS_DIRNAME = ".thumbnails"
 DEFAULT_BLE_RECOVERY_SECONDS = 10 * 60
 MAX_BLE_RECOVERY_SECONDS = 30 * 60
 BOOT_PAIRING_WINDOW_SECONDS = 5 * 60
+BLE_REFRESH_REQUEST_FILE = Path(
+    os.environ.get(
+        "MEDICAM_BLE_REFRESH_REQUEST_FILE",
+        "/var/lib/medicam/ble-refresh.request",
+    )
+)
 MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
 PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
 TLS_CERT_FILE = Path("/etc/medicam/tls/cert.pem")
@@ -982,6 +988,47 @@ def start_ble_recovery(duration_seconds: int = DEFAULT_BLE_RECOVERY_SECONDS) -> 
         remove=(),
     )
     return expires_at.isoformat()
+
+
+def request_ble_refresh() -> None:
+    """Atomically signal the fixed root-owned systemd.path BLE restart."""
+    path = BLE_REFRESH_REQUEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = _open_provision_directory(path)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii", closefd=False) as output:
+            output.write(f"refresh-requested-at={datetime.now(timezone.utc).isoformat()}\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
 
 
 def stop_ble_recovery():

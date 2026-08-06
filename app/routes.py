@@ -610,6 +610,7 @@ async def provision_recovery_start(
     _ok: bool = Depends(require_api_auth),
 ):
     expires_at = utils.start_ble_recovery(duration_seconds)
+    utils.request_ble_refresh()
     return {
         "status": "recovery_started",
         "expires_at": expires_at,
@@ -634,6 +635,7 @@ async def provision_reset(request: Request):
         raise HTTPException(status_code=401, detail="invalid_api_token")
     # Rotate ownership credentials and expose BLE for the next owner.
     utils.set_provisioned(False, {})
+    utils.request_ble_refresh()
     return {
         "status": "reset",
         "ble_restart": {"ok": True, "status": "requested"},
