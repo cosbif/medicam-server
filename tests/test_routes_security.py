@@ -74,6 +74,7 @@ class RouteSecurityTests(unittest.TestCase):
             "/stop",
             "/recording/status",
             "/preview/status",
+            "/preview/stream",
             "/videos",
             "/videos/{filename}/thumbnail",
             "/videos/{filename}",
@@ -126,22 +127,6 @@ class RouteSecurityTests(unittest.TestCase):
 
             self.assertIn("require_update_auth", dependency_names)
 
-        self.assertIn("/preview/ws", route_by_path)
-
-    def test_preview_websocket_rejects_missing_token_before_accepting(self):
-        websocket = Mock()
-        websocket.headers = {}
-        websocket.close = Mock(return_value=None)
-
-        async def close(**kwargs):
-            websocket.closed_with = kwargs
-
-        websocket.close = close
-        with patch("app.routes.utils.is_provisioned", return_value=True):
-            asyncio.run(routes.preview_websocket(websocket))
-
-        self.assertEqual(websocket.closed_with["code"], 4401)
-        self.assertEqual(websocket.closed_with["reason"], "invalid_api_token")
 
     def test_auth_dependency_rejects_unprovisioned_devices(self):
         with self.assertRaises(HTTPException) as context:
@@ -198,6 +183,28 @@ class RouteSecurityTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as stale:
             routes.require_api_auth(request)
         self.assertEqual(stale.exception.status_code, 401)
+
+    def test_preview_stream_frames_jpeg_with_bounded_binary_length(self):
+        frame = b"\xff\xd8preview\xff\xd9"
+
+        async def consume_one():
+            response = await routes.preview_stream(_ok=True)
+            iterator = response.body_iterator
+            chunk = await anext(iterator)
+            await iterator.aclose()
+            return response, chunk
+
+        with patch("app.routes.preview.get_status", return_value={"enabled": True}), patch(
+            "app.routes.camera.get_preview_source", return_value={}
+        ), patch("app.routes.preview.subscribe", return_value=0), patch(
+            "app.routes.preview.wait_for_frame", return_value=(1, frame)
+        ), patch("app.routes.preview.unsubscribe") as unsubscribe_mock:
+            response, chunk = asyncio.run(consume_one())
+
+        self.assertEqual(response.media_type, "application/x-medicam-preview")
+        self.assertEqual(int.from_bytes(chunk[:4], "big"), len(frame))
+        self.assertEqual(chunk[4:], frame)
+        unsubscribe_mock.assert_called_once_with()
 
     def test_update_is_rejected_while_recording(self):
         with patch(

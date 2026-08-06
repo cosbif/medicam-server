@@ -7,8 +7,6 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
-    WebSocket,
-    WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -131,40 +129,42 @@ def preview_status(_ok: bool = Depends(require_api_auth)):
     return preview.get_status()
 
 
-@router.websocket("/preview/ws")
-async def preview_websocket(websocket: WebSocket):
-    # Tokens stay in a request header rather than the URL, where reverse
-    # proxies, analytics, and crash logs commonly retain query strings.
-    if not utils.is_provisioned():
-        await websocket.close(code=4403, reason="device_not_provisioned")
-        return
-    if not utils.verify_api_token(websocket.headers.get(AUTH_HEADER)):
-        await websocket.close(code=4401, reason="invalid_api_token")
-        return
+@router.get("/preview/stream")
+async def preview_stream(_ok: bool = Depends(require_api_auth)):
     if not preview.get_status()["enabled"]:
-        await websocket.close(code=4403, reason="preview_disabled")
-        return
+        raise HTTPException(status_code=503, detail="preview_disabled")
 
-    source = camera.get_preview_source()
-    await websocket.accept()
-    generation = preview.subscribe(**source)
-    try:
-        while True:
-            generation, frame = await asyncio.to_thread(
-                preview.wait_for_frame,
-                generation,
-                2.0,
-            )
-            if frame is None:
-                # Recover automatically if the camera was connected after the
-                # socket opened or an optional preview helper restarted.
-                preview.ensure_running(camera.find_camera_device(timeout=0.0))
-                continue
-            await websocket.send_bytes(frame)
-    except (WebSocketDisconnect, RuntimeError, OSError):
-        pass
-    finally:
-        preview.unsubscribe()
+    async def frames():
+        source = camera.get_preview_source()
+        generation = preview.subscribe(**source)
+        try:
+            while True:
+                generation, frame = await asyncio.to_thread(
+                    preview.wait_for_frame,
+                    generation,
+                    2.0,
+                )
+                if frame is None:
+                    # Recover automatically if the camera was connected after
+                    # the HTTP stream opened or a helper process restarted.
+                    preview.ensure_running(camera.find_camera_device(timeout=0.0))
+                    continue
+                # A fixed four-byte big-endian length has less overhead and
+                # parsing ambiguity than multipart boundaries. Slow clients
+                # still receive only the manager's newest completed JPEG.
+                yield len(frame).to_bytes(4, "big") + frame
+        finally:
+            preview.unsubscribe()
+
+    return StreamingResponse(
+        frames(),
+        media_type="application/x-medicam-preview",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Medicam-Preview": "640x360;fps=24;format=mjpeg;framing=be32",
+        },
+    )
 
 
 # -------------------

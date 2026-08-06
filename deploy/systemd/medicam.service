@@ -14,7 +14,7 @@ Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
 Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
 Environment=MEDICAM_TLS_CERT_FILE=/etc/medicam/tls/cert.pem
 EnvironmentFile=-/etc/medicam/medicam.env
-ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws websockets-sansio --ws-per-message-deflate false --ssl-keyfile /etc/medicam/tls/key.pem --ssl-certfile /etc/medicam/tls/cert.pem
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile /etc/medicam/tls/key.pem --ssl-certfile /etc/medicam/tls/cert.pem
 Restart=always
 RestartSec=5
 UMask=0077
