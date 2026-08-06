@@ -49,6 +49,9 @@ class PreviewFrameTests(unittest.TestCase):
 
 
 class PreviewCommandTests(unittest.TestCase):
+    def test_product_default_keeps_preview_disconnected(self):
+        self.assertFalse(preview.PREVIEW_ENABLED)
+
     def test_idle_command_stream_copies_native_sd_mjpeg(self):
         command = preview._idle_capture_command("/dev/video0")
 

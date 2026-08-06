@@ -34,9 +34,11 @@ def _environment_flag(name: str, default: bool) -> bool:
 
 
 # This is deliberately a deployment switch rather than a customer setting.
-# It lets a release keep all preview code installed while leaving the feature
-# disconnected on hardware that cannot pass the recording-quality benchmark.
-PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", True)
+# The current Cortex-A55 board didn't pass the simultaneous FullHD benchmark,
+# so production defaults to disconnected while retaining the complete feature
+# for a stronger hardware revision. Set the environment value to 1 only after
+# that revision passes the same recording-quality test.
+PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", False)
 
 
 def _idle_capture_command(camera_device: str) -> list[str]:
