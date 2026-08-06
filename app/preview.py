@@ -33,10 +33,10 @@ def _environment_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# This remains a deployment switch rather than a customer setting so support can
-# disable preview without publishing another release. The optimized product
-# default is enabled; it performs no video decode or encode on the board.
-PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", True)
+# This remains a deployment switch rather than a customer setting. Preview is
+# temporarily disabled for the current hardware deployment while the complete
+# optimized implementation and the application's preview window stay in place.
+PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", False)
 
 
 def _idle_capture_command(camera_device: str) -> list[str]:

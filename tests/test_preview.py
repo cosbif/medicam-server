@@ -67,8 +67,8 @@ class PreviewFrameTests(unittest.TestCase):
 
 
 class PreviewCommandTests(unittest.TestCase):
-    def test_optimized_product_default_enables_preview(self):
-        self.assertTrue(preview.PREVIEW_ENABLED)
+    def test_current_hardware_default_disables_preview(self):
+        self.assertFalse(preview.PREVIEW_ENABLED)
 
     def test_idle_command_streams_native_sd_mjpeg_directly_from_v4l2(self):
         command = preview._idle_capture_command("/dev/video0")
