@@ -307,6 +307,23 @@ class ProvisionFileTests(unittest.TestCase):
 
 
 class BleManagerTests(unittest.TestCase):
+    def test_ble_unit_hides_adapter_after_service_stop(self):
+        unit = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "systemd"
+            / "medicam-ble.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "ExecStopPost=/usr/bin/bluetoothctl discoverable off",
+            unit,
+        )
+        self.assertIn(
+            "ExecStopPost=/usr/bin/bluetoothctl pairable off",
+            unit,
+        )
+
     def test_ble_runs_for_setup_disconnect_and_recovery_windows(self):
         self.assertTrue(should_run_ble(False, True, False, False))
         self.assertTrue(should_run_ble(True, False, False, False))
