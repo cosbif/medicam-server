@@ -49,6 +49,9 @@ TLS_CERT_FILE = Path("/etc/medicam/tls/cert.pem")
 PAIRING_CLIENT_CONTEXT = "medicam-client-v1"
 PAIRING_SERVER_CONTEXT = "medicam-server-v1"
 PAIRING_SESSION_CONTEXT = "medicam-session-v1"
+OWNER_PAIRING_CLIENT_CONTEXT = "medicam-owner-client-v1"
+OWNER_PAIRING_SERVER_CONTEXT = "medicam-owner-server-v1"
+OWNER_PAIRING_SESSION_CONTEXT = "medicam-owner-session-v1"
 
 _VIDEO_METADATA_CACHE = {}
 _VIDEO_INDEX_CACHE = None
@@ -1041,6 +1044,56 @@ def pairing_session_key(nonce: str, device_id: str) -> str:
 def verify_pairing_client_proof(nonce: str, device_id: str, proof: str) -> bool:
     try:
         expected = pairing_client_proof(nonce, device_id)
+    except OSError:
+        return False
+    return bool(proof and hmac.compare_digest(proof, expected))
+
+
+def _owner_pairing_hmac(context: str, nonce: str, *values: str) -> str:
+    """Authenticate BLE recovery with the existing owner token.
+
+    The token remains in the iPhone Keychain and in the camera provision file;
+    only a nonce-bound HMAC crosses Bluetooth.
+    """
+    token = get_api_token()
+    if not is_valid_api_token(token):
+        raise OSError("owner_token_unavailable")
+    message = "\0".join((context, nonce, *values)).encode("utf-8")
+    return hmac.new(token.encode("ascii"), message, hashlib.sha256).hexdigest()
+
+
+def owner_pairing_client_proof(nonce: str, device_id: str) -> str:
+    return _owner_pairing_hmac(OWNER_PAIRING_CLIENT_CONTEXT, nonce, device_id)
+
+
+def owner_pairing_server_proof(
+    nonce: str,
+    device_id: str,
+    tls_fingerprint: str,
+) -> str:
+    return _owner_pairing_hmac(
+        OWNER_PAIRING_SERVER_CONTEXT,
+        nonce,
+        device_id,
+        tls_fingerprint,
+    )
+
+
+def owner_pairing_session_key(nonce: str, device_id: str) -> str:
+    return _owner_pairing_hmac(
+        OWNER_PAIRING_SESSION_CONTEXT,
+        nonce,
+        device_id,
+    )
+
+
+def verify_owner_pairing_client_proof(
+    nonce: str,
+    device_id: str,
+    proof: str,
+) -> bool:
+    try:
+        expected = owner_pairing_client_proof(nonce, device_id)
     except OSError:
         return False
     return bool(proof and hmac.compare_digest(proof, expected))

@@ -387,6 +387,7 @@ class ProvisionService:
             "pairing_nonce_ttl": PAIRING_NONCE_TTL_SECONDS,
             "capabilities": [
                 "physical_pairing_code",
+                "owner_token_recovery",
                 "mutual_pairing_proof",
                 "session_hmac",
                 "client_generated_token",
@@ -468,6 +469,96 @@ class ProvisionService:
         self._set_response(
             {
                 "status": "unlocked",
+                "auth_method": "physical_code",
+                "session_id": self._session_id,
+                "expires_in": PAIRING_SESSION_TTL_SECONDS,
+                "device_id": device_id,
+                "device_name": utils.get_device_name(),
+                "tls_fingerprint": fingerprint,
+                "server_proof": server_proof,
+            },
+            request_id=request_id,
+        )
+
+    def _unlock_owner(self, data, request_id=None):
+        """Unlock Wi-Fi recovery using the token already owned by this phone.
+
+        The token itself never crosses BLE. This route is intentionally
+        unavailable during ordinary connected operation unless an authenticated
+        HTTP request opened the recovery window first.
+        """
+        if not utils.is_provisioned() or not (
+            utils.is_ble_recovery_active()
+            or utils.is_boot_pairing_window_active()
+            or not utils.is_wifi_connected()
+        ):
+            self._set_response(
+                {"error": "owner_recovery_unavailable"},
+                request_id=request_id,
+            )
+            return
+
+        nonce = data.get("nonce")
+        proof = data.get("proof")
+        now = time.monotonic()
+        device_id = utils.get_device_id()
+        fingerprint = utils.get_tls_fingerprint()
+        with self._pairing_lock:
+            if now < self._pairing_blocked_until:
+                self._set_response(
+                    {
+                        "error": "pairing_throttled",
+                        "retry_after": max(1, int(self._pairing_blocked_until - now)),
+                    },
+                    request_id=request_id,
+                )
+                return
+            valid_nonce = (
+                isinstance(nonce, str)
+                and hmac.compare_digest(nonce, self._pairing_nonce)
+                and now - self._pairing_nonce_issued < PAIRING_NONCE_TTL_SECONDS
+            )
+            valid_proof = bool(
+                valid_nonce
+                and isinstance(proof, str)
+                and utils.verify_owner_pairing_client_proof(
+                    nonce,
+                    device_id,
+                    proof,
+                )
+            )
+            if not valid_proof or not fingerprint:
+                self._pairing_failures += 1
+                if self._pairing_failures >= PAIRING_FAILURE_LIMIT:
+                    self._pairing_blocked_until = now + PAIRING_BLOCK_SECONDS
+                    self._pairing_failures = 0
+                self._rotate_pairing_nonce_locked()
+                self._set_response(
+                    {
+                        "error": "invalid_owner_proof",
+                        "pairing_nonce": self._pairing_nonce,
+                    },
+                    request_id=request_id,
+                )
+                return
+
+            self._pairing_failures = 0
+            self._pairing_blocked_until = 0.0
+            self._session_id = secrets.token_urlsafe(18)
+            self._session_key = utils.owner_pairing_session_key(nonce, device_id)
+            self._session_expires = now + PAIRING_SESSION_TTL_SECONDS
+            self._session_counter = -1
+            server_proof = utils.owner_pairing_server_proof(
+                nonce,
+                device_id,
+                fingerprint,
+            )
+            self._rotate_pairing_nonce_locked()
+
+        self._set_response(
+            {
+                "status": "unlocked",
+                "auth_method": "owner_token",
                 "session_id": self._session_id,
                 "expires_in": PAIRING_SESSION_TTL_SECONDS,
                 "device_id": device_id,
@@ -618,6 +709,10 @@ class ProvisionService:
 
         if cmd == "UNLOCK":
             self._unlock_pairing(data, request_id=request_id)
+            return
+
+        if cmd == "OWNER_UNLOCK":
+            self._unlock_owner(data, request_id=request_id)
             return
 
         if cmd == "SCAN_WIFI":

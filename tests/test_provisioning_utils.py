@@ -503,6 +503,91 @@ class BluetoothProvisioningTests(unittest.TestCase):
         self.assertNotIn("api_token", response)
         self.assertTrue(service._session_id)
 
+    def test_owner_pairing_proofs_use_existing_token_without_exposing_it(self):
+        token = "A" * 43
+        with patch("app.utils.get_api_token", return_value=token):
+            client_proof = utils.owner_pairing_client_proof(
+                "fresh-nonce",
+                "DEVICE01",
+            )
+            self.assertTrue(
+                utils.verify_owner_pairing_client_proof(
+                    "fresh-nonce",
+                    "DEVICE01",
+                    client_proof,
+                )
+            )
+            self.assertFalse(
+                utils.verify_owner_pairing_client_proof(
+                    "different-nonce",
+                    "DEVICE01",
+                    client_proof,
+                )
+            )
+            self.assertEqual(
+                client_proof,
+                "9b72d508545c57f042a320cc3d1d3ec371db75d85cbe23734526d599a997dfc7",
+            )
+
+    def test_owner_unlock_creates_session_without_returning_owner_token(self):
+        service = self._pairing_service()
+        with patch(
+            "app.bluetooth_provision.utils.is_provisioned", return_value=True
+        ), patch(
+            "app.bluetooth_provision.utils.is_ble_recovery_active",
+            return_value=True,
+        ), patch(
+            "app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"
+        ), patch(
+            "app.bluetooth_provision.utils.get_device_name",
+            return_value="Medicam-VICE01",
+        ), patch(
+            "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
+        ), patch(
+            "app.bluetooth_provision.utils.verify_owner_pairing_client_proof",
+            return_value=True,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_session_key",
+            return_value="b" * 64,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_server_proof",
+            return_value="c" * 64,
+        ):
+            service._unlock_owner(
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
+                request_id="owner-unlock-1",
+            )
+
+        response = service._set_response.call_args.args[0]
+        self.assertEqual(response["status"], "unlocked")
+        self.assertEqual(response["auth_method"], "owner_token")
+        self.assertEqual(response["server_proof"], "c" * 64)
+        self.assertNotIn("api_token", response)
+        self.assertEqual(service._session_key, "b" * 64)
+
+    def test_owner_unlock_is_unavailable_during_normal_connected_operation(self):
+        service = self._pairing_service()
+        with patch(
+            "app.bluetooth_provision.utils.is_provisioned", return_value=True
+        ), patch(
+            "app.bluetooth_provision.utils.is_ble_recovery_active",
+            return_value=False,
+        ), patch(
+            "app.bluetooth_provision.utils.is_boot_pairing_window_active",
+            return_value=False,
+        ), patch(
+            "app.bluetooth_provision.utils.is_wifi_connected", return_value=True
+        ):
+            service._unlock_owner(
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
+                request_id="owner-unlock-1",
+            )
+
+        self.assertEqual(
+            service._set_response.call_args.args[0],
+            {"error": "owner_recovery_unavailable"},
+        )
+
     def test_wifi_commands_require_valid_monotonic_session_hmac(self):
         service = self._pairing_service()
         service._session_id = "session"
