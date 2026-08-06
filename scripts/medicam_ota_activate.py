@@ -72,6 +72,12 @@ SYSTEMD_ASSETS = {
     "medicam-ble-refresh.service": Path(
         "/etc/systemd/system/medicam-ble-refresh.service"
     ),
+    "medicam-poweroff.path": Path(
+        "/etc/systemd/system/medicam-poweroff.path"
+    ),
+    "medicam-poweroff.service": Path(
+        "/etc/systemd/system/medicam-poweroff.service"
+    ),
 }
 REQUIRED_SYSTEMD_ASSETS = {
     "medicam.service",
@@ -929,6 +935,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     )
     run(["/bin/systemctl", "enable", "--now", "medicam-ota.path"])
     run(["/bin/systemctl", "enable", "--now", "medicam-ble-refresh.path"])
+    run(["/bin/systemctl", "enable", "--now", "medicam-poweroff.path"])
 
 
 def reset_checkout(commit: str) -> None:

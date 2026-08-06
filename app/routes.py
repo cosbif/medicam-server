@@ -642,6 +642,43 @@ async def provision_reset(request: Request):
         "ble_service": _systemctl_status(BLE_SERVICE),
     }
 
+
+# -------------------
+# ⏻ POWER CONTROL
+# -------------------
+
+@router.post("/system/poweroff")
+async def system_poweroff(_ok: bool = Depends(require_api_auth)):
+    recording = camera.get_recording_status()
+    if recording.get("capture_active") or recording.get("state") in {
+        "starting",
+        "recording",
+        "interrupted",
+        "finalizing",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "recording_in_progress",
+                "state": recording.get("state"),
+                "message": "Stop or recover the current recording before power off",
+            },
+        )
+
+    update = updater.get_update_status()
+    if update.get("state") in updater.ACTIVE_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "update_in_progress",
+                "state": update.get("state"),
+                "message": "Wait for the signed update to finish before power off",
+            },
+        )
+
+    utils.request_poweroff()
+    return {"status": "poweroff_requested"}
+
 # -------------------
 # 🔄 SIGNED OTA UPDATE
 # -------------------

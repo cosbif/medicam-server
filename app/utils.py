@@ -31,6 +31,12 @@ BLE_REFRESH_REQUEST_FILE = Path(
         "/var/lib/medicam/ble-refresh.request",
     )
 )
+POWER_OFF_REQUEST_FILE = Path(
+    os.environ.get(
+        "MEDICAM_POWER_OFF_REQUEST_FILE",
+        "/var/lib/medicam/poweroff.request",
+    )
+)
 MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
 PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
 TLS_CERT_FILE = Path("/etc/medicam/tls/cert.pem")
@@ -990,9 +996,8 @@ def start_ble_recovery(duration_seconds: int = DEFAULT_BLE_RECOVERY_SECONDS) -> 
     return expires_at.isoformat()
 
 
-def request_ble_refresh() -> None:
-    """Atomically signal the fixed root-owned systemd.path BLE restart."""
-    path = BLE_REFRESH_REQUEST_FILE
+def _request_root_action(path: Path, action: str) -> None:
+    """Atomically signal one fixed root-owned systemd.path action."""
     path.parent.mkdir(parents=True, exist_ok=True)
     directory = _open_provision_directory(path)
     temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
@@ -1009,7 +1014,9 @@ def request_ble_refresh() -> None:
         )
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="ascii", closefd=False) as output:
-            output.write(f"refresh-requested-at={datetime.now(timezone.utc).isoformat()}\n")
+            output.write(
+                f"{action}-requested-at={datetime.now(timezone.utc).isoformat()}\n"
+            )
             output.flush()
             os.fsync(output.fileno())
         os.close(descriptor)
@@ -1029,6 +1036,16 @@ def request_ble_refresh() -> None:
         except FileNotFoundError:
             pass
         os.close(directory)
+
+
+def request_ble_refresh() -> None:
+    """Atomically signal the fixed root-owned systemd.path BLE restart."""
+    _request_root_action(BLE_REFRESH_REQUEST_FILE, "refresh")
+
+
+def request_poweroff() -> None:
+    """Atomically ask the fixed root-owned systemd.path to power off."""
+    _request_root_action(POWER_OFF_REQUEST_FILE, "poweroff")
 
 
 def stop_ble_recovery():

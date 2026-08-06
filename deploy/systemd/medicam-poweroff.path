@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for authenticated Medicam power-off requests
+
+[Path]
+PathExists=/var/lib/medicam/poweroff.request
+Unit=medicam-poweroff.service
+
+[Install]
+WantedBy=multi-user.target

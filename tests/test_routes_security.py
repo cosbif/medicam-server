@@ -96,6 +96,7 @@ class RouteSecurityTests(unittest.TestCase):
             "/provision/recovery/start",
             "/provision/recovery/stop",
             "/auth/rotate",
+            "/system/poweroff",
         }
         update_paths = {
             "/update/check",
@@ -280,6 +281,36 @@ class RouteSecurityTests(unittest.TestCase):
         self.assertFalse(utils.is_ble_recovery_active())
 
         self.assertTrue(utils.verify_api_token(token))
+
+    def test_poweroff_requires_idle_recording_and_update(self):
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={"state": "idle", "capture_active": False},
+        ), patch(
+            "app.routes.updater.get_update_status",
+            return_value={"state": "complete"},
+        ), patch("app.routes.utils.request_poweroff") as request_poweroff:
+            result = asyncio.run(routes.system_poweroff(_ok=True))
+
+        self.assertEqual(result["status"], "poweroff_requested")
+        request_poweroff.assert_called_once_with()
+
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={"state": "recording", "capture_active": True},
+        ), self.assertRaises(HTTPException) as recording_error:
+            asyncio.run(routes.system_poweroff(_ok=True))
+        self.assertEqual(recording_error.exception.status_code, 409)
+
+        with patch(
+            "app.routes.camera.get_recording_status",
+            return_value={"state": "idle", "capture_active": False},
+        ), patch(
+            "app.routes.updater.get_update_status",
+            return_value={"state": "installing"},
+        ), self.assertRaises(HTTPException) as update_error:
+            asyncio.run(routes.system_poweroff(_ok=True))
+        self.assertEqual(update_error.exception.status_code, 409)
 
     def test_owner_reset_revokes_token_and_reopens_ble(self):
         token = self._provision()
