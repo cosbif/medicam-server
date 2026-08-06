@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from app import utils
-from app.bluetooth_provision import ProvisionService, encode_notification_frames
+from app.bluetooth_provision import (
+    ProvisionService,
+    encode_notification_frames,
+    should_refresh_ble,
+    should_stop_ble,
+)
 from app.manage_ble import (
     disable_legacy_ble_services,
     reconcile_ble_service,
@@ -297,6 +302,16 @@ class BleManagerTests(unittest.TestCase):
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
+    def test_new_recovery_marker_refreshes_gatt_once(self):
+        self.assertTrue(should_refresh_ble("old-window", "new-window"))
+        self.assertFalse(should_refresh_ble("new-window", "new-window"))
+        self.assertFalse(should_refresh_ble("new-window", ""))
+
+    def test_connected_device_stays_available_during_recovery(self):
+        self.assertTrue(should_stop_ble(True, True, False))
+        self.assertFalse(should_stop_ble(True, True, True))
+        self.assertFalse(should_stop_ble(True, False, False))
+
     def test_large_ble_response_is_framed_with_bounded_values(self):
         payload = json.dumps({"networks": ["x" * 64] * 20}).encode()
         frames = encode_notification_frames(payload, frame_id="deadbeef")

@@ -108,6 +108,19 @@ def get_wifi_ssid() -> str:
         return ""
     return utils.get_wifi_ssid()
 
+
+def should_refresh_ble(initial_marker: str, current_marker: str) -> bool:
+    """A newly issued recovery window requires a fresh BlueZ GATT session."""
+    return bool(current_marker and current_marker != initial_marker)
+
+
+def should_stop_ble(
+    provisioned: bool,
+    connected: bool,
+    recovery_active: bool,
+) -> bool:
+    return provisioned and connected and not recovery_active
+
 # ---------------------------
 # Provision service class
 # ---------------------------
@@ -718,6 +731,7 @@ class ProvisionService:
     # ---------------------------
     def run(self):
         print("[BLE] Starting provisioning service...")
+        initial_recovery_marker = utils.get_ble_recovery_until()
 
         try:
             self.periph.publish()
@@ -727,7 +741,14 @@ class ProvisionService:
 
         try:
             while True:
-                if utils.is_provisioned() and is_wifi_connected():
+                recovery_marker = utils.get_ble_recovery_until()
+                if should_refresh_ble(initial_recovery_marker, recovery_marker):
+                    raise RuntimeError("BLE recovery window changed; refreshing GATT")
+                if should_stop_ble(
+                    utils.is_provisioned(),
+                    is_wifi_connected(),
+                    utils.is_ble_recovery_active(),
+                ):
                     print("[BLE] Device provisioned and Wi-Fi connected -> stopping BLE")
                     break
                 time.sleep(1)
@@ -752,3 +773,6 @@ if __name__ == "__main__":
         ProvisionService().run()
     except Exception as e:
         print(f"[FATAL] BLE provisioning failed to start: {e}")
+        # systemd Restart=on-failure must see a non-zero result so stale BlueZ
+        # registrations and transient publish failures are self-healing.
+        raise
