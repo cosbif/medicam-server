@@ -49,6 +49,7 @@ BLE_REQUIREMENTS_MARKER = Path("/opt/medicam/.requirements-sha256")
 NFTABLES_FILE = Path("/etc/nftables.conf")
 SSH_DROP_IN = Path("/etc/ssh/sshd_config.d/99-medicam.conf")
 AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
+AVAHI_DAEMON_CONFIG = Path("/etc/avahi/avahi-daemon.conf")
 USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
 USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
 USB_POWER_IDS = {
@@ -552,6 +553,55 @@ def install_device_hostname() -> None:
     )
 
 
+def render_avahi_daemon_config(content: str, hostname: str) -> str:
+    """Pin Avahi to the device hostname while preserving distro settings."""
+    lines = content.splitlines()
+    rendered: list[str] = []
+    in_server = False
+    server_seen = False
+    hostname_written = False
+
+    for line in lines:
+        section = re.fullmatch(r"\s*\[([^]]+)]\s*", line)
+        if section:
+            if in_server and not hostname_written:
+                rendered.append(f"host-name={hostname}")
+                hostname_written = True
+            in_server = section.group(1).strip().lower() == "server"
+            server_seen = server_seen or in_server
+            rendered.append(line)
+            continue
+        if in_server and re.match(r"\s*host-name\s*=", line):
+            if not hostname_written:
+                rendered.append(f"host-name={hostname}")
+                hostname_written = True
+            continue
+        rendered.append(line)
+
+    if in_server and not hostname_written:
+        rendered.append(f"host-name={hostname}")
+    if not server_seen:
+        rendered = ["[server]", f"host-name={hostname}", "", *rendered]
+    return "\n".join(rendered).rstrip("\n") + "\n"
+
+
+def install_avahi_hostname() -> None:
+    try:
+        content = _safe_read_regular(
+            AVAHI_DAEMON_CONFIG,
+            1024 * 1024,
+        ).decode("utf-8")
+    except FileNotFoundError:
+        content = ""
+    rendered = render_avahi_daemon_config(content, device_hostname())
+    _safe_atomic_write(
+        AVAHI_DAEMON_CONFIG,
+        rendered.encode("utf-8"),
+        mode=0o644,
+        owner=(0, 0),
+    )
+
+
 def migrate_provision_state(uid: int, gid: int) -> None:
     """Move legacy credentials out of the checkout and remove the duplicate."""
     legacy_provision = REPO / "provision.json"
@@ -823,6 +873,7 @@ def install_network_security(release_root: Path) -> None:
         owner=(0, 0),
     )
     install_device_hostname()
+    install_avahi_hostname()
     run(["/bin/systemctl", "enable", "--now", "avahi-daemon.service"])
     run(["/bin/systemctl", "restart", "avahi-daemon.service"])
 

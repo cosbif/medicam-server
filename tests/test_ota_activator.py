@@ -31,6 +31,63 @@ class OtaActivatorTests(unittest.TestCase):
             timeout=30,
         )
 
+    def test_avahi_hostname_replaces_legacy_value_without_losing_settings(self):
+        source = """# managed by distro
+[server]
+host-name=nom
+use-ipv4=yes
+host-name=duplicate
+
+[publish]
+publish-addresses=yes
+"""
+
+        rendered = activate.render_avahi_daemon_config(
+            source,
+            "medicam-6279c7",
+        )
+
+        self.assertEqual(rendered.count("host-name="), 1)
+        self.assertIn("host-name=medicam-6279c7", rendered)
+        self.assertIn("use-ipv4=yes", rendered)
+        self.assertIn("[publish]", rendered)
+        self.assertIn("publish-addresses=yes", rendered)
+
+    def test_avahi_hostname_adds_missing_server_section(self):
+        rendered = activate.render_avahi_daemon_config(
+            "[publish]\npublish-addresses=yes\n",
+            "medicam-6279c7",
+        )
+
+        self.assertTrue(
+            rendered.startswith("[server]\nhost-name=medicam-6279c7\n")
+        )
+        self.assertIn("[publish]", rendered)
+
+    def test_avahi_hostname_is_written_atomically_for_the_device(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "avahi-daemon.conf"
+            config.write_text(
+                "[server]\nhost-name=nom\nuse-ipv4=yes\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                activate,
+                "AVAHI_DAEMON_CONFIG",
+                config,
+            ), patch.object(
+                activate,
+                "device_hostname",
+                return_value="medicam-6279c7",
+            ), patch.object(activate.os, "fchown"):
+                activate.install_avahi_hostname()
+
+            self.assertEqual(
+                config.read_text(encoding="utf-8"),
+                "[server]\nhost-name=medicam-6279c7\nuse-ipv4=yes\n",
+            )
+            self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+
     def test_provision_migration_removes_legacy_secret_after_secure_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
