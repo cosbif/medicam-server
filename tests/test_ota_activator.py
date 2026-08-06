@@ -15,6 +15,22 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_device_hostname_is_stable_unique_and_installed(self):
+        with patch.object(activate, "_device_id", return_value="856279C7"), patch.object(
+            activate, "run"
+        ) as run:
+            self.assertEqual(activate.device_hostname(), "medicam-6279c7")
+            activate.install_device_hostname()
+
+        run.assert_called_once_with(
+            [
+                "/usr/bin/hostnamectl",
+                "set-hostname",
+                "medicam-6279c7",
+            ],
+            timeout=30,
+        )
+
     def test_provision_migration_removes_legacy_secret_after_secure_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

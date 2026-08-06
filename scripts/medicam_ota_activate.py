@@ -537,6 +537,21 @@ def _device_id() -> str:
     return hashlib.sha256(f"medicam:{source}".encode("utf-8")).hexdigest()[:8].upper()
 
 
+def device_hostname() -> str:
+    """Return the collision-resistant local hostname covered by the TLS cert."""
+    return f"medicam-{_device_id()[-6:].lower()}"
+
+
+def install_device_hostname() -> None:
+    # A shared `nom.local` is renamed unpredictably by Avahi when any device on
+    # the customer's LAN already owns that name. The device-derived suffix is
+    # stable across networks and is already part of the generated certificate.
+    run(
+        ["/usr/bin/hostnamectl", "set-hostname", device_hostname()],
+        timeout=30,
+    )
+
+
 def migrate_provision_state(uid: int, gid: int) -> None:
     """Move legacy credentials out of the checkout and remove the duplicate."""
     legacy_provision = REPO / "provision.json"
@@ -807,6 +822,7 @@ def install_network_security(release_root: Path) -> None:
         mode=0o644,
         owner=(0, 0),
     )
+    install_device_hostname()
     run(["/bin/systemctl", "enable", "--now", "avahi-daemon.service"])
     run(["/bin/systemctl", "restart", "avahi-daemon.service"])
 
