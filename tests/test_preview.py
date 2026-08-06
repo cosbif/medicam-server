@@ -70,14 +70,18 @@ class PreviewCommandTests(unittest.TestCase):
     def test_optimized_product_default_enables_preview(self):
         self.assertTrue(preview.PREVIEW_ENABLED)
 
-    def test_idle_command_stream_copies_native_sd_mjpeg(self):
+    def test_idle_command_streams_native_sd_mjpeg_directly_from_v4l2(self):
         command = preview._idle_capture_command("/dev/video0")
 
-        self.assertIn("640x360", command)
-        self.assertIn("10", command)
-        self.assertIn("copy", command)
-        self.assertNotIn("scale=640:360:flags=fast_bilinear", command)
-        self.assertEqual(command[:4], ["nice", "-n", "19", "ffmpeg"])
+        self.assertIn(
+            "--set-fmt-video=width=640,height=360,pixelformat=MJPG",
+            command,
+        )
+        self.assertIn("--set-parm=10", command)
+        self.assertIn("--stream-mmap=4", command)
+        self.assertIn("--stream-to=-", command)
+        self.assertNotIn("ffmpeg", command)
+        self.assertEqual(command[:4], ["nice", "-n", "19", "v4l2-ctl"])
 
     def test_recording_preview_has_no_transcode_command(self):
         self.assertFalse(hasattr(preview, "_recording_transcode_command"))

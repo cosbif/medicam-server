@@ -42,20 +42,16 @@ PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", True)
 def _idle_capture_command(camera_device: str) -> list[str]:
     return [
         "nice", "-n", "19",
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostats",
-        "-f", "v4l2",
-        "-input_format", "mjpeg",
-        "-framerate", str(PREVIEW_IDLE_FPS),
-        "-video_size", f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}",
-        "-i", camera_device,
-        "-map", "0:v:0",
-        "-c:v", "copy",
-        "-an",
-        "-f", "mjpeg",
-        "pipe:1",
+        "v4l2-ctl",
+        "-d", camera_device,
+        (
+            f"--set-fmt-video=width={PREVIEW_WIDTH},height={PREVIEW_HEIGHT},"
+            "pixelformat=MJPG"
+        ),
+        f"--set-parm={PREVIEW_IDLE_FPS}",
+        "--stream-mmap=4",
+        "--stream-to=-",
+        "--stream-count=0",
     ]
 
 
@@ -201,8 +197,9 @@ class PreviewManager:
             if process.stdout is None:
                 raise RuntimeError("preview_stdout_unavailable")
 
-            # The camera supplies native 640x360@10 MJPEG, so idle preview is a
-            # pure compressed copy with no conversion or frame dropping.
+            # Direct V4L2 mmap avoids FFmpeg's demux/mux overhead. v4l2-ctl
+            # writes a short textual frame-rate confirmation before the first
+            # JPEG; the SOI-aware parser safely discards that prefix.
             _read_mjpeg_stream(
                 process.stdout,
                 stop_event,
