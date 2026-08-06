@@ -19,7 +19,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app import audio, camera, storage_manager, updater, utils, version_info
+from app import audio, camera, preview, storage_manager, updater, utils, version_info
 
 
 SELF_TEST_FILE = Path(
@@ -511,10 +511,15 @@ def run_self_test() -> dict:
         raise SelfTestBusyError("hardware_busy")
     _SELF_TEST_ACTIVE.set()
     started = time.monotonic()
+    preview_paused = False
     try:
         recording = camera.get_recording_status()
         if recording.get("recording") or recording.get("finalizing"):
             raise SelfTestBusyError("recording_in_progress")
+        # The board exposes one UVC image node. Temporarily release the idle
+        # preview so the diagnostic capture can exercise that node itself.
+        preview.pause()
+        preview_paused = True
         checks = [
             _camera_capture_test(),
             _audio_test(),
@@ -533,6 +538,8 @@ def run_self_test() -> dict:
         _save_last_self_test(payload)
         return payload
     finally:
+        if preview_paused:
+            preview.resume()
         _SELF_TEST_ACTIVE.clear()
         _HARDWARE_OPERATION_LOCK.release()
 

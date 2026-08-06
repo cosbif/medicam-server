@@ -1,8 +1,27 @@
 '''app/routes.py'''
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Form, Depends, Query, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from app import audio, camera, diagnostics, storage_manager, utils, updater, version_info
+from app import (
+    audio,
+    camera,
+    diagnostics,
+    preview,
+    storage_manager,
+    updater,
+    utils,
+    version_info,
+)
 import asyncio
 import io
 import math
@@ -102,6 +121,50 @@ def stop_recording(_ok: bool = Depends(require_api_auth)):
 @router.get("/recording/status")
 def recording_status(_ok: bool = Depends(require_api_auth)):
     return camera.get_recording_status()
+
+
+# -------------------
+# Live SD preview
+# -------------------
+@router.get("/preview/status")
+def preview_status(_ok: bool = Depends(require_api_auth)):
+    return preview.get_status()
+
+
+@router.websocket("/preview/ws")
+async def preview_websocket(websocket: WebSocket):
+    # Tokens stay in a request header rather than the URL, where reverse
+    # proxies, analytics, and crash logs commonly retain query strings.
+    if not utils.is_provisioned():
+        await websocket.close(code=4403, reason="device_not_provisioned")
+        return
+    if not utils.verify_api_token(websocket.headers.get(AUTH_HEADER)):
+        await websocket.close(code=4401, reason="invalid_api_token")
+        return
+    if not preview.get_status()["enabled"]:
+        await websocket.close(code=4403, reason="preview_disabled")
+        return
+
+    source = camera.get_preview_source()
+    await websocket.accept()
+    generation = preview.subscribe(**source)
+    try:
+        while True:
+            generation, frame = await asyncio.to_thread(
+                preview.wait_for_frame,
+                generation,
+                2.0,
+            )
+            if frame is None:
+                # Recover automatically if the camera was connected after the
+                # socket opened or an optional preview helper restarted.
+                preview.ensure_running(camera.find_camera_device(timeout=0.0))
+                continue
+            await websocket.send_bytes(frame)
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass
+    finally:
+        preview.unsubscribe()
 
 
 # -------------------

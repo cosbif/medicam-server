@@ -73,6 +73,7 @@ class RouteSecurityTests(unittest.TestCase):
             "/start",
             "/stop",
             "/recording/status",
+            "/preview/status",
             "/videos",
             "/videos/{filename}/thumbnail",
             "/videos/{filename}",
@@ -124,6 +125,23 @@ class RouteSecurityTests(unittest.TestCase):
                 }
 
             self.assertIn("require_update_auth", dependency_names)
+
+        self.assertIn("/preview/ws", route_by_path)
+
+    def test_preview_websocket_rejects_missing_token_before_accepting(self):
+        websocket = Mock()
+        websocket.headers = {}
+        websocket.close = Mock(return_value=None)
+
+        async def close(**kwargs):
+            websocket.closed_with = kwargs
+
+        websocket.close = close
+        with patch("app.routes.utils.is_provisioned", return_value=True):
+            asyncio.run(routes.preview_websocket(websocket))
+
+        self.assertEqual(websocket.closed_with["code"], 4401)
+        self.assertEqual(websocket.closed_with["reason"], "invalid_api_token")
 
     def test_auth_dependency_rejects_unprovisioned_devices(self):
         with self.assertRaises(HTTPException) as context:

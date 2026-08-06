@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 
-from app import audio, storage_manager, utils
+from app import audio, preview, storage_manager, utils
 
 
 SETTINGS_FILE = "camera_settings.json"
@@ -89,6 +89,16 @@ recording_generation = 0
 last_recording_error = None
 recovery_state_loaded = False
 recording_lock = threading.RLock()
+
+
+def _preview_call(method: str, *args) -> None:
+    """Keep every preview failure outside the recording control path."""
+    try:
+        getattr(preview, method)(*args)
+    except Exception:
+        # Preview is optional by design. A malformed frame, failed helper
+        # process, or shutdown race must never prevent FullHD capture.
+        pass
 
 
 def _normalize_settings(settings: dict | None):
@@ -844,6 +854,8 @@ def _watch_recording(generation: int):
         if processes_to_stop:
             for process in processes_to_stop:
                 _stop_capture_process(process)
+            _preview_call("recording_stopped")
+            _preview_call("recording_finished")
             return
 
 
@@ -1019,6 +1031,16 @@ def start_recording():
         recording_generation += 1
         last_recording_error = None
         _persist_recording_state_locked()
+        if capture_command:
+            # Release the idle SD camera owner before ALSA/UVC startup. The
+            # preview branch remains stopped until the first FullHD byte proves
+            # that the primary recorder is healthy.
+            _preview_call(
+                "prepare_for_recording",
+                camera_device,
+                raw_file,
+                float(fps),
+            )
 
         try:
             ffmpeg_log_file = open(FFMPEG_LOG_FILE, "w", encoding="utf-8")
@@ -1099,6 +1121,7 @@ def start_recording():
                 details or error.details or str(error),
             )
             _persist_recording_state_locked()
+            _preview_call("recording_finished")
             return {
                 "status": "error",
                 "error_code": error.code,
@@ -1114,6 +1137,7 @@ def start_recording():
             _remove_file(audio_file)
             _set_last_error_locked("capture_start_failed", str(error))
             _persist_recording_state_locked()
+            _preview_call("recording_finished")
             return {
                 "status": "error",
                 "error_code": "capture_start_failed",
@@ -1163,6 +1187,7 @@ def start_recording():
                 details or f"Capture exited with code {return_code}",
             )
             _persist_recording_state_locked()
+            _preview_call("recording_finished")
             return {
                 "status": "error",
                 "error_code": "capture_start_failed",
@@ -1174,6 +1199,7 @@ def start_recording():
         recording_phase = "recording"
         _persist_recording_state_locked()
         _start_watchdog_locked()
+        _preview_call("recording_started")
 
         return {
             "status": "recording_started",
@@ -1245,6 +1271,9 @@ def stop_recording():
         FFMPEG_REMUX_TIMEOUT,
         REMUX_MIN_THROUGHPUT_BYTES_PER_SECOND,
     )
+    # Stop the disk-tail/scaler before stopping the primary capture. Idle SD
+    # preview is restarted only after potentially expensive MP4 finalization.
+    _preview_call("recording_stopped")
 
     if raw_file:
         capture_was_running = capture is not None and capture.poll() is None
@@ -1437,11 +1466,29 @@ def stop_recording():
         response["warning"] = "; ".join(warning_parts)
     if storage_cleanup is not None:
         response["storage_cleanup"] = storage_cleanup
+    _preview_call("recording_finished")
     return response
 
 
 def get_settings():
     return dict(camera_settings)
+
+
+def get_preview_source() -> dict:
+    """Return internal source data used by the authenticated preview route."""
+    with recording_lock:
+        _restore_recording_state_locked()
+        active = recording_phase == "recording" and bool(recording_raw_file)
+        device = recording_camera_device if active else None
+        raw_file = recording_raw_file if active else None
+        fps = float(recording_fps or camera_settings.get("fps", "30"))
+    if not device:
+        device = find_camera_device(timeout=0.0)
+    return {
+        "camera_device": device,
+        "recording_raw_file": raw_file,
+        "recording_fps": fps,
+    }
 
 
 def get_recording_status():
