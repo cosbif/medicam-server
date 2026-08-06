@@ -317,6 +317,7 @@ class BluetoothProvisioningTests(unittest.TestCase):
         class FakePeripheral:
             def __init__(self, **_kwargs):
                 self.characteristics = []
+                self.dongle = type("FakeDongle", (), {"alias": "nom"})()
 
             def add_service(self, *_args):
                 return None
@@ -337,6 +338,7 @@ class BluetoothProvisioningTests(unittest.TestCase):
             service = ProvisionService()
 
         try:
+            self.assertEqual(service.periph.dongle.alias, "Medicam-TEST01")
             self.assertIs(service.cmd_char, service.periph.characteristics[0])
             self.assertIs(service.resp_char, service.periph.characteristics[1])
             service._notify_value(b'{"status":"ok"}')

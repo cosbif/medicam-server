@@ -166,10 +166,15 @@ class ProvisionService:
 
         print(f"[BLE] Using adapter MAC: {mac}")
 
+        device_name = utils.get_device_name()
         self.periph = peripheral.Peripheral(
             adapter_address=mac,
-            local_name=utils.get_device_name()
+            local_name=device_name,
         )
+        # CoreBluetooth can use the GAP adapter alias instead of the extended
+        # advertisement LocalName. Keep both identities product-specific so a
+        # new owner never sees the Linux hostname (for example, "nom").
+        self.periph.dongle.alias = device_name
 
         print("[BLE] Peripheral created via bluezero")
 
