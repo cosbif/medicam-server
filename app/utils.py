@@ -509,12 +509,19 @@ def split_nmcli_escaped(line: str) -> list[str]:
 def is_wifi_connected() -> bool:
     """Return True only when a Wi-Fi interface is connected."""
     try:
+        # nmcli localizes human-readable state values.  The BLE manager runs
+        # under systemd and may therefore inherit a different locale from an
+        # interactive SSH session.  Force the stable machine-readable English
+        # value so a connected camera is never mistaken for an offline one.
+        nmcli_environment = os.environ.copy()
+        nmcli_environment.update({"LANG": "C", "LC_ALL": "C"})
         status = subprocess.check_output(
             ["nmcli", "-t", "-f", "TYPE,STATE", "dev", "status"],
             text=True,
             encoding="utf-8",
             errors="ignore",
             timeout=5,
+            env=nmcli_environment,
         ).strip()
         for line in status.splitlines():
             parts = split_nmcli_escaped(line)

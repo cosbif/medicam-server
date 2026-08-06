@@ -30,6 +30,17 @@ class NmcliParsingTests(unittest.TestCase):
             ["My:WiFi", "82", "WPA2"],
         )
 
+    def test_wifi_status_uses_stable_c_locale(self):
+        with patch(
+            "app.utils.subprocess.check_output",
+            return_value="wifi:connected\nloopback:connected (externally):lo\n",
+        ) as check_output:
+            self.assertTrue(utils.is_wifi_connected())
+
+        environment = check_output.call_args.kwargs["env"]
+        self.assertEqual(environment["LANG"], "C")
+        self.assertEqual(environment["LC_ALL"], "C")
+
     def test_wifi_password_is_not_passed_as_process_argument(self):
         completed = subprocess.CompletedProcess(
             args=["nmcli"],
@@ -302,6 +313,15 @@ class BleManagerTests(unittest.TestCase):
             )
 
         control.assert_not_called()
+
+    def test_active_unneeded_ble_is_stopped(self):
+        with patch("app.manage_ble.systemctl", return_value=True) as control:
+            reconcile_ble_service(
+                should_run=False,
+                status="active",
+            )
+
+        control.assert_called_once_with("stop")
 
 
 class BluetoothProvisioningTests(unittest.TestCase):

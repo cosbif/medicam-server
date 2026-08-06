@@ -90,6 +90,7 @@ def disable_legacy_ble_services():
 
 def main():
     disable_legacy_ble_services()
+    previous_state = None
     while True:
         provisioned = utils.is_provisioned()
         connected = utils.is_wifi_connected()
@@ -103,6 +104,25 @@ def main():
             recovery_active,
             boot_window_active,
         )
+
+        current_state = (
+            provisioned,
+            connected,
+            recovery_active,
+            boot_window_active,
+            status,
+            should_ble_run,
+        )
+        if current_state != previous_state:
+            print(
+                "[Auto] BLE state: "
+                f"provisioned={provisioned} "
+                f"wifi_connected={connected} "
+                f"recovery_active={recovery_active} "
+                f"boot_window_active={boot_window_active} "
+                f"service={status} required={should_ble_run}"
+            )
+            previous_state = current_state
 
         reconcile_ble_service(
             should_run=should_ble_run,
