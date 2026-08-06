@@ -20,11 +20,19 @@ class RouteSecurityTests(unittest.TestCase):
         os.chdir(self.tmp.name)
 
         self.provision_path = Path(self.tmp.name) / "provision.json"
+        self.ble_recovery_state = (
+            Path(self.tmp.name) / "ble-recovery-until.state"
+        )
         self.videos_dir = Path(self.tmp.name) / "videos"
         self.videos_dir.mkdir()
 
         self.patchers = [
             patch("app.utils._provision_path", Mock(return_value=self.provision_path)),
+            patch.object(
+                utils,
+                "BLE_RECOVERY_STATE_FILE",
+                self.ble_recovery_state,
+            ),
             patch("app.utils.is_wifi_connected", Mock(return_value=True)),
             patch("app.utils.get_wifi_ssid", Mock(return_value="Office")),
             patch("app.utils.get_primary_ipv4", Mock(return_value="192.168.1.50")),

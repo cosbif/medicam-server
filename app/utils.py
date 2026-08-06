@@ -31,6 +31,12 @@ BLE_PROVISIONED_STATE_FILE = Path(
         "/var/lib/medicam/ble-provisioned.state",
     )
 )
+BLE_RECOVERY_STATE_FILE = Path(
+    os.environ.get(
+        "MEDICAM_BLE_RECOVERY_STATE_FILE",
+        "/var/lib/medicam/ble-recovery-until.state",
+    )
+)
 BLE_REFRESH_REQUEST_FILE = Path(
     os.environ.get(
         "MEDICAM_BLE_REFRESH_REQUEST_FILE",
@@ -859,6 +865,75 @@ def _sync_ble_provisioned_state(value: bool) -> None:
         pass
 
 
+def _write_ble_recovery_state(expires_at: str) -> None:
+    """Publish only the non-secret recovery deadline for the root manager."""
+    path = BLE_RECOVERY_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = _open_provision_directory(path)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory)
+        payload = f"{expires_at}\n".encode("ascii")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        # A UTC deadline contains no credentials or customer network data.
+        os.fchmod(descriptor, 0o644)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
+def _sync_ble_recovery_state(expires_at: str) -> None:
+    try:
+        _write_ble_recovery_state(expires_at)
+    except (OSError, UnicodeEncodeError):
+        # The private state remains authoritative. A stale public deadline can
+        # only keep BLE available until its already bounded expiry.
+        pass
+
+
+def get_ble_recovery_state_until() -> str:
+    """Read the public, credential-free recovery deadline without symlinks."""
+    path = BLE_RECOVERY_STATE_FILE
+    try:
+        directory = _open_provision_directory(path)
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path.name, flags, dir_fd=directory)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
+                    raise OSError("unsafe_ble_recovery_state")
+                value = os.read(descriptor, 128).decode("ascii").strip()
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+        return value
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def is_ble_provisioned() -> bool:
     """Read the non-secret marker used by the capability-free BLE manager."""
     path = BLE_PROVISIONED_STATE_FILE
@@ -921,6 +996,7 @@ def set_provisioned(
         data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
         _atomic_write_provision_data_unlocked(path, data)
     _sync_ble_provisioned_state(bool(value))
+    _sync_ble_recovery_state("")
 
 
 def _normalize_provision_file_permissions(path: Path):
@@ -1139,6 +1215,11 @@ def start_ble_recovery(duration_seconds: int = DEFAULT_BLE_RECOVERY_SECONDS) -> 
         {"ble_recovery_until": expires_at.isoformat()},
         remove=(),
     )
+    try:
+        _write_ble_recovery_state(expires_at.isoformat())
+    except (OSError, UnicodeEncodeError):
+        _update_provision_fields({}, remove=("ble_recovery_until",))
+        raise
     return expires_at.isoformat()
 
 
@@ -1195,13 +1276,18 @@ def request_poweroff() -> None:
 
 
 def stop_ble_recovery():
+    # Publish the fail-closed state first so the manager never extends an
+    # explicitly closed window because of a stale marker.
+    _write_ble_recovery_state("")
     _update_provision_fields({}, remove=("ble_recovery_until",))
 
 
 def get_ble_recovery_until() -> str:
     data = _read_provision_data()
     value = data.get("ble_recovery_until", "")
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str) and value:
+        return value
+    return get_ble_recovery_state_until()
 
 
 def is_ble_recovery_active(now: datetime | None = None) -> bool:

@@ -6,7 +6,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -212,18 +212,61 @@ class ProvisionFileTests(unittest.TestCase):
     def test_recovery_window_expires_and_successful_provisioning_closes_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             provision_path = Path(tmp) / "provision.json"
+            recovery_state = Path(tmp) / "ble-recovery-until.state"
 
-            with patch("app.utils._provision_path", Mock(return_value=provision_path)):
+            with patch(
+                "app.utils._provision_path", Mock(return_value=provision_path)
+            ), patch.object(utils, "BLE_RECOVERY_STATE_FILE", recovery_state):
                 utils.set_provisioned(True, {"ssid": "Office"})
                 expires_at = utils.start_ble_recovery(120)
                 before_expiry = datetime.fromisoformat(expires_at) - timedelta(seconds=1)
                 after_expiry = datetime.fromisoformat(expires_at) + timedelta(seconds=1)
 
+                self.assertEqual(
+                    recovery_state.read_text(encoding="ascii").strip(),
+                    expires_at,
+                )
+                self.assertEqual(recovery_state.stat().st_mode & 0o777, 0o644)
                 self.assertTrue(utils.is_ble_recovery_active(before_expiry))
                 self.assertFalse(utils.is_ble_recovery_active(after_expiry))
 
                 utils.set_provisioned(True, {"ssid": "Office"})
                 self.assertFalse(utils.is_ble_recovery_active())
+                self.assertEqual(recovery_state.read_text(encoding="ascii"), "\n")
+
+    def test_public_recovery_marker_survives_private_state_read_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "ble-recovery-until.state"
+            now = datetime.now(timezone.utc)
+            marker.write_text(
+                f"{(now + timedelta(minutes=5)).isoformat()}\n",
+                encoding="ascii",
+            )
+            marker.chmod(0o644)
+
+            with patch.object(utils, "BLE_RECOVERY_STATE_FILE", marker), patch(
+                "app.utils._read_provision_data", return_value={}
+            ):
+                self.assertTrue(utils.is_ble_recovery_active(now))
+
+    def test_recovery_marker_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            provision_path = directory / "provision.json"
+            marker = directory / "ble-recovery-until.state"
+            target = directory / "target"
+            target.write_text("preserve", encoding="utf-8")
+            marker.symlink_to(target)
+
+            with patch(
+                "app.utils._provision_path", Mock(return_value=provision_path)
+            ), patch.object(utils, "BLE_RECOVERY_STATE_FILE", marker):
+                expires_at = utils.start_ble_recovery(120)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(marker.is_symlink())
+            self.assertEqual(marker.read_text(encoding="ascii").strip(), expires_at)
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o644)
 
     def test_ble_refresh_signal_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as tmp:

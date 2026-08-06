@@ -60,6 +60,10 @@ Sandbox backend сохраняется полностью: API не вызыва
 anti-downgrade и root-owned trust state. Sudoers не содержит OTA-команд.
 BLE recovery/reset также не использует sudo: root-owned BLE manager замечает
 атомарно сохранённое состояние максимум за десять секунд и включает GATT.
+Срок recovery публикуется отдельно в несекретном
+`/var/lib/medicam/ble-recovery-until.state`: менеджеру не требуется читать
+закрытый `provision.json` с API-токеном, а истёкший срок автоматически перестаёт
+удерживать Bluetooth включённым.
 
 Release-процесс и хранение ключа описаны в
 [`docs/ota-release.md`](docs/ota-release.md). Подписанный тег создаётся командой:
