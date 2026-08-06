@@ -152,7 +152,10 @@ async def preview_stream(_ok: bool = Depends(require_api_auth)):
                 # A fixed four-byte big-endian length has less overhead and
                 # parsing ambiguity than multipart boundaries. Slow clients
                 # still receive only the manager's newest completed JPEG.
-                yield len(frame).to_bytes(4, "big") + frame
+                # Avoid allocating another FullHD-sized bytes object merely to
+                # prepend the framing length on the resource-limited board.
+                yield len(frame).to_bytes(4, "big")
+                yield frame
         finally:
             preview.unsubscribe()
 
@@ -162,7 +165,10 @@ async def preview_stream(_ok: bool = Depends(require_api_auth)):
         headers={
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
-            "X-Medicam-Preview": "640x360;fps=24;format=mjpeg;framing=be32",
+            "X-Medicam-Preview": (
+                "display=640x360;fps=10;format=mjpeg;framing=be32;"
+                "source=dynamic"
+            ),
         },
     )
 

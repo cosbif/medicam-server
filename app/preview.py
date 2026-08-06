@@ -1,8 +1,8 @@
 """Resource-isolated MJPEG preview for the mobile application.
 
-The recorder always owns the camera while a FullHD capture is active.  Preview
-work therefore runs in a separate, low-priority branch fed from the growing raw
-MJPEG recording.  A slow client can only miss preview frames: the latest JPEG
+The recorder always owns the camera while a FullHD capture is active. Preview
+work therefore reads the growing raw MJPEG recording without decoding, scaling,
+or re-encoding it. A slow client can only miss preview frames: the latest JPEG
 replaces the previous one and no client-facing queue can back-pressure capture.
 """
 
@@ -18,8 +18,8 @@ from typing import BinaryIO, Callable
 
 PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 360
-PREVIEW_INPUT_FPS = 30
-PREVIEW_OUTPUT_FPS = 24
+PREVIEW_IDLE_FPS = 10
+PREVIEW_OUTPUT_FPS = 10
 PREVIEW_MAX_JPEG_BYTES = 8 * 1024 * 1024
 PREVIEW_READ_SIZE = 256 * 1024
 PREVIEW_TAIL_POLL_SECONDS = 0.005
@@ -33,12 +33,10 @@ def _environment_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# This is deliberately a deployment switch rather than a customer setting.
-# The current Cortex-A55 board didn't pass the simultaneous FullHD benchmark,
-# so production defaults to disconnected while retaining the complete feature
-# for a stronger hardware revision. Set the environment value to 1 only after
-# that revision passes the same recording-quality test.
-PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", False)
+# This remains a deployment switch rather than a customer setting so support can
+# disable preview without publishing another release. The optimized product
+# default is enabled; it performs no video decode or encode on the board.
+PREVIEW_ENABLED = _environment_flag("MEDICAM_PREVIEW_ENABLED", True)
 
 
 def _idle_capture_command(camera_device: str) -> list[str]:
@@ -50,7 +48,7 @@ def _idle_capture_command(camera_device: str) -> list[str]:
         "-nostats",
         "-f", "v4l2",
         "-input_format", "mjpeg",
-        "-framerate", str(PREVIEW_INPUT_FPS),
+        "-framerate", str(PREVIEW_IDLE_FPS),
         "-video_size", f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}",
         "-i", camera_device,
         "-map", "0:v:0",
@@ -61,32 +59,16 @@ def _idle_capture_command(camera_device: str) -> list[str]:
     ]
 
 
-def _recording_transcode_command() -> list[str]:
-    return [
-        "nice", "-n", "19",
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostats",
-        "-fflags", "nobuffer",
-        "-f", "mjpeg",
-        "-framerate", str(PREVIEW_OUTPUT_FPS),
-        "-i", "pipe:0",
-        "-map", "0:v:0",
-        "-vf", (
-            f"scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:flags=fast_bilinear"
-        ),
-        "-threads", "1",
-        "-c:v", "mjpeg",
-        "-q:v", "10",
-        "-an",
-        "-f", "mjpeg",
-        "pipe:1",
-    ]
+def _extract_mjpeg_frames(
+    buffer: bytearray,
+    should_copy: Callable[[], bool] | None = None,
+):
+    """Yield selected complete JPEGs while bounding malformed-stream memory.
 
-
-def _extract_mjpeg_frames(buffer: bytearray):
-    """Yield complete JPEG images while bounding malformed-stream memory."""
+    ``should_copy`` is evaluated once per complete image. Rejected frames are
+    removed without first allocating a ``bytes`` copy, which matters when
+    selecting preview frames from the growing FullHD recording.
+    """
     while True:
         start = buffer.find(b"\xff\xd8")
         if start < 0:
@@ -101,10 +83,21 @@ def _extract_mjpeg_frames(buffer: bytearray):
                 del buffer[:-1]
             return
         frame_end = end + 2
-        frame = bytes(buffer[:frame_end])
+        copy_frame = should_copy is None or should_copy()
+        frame = bytes(buffer[:frame_end]) if copy_frame else None
         del buffer[:frame_end]
-        if len(frame) <= PREVIEW_MAX_JPEG_BYTES:
+        if frame is not None and len(frame) <= PREVIEW_MAX_JPEG_BYTES:
             yield frame
+
+
+def _should_publish_frame(frame_index: int, source_fps: float) -> bool:
+    """Evenly select at most PREVIEW_OUTPUT_FPS frames, including frame one."""
+    source_rate = max(1, int(round(source_fps)))
+    if source_rate <= PREVIEW_OUTPUT_FPS:
+        return True
+    current_slot = ((frame_index - 1) * PREVIEW_OUTPUT_FPS) // source_rate
+    previous_slot = ((frame_index - 2) * PREVIEW_OUTPUT_FPS) // source_rate
+    return current_slot != previous_slot
 
 
 def _read_mjpeg_stream(
@@ -160,7 +153,7 @@ class PreviewManager:
         self._pause_depth = 0
         self._camera_device: str | None = None
         self._recording_raw_file: str | None = None
-        self._recording_fps = float(PREVIEW_INPUT_FPS)
+        self._recording_fps = 30.0
         self._recording_prepared = False
         self._recording_ready = False
         self._last_error: str | None = None
@@ -192,7 +185,6 @@ class PreviewManager:
     def _run_idle(self, serial: int, stop_event: threading.Event) -> None:
         process = None
         error = None
-        frame_index = 0
         try:
             if not self._camera_device:
                 raise RuntimeError("camera_unavailable")
@@ -209,15 +201,13 @@ class PreviewManager:
             if process.stdout is None:
                 raise RuntimeError("preview_stdout_unavailable")
 
-            def on_frame(frame: bytes) -> None:
-                nonlocal frame_index
-                frame_index += 1
-                # The camera has no native 24 fps mode. Dropping one compressed
-                # JPEG out of every five costs no decode or encode work.
-                if frame_index % 5:
-                    self._publish(serial, frame)
-
-            _read_mjpeg_stream(process.stdout, stop_event, on_frame)
+            # The camera supplies native 640x360@10 MJPEG, so idle preview is a
+            # pure compressed copy with no conversion or frame dropping.
+            _read_mjpeg_stream(
+                process.stdout,
+                stop_event,
+                lambda frame: self._publish(serial, frame),
+            )
             if not stop_event.is_set() and process.poll() not in (0, None):
                 raise RuntimeError(f"idle_preview_exited_{process.poll()}")
         except Exception as caught:  # Preview failure must never reach capture.
@@ -227,8 +217,6 @@ class PreviewManager:
             self._producer_finished(serial, error)
 
     def _run_recording(self, serial: int, stop_event: threading.Event) -> None:
-        process = None
-        output_thread = None
         error = None
         input_buffer = bytearray()
         frame_index = 0
@@ -236,63 +224,34 @@ class PreviewManager:
             raw_file = self._recording_raw_file
             if not raw_file:
                 raise RuntimeError("recording_preview_source_unavailable")
-            process = subprocess.Popen(
-                _recording_transcode_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
-            self._producer_process = process
-            if stop_event.is_set():
-                return
-            if process.stdin is None or process.stdout is None:
-                raise RuntimeError("preview_pipe_unavailable")
-            output_thread = threading.Thread(
-                target=_read_mjpeg_stream,
-                args=(
-                    process.stdout,
-                    stop_event,
-                    lambda frame: self._publish(serial, frame),
-                ),
-                name=f"medicam-preview-output-{serial}",
-                daemon=True,
-            )
-            output_thread.start()
-
             # Start at the current end so a client joining mid-recording does
-            # not cause a burst of old FullHD frames to be decoded.
+            # not cause a burst of old FullHD frames to be transmitted. Frames
+            # stay compressed: the iPhone performs the display downscale.
             with open(raw_file, "rb", buffering=0) as source:
                 source.seek(0, os.SEEK_END)
                 while not stop_event.is_set():
                     chunk = source.read(PREVIEW_READ_SIZE)
                     if not chunk:
-                        if process.poll() is not None:
-                            raise RuntimeError(
-                                f"recording_preview_exited_{process.poll()}"
-                            )
                         time.sleep(PREVIEW_TAIL_POLL_SECONDS)
                         continue
                     input_buffer.extend(chunk)
-                    for frame in _extract_mjpeg_frames(input_buffer):
+
+                    def select_frame() -> bool:
+                        nonlocal frame_index
                         frame_index += 1
-                        if frame_index % 5 == 0:
-                            continue
-                        try:
-                            process.stdin.write(frame)
-                        except (BrokenPipeError, OSError) as caught:
-                            raise RuntimeError("recording_preview_pipe_closed") from caught
+                        return _should_publish_frame(
+                            frame_index,
+                            self._recording_fps,
+                        )
+
+                    for frame in _extract_mjpeg_frames(
+                        input_buffer,
+                        should_copy=select_frame,
+                    ):
+                        self._publish(serial, frame)
         except Exception as caught:  # Preview failure must never reach capture.
             error = caught
         finally:
-            if process is not None and process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
-            _stop_process(process)
-            if output_thread is not None and output_thread is not threading.current_thread():
-                output_thread.join(timeout=PREVIEW_PROCESS_STOP_TIMEOUT)
             self._producer_finished(serial, error)
 
     def _stop_producer_locked(self) -> None:
@@ -348,7 +307,7 @@ class PreviewManager:
         self,
         camera_device: str | None = None,
         recording_raw_file: str | None = None,
-        recording_fps: float = PREVIEW_INPUT_FPS,
+        recording_fps: float = 30.0,
     ) -> int:
         with self._control_lock:
             self._subscribers += 1
@@ -445,6 +404,7 @@ class PreviewManager:
                 "height": PREVIEW_HEIGHT,
                 "fps": PREVIEW_OUTPUT_FPS,
                 "format": "mjpeg",
+                "transport": "compressed_passthrough",
                 "last_error": self._last_error,
             }
 

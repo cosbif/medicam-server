@@ -190,20 +190,21 @@ class RouteSecurityTests(unittest.TestCase):
         async def consume_one():
             response = await routes.preview_stream(_ok=True)
             iterator = response.body_iterator
-            chunk = await anext(iterator)
+            prefix = await anext(iterator)
+            jpeg = await anext(iterator)
             await iterator.aclose()
-            return response, chunk
+            return response, prefix, jpeg
 
         with patch("app.routes.preview.get_status", return_value={"enabled": True}), patch(
             "app.routes.camera.get_preview_source", return_value={}
         ), patch("app.routes.preview.subscribe", return_value=0), patch(
             "app.routes.preview.wait_for_frame", return_value=(1, frame)
         ), patch("app.routes.preview.unsubscribe") as unsubscribe_mock:
-            response, chunk = asyncio.run(consume_one())
+            response, prefix, jpeg = asyncio.run(consume_one())
 
         self.assertEqual(response.media_type, "application/x-medicam-preview")
-        self.assertEqual(int.from_bytes(chunk[:4], "big"), len(frame))
-        self.assertEqual(chunk[4:], frame)
+        self.assertEqual(int.from_bytes(prefix, "big"), len(frame))
+        self.assertEqual(jpeg, frame)
         unsubscribe_mock.assert_called_once_with()
 
     def test_update_is_rejected_while_recording(self):

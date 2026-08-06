@@ -20,7 +20,7 @@ class PreviewFrameTests(unittest.TestCase):
         buffer.extend(b"\xff\xd9")
         self.assertEqual(list(preview._extract_mjpeg_frames(buffer)), [jpeg(b"two")])
 
-    def test_idle_preview_drops_one_of_every_five_camera_jpegs(self):
+    def test_idle_preview_copies_native_ten_fps_jpegs(self):
         stream = io.BytesIO(b"".join(jpeg(str(index).encode()) for index in range(10)))
         process = Mock()
         process.stdout = stream
@@ -32,8 +32,26 @@ class PreviewFrameTests(unittest.TestCase):
         with patch("app.preview.subprocess.Popen", return_value=process):
             manager._run_idle(1, preview.threading.Event())
 
-        self.assertEqual(manager._frame_generation, 8)
-        self.assertEqual(manager._latest_frame, jpeg(b"8"))
+        self.assertEqual(manager._frame_generation, 10)
+        self.assertEqual(manager._latest_frame, jpeg(b"9"))
+
+    def test_recording_selector_copies_only_ten_of_thirty_fullhd_frames(self):
+        buffer = bytearray(
+            b"".join(jpeg(str(index).encode()) for index in range(30))
+        )
+        frame_index = 0
+
+        def select_frame():
+            nonlocal frame_index
+            frame_index += 1
+            return preview._should_publish_frame(frame_index, 30.0)
+
+        frames = list(preview._extract_mjpeg_frames(buffer, select_frame))
+
+        self.assertEqual(len(frames), 10)
+        self.assertEqual(frames[0], jpeg(b"0"))
+        self.assertEqual(frames[-1], jpeg(b"27"))
+        self.assertEqual(buffer, bytearray())
 
     def test_waiter_receives_only_the_latest_frame(self):
         manager = preview.PreviewManager(enabled=True)
@@ -49,27 +67,20 @@ class PreviewFrameTests(unittest.TestCase):
 
 
 class PreviewCommandTests(unittest.TestCase):
-    def test_product_default_keeps_preview_disconnected(self):
-        self.assertFalse(preview.PREVIEW_ENABLED)
+    def test_optimized_product_default_enables_preview(self):
+        self.assertTrue(preview.PREVIEW_ENABLED)
 
     def test_idle_command_stream_copies_native_sd_mjpeg(self):
         command = preview._idle_capture_command("/dev/video0")
 
         self.assertIn("640x360", command)
-        self.assertIn("30", command)
+        self.assertIn("10", command)
         self.assertIn("copy", command)
         self.assertNotIn("scale=640:360:flags=fast_bilinear", command)
         self.assertEqual(command[:4], ["nice", "-n", "19", "ffmpeg"])
 
-    def test_recording_preview_is_single_threaded_and_low_priority(self):
-        command = preview._recording_transcode_command()
-
-        self.assertEqual(command[:4], ["nice", "-n", "19", "ffmpeg"])
-        self.assertIn("scale=640:360:flags=fast_bilinear", command)
-        threads = command.index("-threads")
-        self.assertEqual(command[threads + 1], "1")
-        framerate = command.index("-framerate")
-        self.assertEqual(command[framerate + 1], "24")
+    def test_recording_preview_has_no_transcode_command(self):
+        self.assertFalse(hasattr(preview, "_recording_transcode_command"))
 
     def test_disabled_manager_never_starts_a_producer(self):
         manager = preview.PreviewManager(enabled=False)
