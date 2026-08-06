@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import time
+import json
+import os
+import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parents[1]
@@ -12,6 +15,12 @@ from app import utils
 
 BLE_SERVICE = "medicam-ble.service"
 LEGACY_BLE_SERVICES = ("ble-provision.service",)
+BLE_MANAGER_STATE_FILE = Path(
+    os.environ.get(
+        "MEDICAM_BLE_MANAGER_STATE_FILE",
+        "/var/lib/medicam/ble-manager-state.json",
+    )
+)
 
 
 def should_run_ble(
@@ -65,9 +74,56 @@ def reconcile_ble_service(*, should_run: bool, status: str):
     if not should_run and status == "active":
         if systemctl("stop"):
             print("[Auto] Provisioned Wi-Fi active → stop BLE")
+            return "stopped"
+        return "stop_failed"
     elif should_run and status != "active":
         if systemctl("start"):
             print("[Auto] BLE provisioning required → start BLE")
+            return "started"
+        return "start_failed"
+    return "unchanged"
+
+
+def write_manager_state(state: dict) -> None:
+    """Publish non-secret manager state without following attacker links."""
+    path = BLE_MANAGER_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(path.parent, directory_flags)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        payload = json.dumps(state, sort_keys=True).encode("utf-8") + b"\n"
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o644)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
 
 
 def disable_legacy_ble_services():
@@ -87,6 +143,7 @@ def disable_legacy_ble_services():
             print(f"[Auto] Stopped legacy BLE service: {unit}")
         if enabled and systemctl("disable", unit):
             print(f"[Auto] Disabled legacy BLE service: {unit}")
+
 
 def main():
     disable_legacy_ble_services()
@@ -113,6 +170,11 @@ def main():
             status,
             should_ble_run,
         )
+        action = reconcile_ble_service(
+            should_run=should_ble_run,
+            status=status,
+        )
+
         if current_state != previous_state:
             print(
                 "[Auto] BLE state: "
@@ -122,12 +184,22 @@ def main():
                 f"boot_window_active={boot_window_active} "
                 f"service={status} required={should_ble_run}"
             )
+            try:
+                write_manager_state(
+                    {
+                        "observed_at_unix": time.time(),
+                        "provisioned": provisioned,
+                        "wifi_connected": connected,
+                        "recovery_active": recovery_active,
+                        "boot_window_active": boot_window_active,
+                        "service": status,
+                        "required": should_ble_run,
+                        "action": action,
+                    }
+                )
+            except Exception as error:
+                print(f"[Auto] Failed to publish BLE manager state: {error}")
             previous_state = current_state
-
-        reconcile_ble_service(
-            should_run=should_ble_run,
-            status=status,
-        )
 
         time.sleep(10)
 

@@ -1,6 +1,7 @@
 import json
 import hashlib
 import hmac
+import os
 import stat
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ from app.manage_ble import (
     disable_legacy_ble_services,
     reconcile_ble_service,
     should_run_ble,
+    write_manager_state,
 )
 
 
@@ -316,12 +318,32 @@ class BleManagerTests(unittest.TestCase):
 
     def test_active_unneeded_ble_is_stopped(self):
         with patch("app.manage_ble.systemctl", return_value=True) as control:
-            reconcile_ble_service(
+            action = reconcile_ble_service(
                 should_run=False,
                 status="active",
             )
 
         control.assert_called_once_with("stop")
+        self.assertEqual(action, "stopped")
+
+    def test_manager_state_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            target = directory / "target.json"
+            target.write_text("preserve", encoding="utf-8")
+            state_file = directory / "state.json"
+            state_file.symlink_to(target)
+
+            with patch("app.manage_ble.BLE_MANAGER_STATE_FILE", state_file):
+                write_manager_state({"required": False, "action": "stopped"})
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(state_file.is_symlink())
+            self.assertEqual(
+                json.loads(state_file.read_text(encoding="utf-8")),
+                {"required": False, "action": "stopped"},
+            )
+            self.assertEqual(stat.S_IMODE(os.stat(state_file).st_mode), 0o644)
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
