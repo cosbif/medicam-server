@@ -25,6 +25,12 @@ VIDEO_THUMBNAILS_DIRNAME = ".thumbnails"
 DEFAULT_BLE_RECOVERY_SECONDS = 10 * 60
 MAX_BLE_RECOVERY_SECONDS = 30 * 60
 BOOT_PAIRING_WINDOW_SECONDS = 5 * 60
+BLE_PROVISIONED_STATE_FILE = Path(
+    os.environ.get(
+        "MEDICAM_BLE_PROVISIONED_STATE_FILE",
+        "/var/lib/medicam/ble-provisioned.state",
+    )
+)
 BLE_REFRESH_REQUEST_FILE = Path(
     os.environ.get(
         "MEDICAM_BLE_REFRESH_REQUEST_FILE",
@@ -804,9 +810,88 @@ def _atomic_write_provision_data_unlocked(path: Path, data: dict) -> None:
             pass
         os.close(directory)
 
+
+def _write_ble_provisioned_state(value: bool) -> None:
+    """Publish only the non-secret ownership bit for the root BLE manager."""
+    path = BLE_PROVISIONED_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = _open_provision_directory(path)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory)
+        os.write(descriptor, b"1\n" if value else b"0\n")
+        os.fsync(descriptor)
+        # This marker contains no token, SSID, or customer data.  It is
+        # intentionally readable while provision.json remains mode 0600.
+        os.fchmod(descriptor, 0o644)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
+def _sync_ble_provisioned_state(value: bool) -> None:
+    try:
+        _write_ble_provisioned_state(value)
+    except OSError:
+        # A missing marker safely keeps BLE available. Ownership state and
+        # API authentication continue to use the private provision.json.
+        pass
+
+
+def is_ble_provisioned() -> bool:
+    """Read the non-secret marker used by the capability-free BLE manager."""
+    path = BLE_PROVISIONED_STATE_FILE
+    try:
+        directory = _open_provision_directory(path)
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path.name, flags, dir_fd=directory)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
+                    raise OSError("unsafe_ble_provisioned_state")
+                value = os.read(descriptor, 16).decode("ascii").strip()
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+        if value == "1":
+            return True
+        if value == "0":
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    # Fail open for physical recovery when the marker is absent or invalid.
+    return is_provisioned()
+
+
 def is_provisioned() -> bool:
     """Возвращает True если устройство provisioned (подключено к Wi-Fi и помечено)."""
-    return bool(_read_provision_data().get("provisioned", False))
+    data = _read_provision_data()
+    value = bool(data.get("provisioned", False))
+    if "provisioned" in data:
+        _sync_ble_provisioned_state(value)
+    return value
 
 def set_provisioned(
     value: bool,
@@ -832,6 +917,7 @@ def set_provisioned(
         data.pop("ble_recovery_until", None)
         data.setdefault("info", {})["updated_at"] = datetime.now().isoformat()
         _atomic_write_provision_data_unlocked(path, data)
+    _sync_ble_provisioned_state(bool(value))
 
 
 def _normalize_provision_file_permissions(path: Path):

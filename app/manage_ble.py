@@ -149,7 +149,7 @@ def main():
     disable_legacy_ble_services()
     previous_state = None
     while True:
-        provisioned = utils.is_provisioned()
+        provisioned = utils.is_ble_provisioned()
         connected = utils.is_wifi_connected()
         recovery_active = utils.is_ble_recovery_active()
         boot_window_active = utils.is_boot_pairing_window_active()

@@ -90,6 +90,34 @@ class NmcliParsingTests(unittest.TestCase):
 
 
 class ProvisionFileTests(unittest.TestCase):
+    def test_ble_provisioned_marker_is_non_secret_and_symlink_safe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            target = directory / "target"
+            target.write_text("preserve", encoding="utf-8")
+            marker = directory / "ble-provisioned.state"
+            marker.symlink_to(target)
+
+            with patch("app.utils.BLE_PROVISIONED_STATE_FILE", marker):
+                utils._write_ble_provisioned_state(True)
+                self.assertTrue(utils.is_ble_provisioned())
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(marker.is_symlink())
+            self.assertEqual(marker.read_text(encoding="ascii"), "1\n")
+            self.assertEqual(stat.S_IMODE(os.stat(marker).st_mode), 0o644)
+
+    def test_invalid_ble_provisioned_marker_falls_back_to_private_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "ble-provisioned.state"
+            marker.write_text("invalid\n", encoding="ascii")
+
+            with patch("app.utils.BLE_PROVISIONED_STATE_FILE", marker):
+                with patch("app.utils.is_provisioned", return_value=False) as fallback:
+                    self.assertFalse(utils.is_ble_provisioned())
+
+            fallback.assert_called_once_with()
+
     def test_reset_clears_previous_provisioning_info(self):
         with tempfile.TemporaryDirectory() as tmp:
             provision_path = Path(tmp) / "provision.json"
