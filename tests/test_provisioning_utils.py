@@ -11,7 +11,11 @@ from unittest.mock import Mock, call, patch
 
 from app import utils
 from app.bluetooth_provision import ProvisionService, encode_notification_frames
-from app.manage_ble import disable_legacy_ble_services, should_run_ble
+from app.manage_ble import (
+    disable_legacy_ble_services,
+    reconcile_ble_service,
+    should_run_ble,
+)
 
 
 class NmcliParsingTests(unittest.TestCase):
@@ -270,6 +274,26 @@ class BleManagerTests(unittest.TestCase):
                 call("disable", "ble-provision.service"),
             ],
         )
+
+    def test_new_recovery_window_restarts_active_ble_to_clear_stale_gatt(self):
+        with patch("app.manage_ble.systemctl", return_value=True) as control:
+            reconcile_ble_service(
+                should_run=True,
+                status="active",
+                recovery_changed=True,
+            )
+
+        control.assert_called_once_with("restart")
+
+    def test_existing_recovery_window_does_not_restart_ble_repeatedly(self):
+        with patch("app.manage_ble.systemctl", return_value=True) as control:
+            reconcile_ble_service(
+                should_run=True,
+                status="active",
+                recovery_changed=False,
+            )
+
+        control.assert_not_called()
 
 
 class BluetoothProvisioningTests(unittest.TestCase):

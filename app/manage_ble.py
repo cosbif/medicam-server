@@ -60,6 +60,24 @@ def systemctl(action: str, unit: str = BLE_SERVICE):
         return False
 
 
+def reconcile_ble_service(*, should_run: bool, status: str, recovery_changed: bool):
+    """Apply one manager iteration and refresh stale GATT on a new window."""
+    if should_run and recovery_changed:
+        action = "restart" if status == "active" else "start"
+        if systemctl(action):
+            print(
+                "[Auto] New BLE recovery window → "
+                f"{action} provisioning service"
+            )
+        return
+    if not should_run and status == "active":
+        if systemctl("stop"):
+            print("[Auto] Provisioned Wi-Fi active → stop BLE")
+    elif should_run and status != "active":
+        if systemctl("start"):
+            print("[Auto] BLE provisioning required → start BLE")
+
+
 def disable_legacy_ble_services():
     """Remove obsolete units that otherwise publish duplicate GATT services."""
     for unit in LEGACY_BLE_SERVICES:
@@ -80,10 +98,17 @@ def disable_legacy_ble_services():
 
 def main():
     disable_legacy_ble_services()
+    last_recovery_marker = None
     while True:
         provisioned = utils.is_provisioned()
         connected = utils.is_wifi_connected()
         recovery_active = utils.is_ble_recovery_active()
+        recovery_marker = (
+            utils.get_ble_recovery_until() if recovery_active else None
+        )
+        recovery_changed = bool(
+            recovery_marker and recovery_marker != last_recovery_marker
+        )
         boot_window_active = utils.is_boot_pairing_window_active()
         status = service_status()
 
@@ -94,16 +119,12 @@ def main():
             boot_window_active,
         )
 
-        if not should_ble_run and status == "active":
-            if systemctl("stop"):
-                print("[Auto] Provisioned Wi-Fi active → stop BLE")
-        elif should_ble_run and status != "active":
-            if systemctl("start"):
-                print(
-                    "[Auto] BLE provisioning required → start BLE "
-                    f"(provisioned={provisioned}, wifi_connected={connected}, "
-                    f"recovery={recovery_active}, boot_window={boot_window_active})"
-                )
+        reconcile_ble_service(
+            should_run=should_ble_run,
+            status=status,
+            recovery_changed=recovery_changed,
+        )
+        last_recovery_marker = recovery_marker
 
         time.sleep(10)
 
