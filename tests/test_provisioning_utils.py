@@ -305,6 +305,49 @@ class BleManagerTests(unittest.TestCase):
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
+    def test_bluezero_091_none_return_keeps_response_characteristic(self):
+        class FakeCharacteristic:
+            def __init__(self, uuid):
+                self.uuid_value = uuid
+                self.values = []
+
+            def set_value(self, value):
+                self.values.append(value)
+
+        class FakePeripheral:
+            def __init__(self, **_kwargs):
+                self.characteristics = []
+
+            def add_service(self, *_args):
+                return None
+
+            def add_characteristic(self, **kwargs):
+                self.characteristics.append(FakeCharacteristic(kwargs["uuid"]))
+                # This is the pinned Bluezero 0.9.1 behaviour.
+                return None
+
+        class FakePeripheralModule:
+            Peripheral = FakePeripheral
+
+        with patch("app.bluetooth_provision.peripheral", FakePeripheralModule), patch(
+            "app.bluetooth_provision.get_adapter_mac", return_value="AA:BB:CC:DD:EE:FF"
+        ), patch(
+            "app.bluetooth_provision.utils.get_device_name", return_value="Medicam-TEST01"
+        ):
+            service = ProvisionService()
+
+        try:
+            self.assertIs(service.cmd_char, service.periph.characteristics[0])
+            self.assertIs(service.resp_char, service.periph.characteristics[1])
+            service._notify_value(b'{"status":"ok"}')
+            self.assertEqual(
+                service.resp_char.values,
+                [list(b'{"status":"ok"}')],
+            )
+        finally:
+            service._executor.shutdown(wait=False, cancel_futures=True)
+            service._notify_executor.shutdown(wait=False, cancel_futures=True)
+
     def test_new_recovery_marker_refreshes_gatt_once(self):
         self.assertTrue(should_refresh_ble("old-window", "new-window"))
         self.assertFalse(should_refresh_ble("new-window", "new-window"))

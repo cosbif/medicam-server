@@ -121,6 +121,32 @@ def should_stop_ble(
 ) -> bool:
     return provisioned and connected and not recovery_active
 
+
+def add_characteristic(periph, **kwargs):
+    """Add and return a characteristic across Bluezero API variants.
+
+    Bluezero 0.9.1 appends the created object to ``characteristics`` but
+    returns ``None``.  Some forks return the object directly.  Capturing both
+    behaviours is essential for server-initiated response notifications.
+    """
+    characteristics = getattr(periph, "characteristics", None)
+    previous_count = len(characteristics) if characteristics is not None else 0
+    try:
+        characteristic = periph.add_characteristic(**kwargs)
+    except TypeError:
+        # Older Bluezero variants do not accept notify_callback.
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs.pop("notify_callback", None)
+        characteristic = periph.add_characteristic(**fallback_kwargs)
+
+    if characteristic is not None:
+        return characteristic
+
+    characteristics = getattr(periph, "characteristics", None)
+    if characteristics is not None and len(characteristics) > previous_count:
+        return characteristics[-1]
+    return None
+
 # ---------------------------
 # Provision service class
 # ---------------------------
@@ -150,59 +176,36 @@ class ProvisionService:
         SRV_ID = 1
         self.periph.add_service(SRV_ID, SERVICE_UUID, True)
 
-        # Command characteristic (write)
-        try:
-            self.cmd_char = self.periph.add_characteristic(
-                srv_id=SRV_ID,
-                chr_id=1,
-                uuid=CMD_CHAR_UUID,
-                value=[],
-                notifying=False,
-                flags=["write-without-response", "write"],
-                read_callback=None,
-                write_callback=self.on_command
-            )
-        except TypeError:
-            # fallback for different bluezero versions
-            self.periph.add_characteristic(
-                srv_id=SRV_ID,
-                chr_id=1,
-                uuid=CMD_CHAR_UUID,
-                value=[],
-                notifying=False,
-                flags=["write-without-response", "write"],
-                read_callback=None,
-                write_callback=self.on_command
-            )
-            self.cmd_char = None
+        # Command characteristic (write). Bluezero 0.9.1 returns None from
+        # add_characteristic(), so capture the object appended to its list.
+        self.cmd_char = add_characteristic(
+            self.periph,
+            srv_id=SRV_ID,
+            chr_id=1,
+            uuid=CMD_CHAR_UUID,
+            value=[],
+            notifying=False,
+            flags=["write-without-response", "write"],
+            read_callback=None,
+            write_callback=self.on_command,
+            notify_callback=None,
+        )
 
         # Response characteristic (read + notify)
-        try:
-            resp = self.periph.add_characteristic(
-                srv_id=SRV_ID,
-                chr_id=2,
-                uuid=RESP_CHAR_UUID,
-                value=[],
-                notifying=False,
-                flags=["notify"],
-                read_callback=None,
-                write_callback=None,
-                notify_callback=None
-            )
-            self.resp_char = resp
-        except TypeError:
-            self.periph.add_characteristic(
-                srv_id=SRV_ID,
-                chr_id=2,
-                uuid=RESP_CHAR_UUID,
-                value=[],
-                notifying=False,
-                flags=["notify"],
-                read_callback=None,
-                write_callback=None,
-                notify_callback=None
-            )
-            self.resp_char = None
+        self.resp_char = add_characteristic(
+            self.periph,
+            srv_id=SRV_ID,
+            chr_id=2,
+            uuid=RESP_CHAR_UUID,
+            value=[],
+            notifying=False,
+            flags=["read", "notify"],
+            read_callback=self.on_read_response,
+            write_callback=None,
+            notify_callback=None,
+        )
+        if self.resp_char is None or not hasattr(self.resp_char, "set_value"):
+            raise RuntimeError("Bluezero response characteristic is unavailable")
 
         self.srv_id = SRV_ID
         self.resp_chr_id = 2
