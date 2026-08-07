@@ -65,6 +65,21 @@ _VIDEO_INDEX_CACHE_PATH = None
 _VIDEO_INDEX_LOCK = threading.RLock()
 _VIDEO_METADATA_IN_PROGRESS = set()
 
+
+def development_open_access_enabled() -> bool:
+    """Return whether the explicitly deployed development bypass is active.
+
+    Production keeps this environment variable absent/false.  The temporary
+    development systemd units set it to true so HTTP and BLE can be exercised
+    without owner tokens or a physical pairing code.
+    """
+    return os.environ.get("MEDICAM_DEVELOPMENT_OPEN_ACCESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
         while chunk := file_like.read(1024 * 1024):
@@ -606,6 +621,14 @@ def connect_wifi_nmcli(ssid: str, password: str | None = None, timeout: int = 60
             "stderr": "ssid_too_long",
             "error_code": "ssid_too_long",
             "ip": "",
+        }
+    if is_wifi_connected() and get_wifi_ssid() == ssid:
+        return {
+            "ok": True,
+            "stdout": "already_connected",
+            "stderr": "",
+            "error_code": "",
+            "ip": get_primary_ipv4(),
         }
     if password and not _is_valid_wifi_password(password):
         return {

@@ -12,6 +12,7 @@ Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
 Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
 Environment=MEDICAM_PAIRING_SECRET_FILE=/etc/medicam/pairing-secret
 Environment=MEDICAM_TLS_CERT_FILE=/etc/medicam/tls/cert.pem
+Environment=MEDICAM_DEVELOPMENT_OPEN_ACCESS=1
 ExecStart=/opt/medicam/venv/bin/python3 /opt/medicam/ble/app/bluetooth_provision.py
 ExecStopPost=/usr/bin/bluetoothctl discoverable off
 ExecStopPost=/usr/bin/bluetoothctl pairable off

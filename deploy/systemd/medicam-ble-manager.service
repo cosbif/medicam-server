@@ -10,6 +10,7 @@ WorkingDirectory=/opt/medicam/ble
 Environment=PYTHONUNBUFFERED=1
 Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
 Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
+Environment=MEDICAM_DEVELOPMENT_OPEN_ACCESS=1
 ExecStart=/opt/medicam/venv/bin/python3 /opt/medicam/ble/app/manage_ble.py
 Restart=always
 RestartSec=5
