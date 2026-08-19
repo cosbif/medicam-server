@@ -1,0 +1,32 @@
+[Unit]
+Description=Medicam outbound cloud heartbeat agent
+After=network-online.target medicam.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa/medicam-server
+Environment=PATH=/home/radxa/medicam-server/medicam-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MEDICAM_CLOUD_STATE_FILE=/var/lib/medicam/cloud-state.json
+EnvironmentFile=-/etc/medicam/medicam.env
+ExecStart=/home/radxa/medicam-server/medicam-venv/bin/python -m app.cloud_agent
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/medicam
+
+[Install]
+WantedBy=multi-user.target

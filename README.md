@@ -2,6 +2,38 @@
 
 FastAPI backend и BLE-провижининг для камеры Medicam на Radxa.
 
+## Облачный heartbeat
+
+`app.cloud_agent` — отдельный процесс, который устанавливает только исходящее
+HTTPS-соединение с Medicam Cloud. В первой версии он передаёт идентификатор,
+версии, uptime, состояние записи и объём свободного места. SSID, локальный IP,
+пароли, видео и логи не отправляются. Облачные команды пока не поддерживаются.
+
+Для первой регистрации каждой камере выдаётся индивидуальный одноразовый
+bootstrap token. После `POST /api/v1/device/enroll` агент атомарно сохраняет
+уникальный постоянный token в `/var/lib/medicam/cloud-state.json` с правами
+`0600`. Камера не принимает входящие облачные соединения.
+
+Mac-эмулятор использует тот же production-модуль:
+
+```bash
+medicam-venv/bin/python scripts/run_cloud_simulator.py \
+  --cloud-url http://127.0.0.1:8000 \
+  --device-id ABCD1234 \
+  --bootstrap-token-file /path/to/mode-0600-bootstrap-token \
+  --once
+```
+
+На Radxa параметры задаются в `/etc/medicam/medicam.env`:
+
+```ini
+MEDICAM_CLOUD_URL=https://cloud.example.com
+MEDICAM_CLOUD_BOOTSTRAP_TOKEN=<individual-one-time-token>
+```
+
+Без `MEDICAM_CLOUD_URL` агент штатно завершается и облачная интеграция остаётся
+выключенной.
+
 Каждая плата публикует уникальное mDNS-имя вида
 `medicam-XXXXXX.local`, полученное из стабильного device ID и включённое в
 TLS-сертификат. Это исключает конфликты общего `nom.local` в сети клиента.

@@ -249,6 +249,35 @@ publish-addresses=yes
             )
             self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
 
+    def test_rollback_removes_cloud_agent_when_old_release_has_no_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            destination = root / "medicam-cloud-agent.service"
+            destination.write_text("new unit", encoding="utf-8")
+            with patch.object(
+                activate,
+                "SYSTEMD_ASSETS",
+                {"medicam-cloud-agent.service": destination},
+            ), patch.object(
+                activate,
+                "REQUIRED_SYSTEMD_ASSETS",
+                set(),
+            ), patch.object(activate, "run") as run:
+                installed = activate._install_systemd_assets(release)
+
+            self.assertEqual(installed, set())
+            self.assertFalse(destination.exists())
+            run.assert_called_once_with(
+                [
+                    "/bin/systemctl",
+                    "disable",
+                    "--now",
+                    "medicam-cloud-agent.service",
+                ],
+                check=False,
+            )
+
     def test_known_legacy_sudoers_rules_are_removed_by_policy_matchers(self):
         legacy = [
             "radxa ALL=(ALL) NOPASSWD: ALL",

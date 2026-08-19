@@ -59,6 +59,9 @@ USB_POWER_IDS = {
 }
 SYSTEMD_ASSETS = {
     "medicam.service": Path("/etc/systemd/system/medicam.service"),
+    "medicam-cloud-agent.service": Path(
+        "/etc/systemd/system/medicam-cloud-agent.service"
+    ),
     "medicam-ble.service": Path("/etc/systemd/system/medicam-ble.service"),
     "medicam-ble-manager.service": Path(
         "/etc/systemd/system/medicam-ble-manager.service"
@@ -84,6 +87,9 @@ REQUIRED_SYSTEMD_ASSETS = {
     "medicam.service",
     "medicam-ble.service",
     "medicam-ble-manager.service",
+}
+ROLLBACK_REMOVABLE_SYSTEMD_ASSETS = {
+    "medicam-cloud-agent.service",
 }
 TAG_PATTERN = re.compile(r"^medicam-v\d+\.\d+\.\d+$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -936,6 +942,33 @@ def normalize_git_runtime_ownership() -> None:
             os.close(descriptor)
 
 
+def _install_systemd_assets(release_root: Path) -> set[str]:
+    """Install units present in a release and remove newer optional units.
+
+    Removing an optional unit during rollback is required when the older
+    checkout no longer contains the Python module used by that service.
+    """
+    installed = set()
+    for unit_name, destination in SYSTEMD_ASSETS.items():
+        source = release_root / "deploy" / "systemd" / unit_name
+        if not source.is_file():
+            if unit_name in REQUIRED_SYSTEMD_ASSETS:
+                raise ActivationError(f"signed systemd unit missing: {source}")
+            if unit_name in ROLLBACK_REMOVABLE_SYSTEMD_ASSETS:
+                run(
+                    ["/bin/systemctl", "disable", "--now", unit_name],
+                    check=False,
+                )
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+            continue
+        _atomic_install_text(destination, source.read_text(encoding="utf-8"), 0o644)
+        installed.add(unit_name)
+    return installed
+
+
 def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     source_helper = release_root / "scripts" / "medicam_ota_activate.py"
     source_signers = release_root / "deploy" / "ota_allowed_signers"
@@ -943,11 +976,6 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     for source in (source_helper, source_signers, source_image):
         if not source.is_file():
             raise ActivationError(f"signed release asset missing: {source}")
-    for unit_name in SYSTEMD_ASSETS:
-        source = release_root / "deploy" / "systemd" / unit_name
-        if unit_name in REQUIRED_SYSTEMD_ASSETS and not source.is_file():
-            raise ActivationError(f"signed systemd unit missing: {source}")
-
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chown(STATE_DIR, 0, _radxa_ids()[1])
     os.chmod(STATE_DIR, 0o770)
@@ -971,13 +999,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
         owner=(0, 0),
     )
     _atomic_install_text(DROP_IN, RUNTIME_DROP_IN, 0o644)
-    for unit_name, destination in SYSTEMD_ASSETS.items():
-        source = release_root / "deploy" / "systemd" / unit_name
-        if not source.is_file():
-            # Rollback to a release predating the root path activator keeps
-            # the installed idle path unit but restores every required unit.
-            continue
-        _atomic_install_text(destination, source.read_text(encoding="utf-8"), 0o644)
+    installed_units = _install_systemd_assets(release_root)
 
     # Install the next signed helper atomically. The currently running Python
     # process remains mapped, while the scheduled process uses this new file.
@@ -1003,6 +1025,15 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     run(["/bin/systemctl", "enable", "--now", "medicam-ota.path"])
     run(["/bin/systemctl", "enable", "--now", "medicam-ble-refresh.path"])
     run(["/bin/systemctl", "enable", "--now", "medicam-poweroff.path"])
+    if "medicam-cloud-agent.service" in installed_units:
+        run(
+            [
+                "/bin/systemctl",
+                "enable",
+                "--now",
+                "medicam-cloud-agent.service",
+            ]
+        )
 
 
 def reset_checkout(commit: str) -> None:
@@ -1095,6 +1126,11 @@ def restart_services() -> None:
     )
     run(
         ["/bin/systemctl", "try-restart", "medicam-ble.service"],
+        timeout=30,
+        check=False,
+    )
+    run(
+        ["/bin/systemctl", "try-restart", "medicam-cloud-agent.service"],
         timeout=30,
         check=False,
     )
