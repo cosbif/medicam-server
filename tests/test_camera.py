@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, mock_open, patch
 
 from app import camera
@@ -75,6 +76,42 @@ class CameraSettingsTests(unittest.TestCase):
 
 
 class CameraCommandTests(unittest.TestCase):
+    def test_persisted_recording_status_is_read_only_and_cross_process_safe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = os.path.join(temporary, "recording-state.json")
+            payload = {
+                "phase": "recording",
+                "output_file": os.path.join(temporary, "recording.mp4"),
+            }
+            with open(state_file, "w", encoding="utf-8") as output:
+                json.dump(payload, output)
+            before = Path(state_file).read_bytes()
+            recovery_loaded = camera.recovery_state_loaded
+
+            with patch.object(camera, "RECORDING_STATE_FILE", state_file):
+                status = camera.get_persisted_recording_status()
+
+            self.assertEqual(status["state"], "recording")
+            self.assertTrue(status["recording"])
+            self.assertTrue(status["capture_active"])
+            self.assertEqual(Path(state_file).read_bytes(), before)
+            self.assertEqual(camera.recovery_state_loaded, recovery_loaded)
+
+    def test_unsafe_persisted_recording_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = os.path.join(temporary, "target.json")
+            state_file = os.path.join(temporary, "recording-state.json")
+            with open(target, "w", encoding="utf-8") as output:
+                json.dump({"phase": "idle"}, output)
+            os.symlink(target, state_file)
+
+            with patch.object(camera, "RECORDING_STATE_FILE", state_file):
+                status = camera.get_persisted_recording_status()
+
+            self.assertEqual(status["state"], "unknown")
+            self.assertTrue(status["recording"])
+            self.assertTrue(status["capture_active"])
+
     @patch("app.camera.subprocess.run")
     def test_recording_probe_uses_fast_mp4_frame_count(self, run_mock):
         run_mock.return_value = Mock(

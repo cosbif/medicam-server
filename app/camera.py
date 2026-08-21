@@ -1474,6 +1474,52 @@ def get_settings():
     return dict(camera_settings)
 
 
+def get_persisted_recording_status() -> dict:
+    """Read cross-process recording state without invoking recovery logic."""
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(RECORDING_STATE_FILE, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024:
+                raise OSError("unsafe_recording_state")
+            payload = json.loads(os.read(descriptor, 64 * 1024 + 1))
+        finally:
+            os.close(descriptor)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid_recording_state")
+        phase = payload.get("phase")
+        if phase not in {
+            "idle",
+            "starting",
+            "recording",
+            "interrupted",
+            "finalizing",
+        }:
+            raise ValueError("invalid_recording_phase")
+    except FileNotFoundError:
+        phase = "idle"
+    except (OSError, ValueError, json.JSONDecodeError):
+        # An unreadable state must block disruptive operations until the
+        # backend can resolve it; treating it as idle would risk data loss.
+        phase = "unknown"
+
+    return {
+        "status": "ok" if phase != "unknown" else "error",
+        "state": phase,
+        "recording": phase in {
+            "starting",
+            "recording",
+            "interrupted",
+            "finalizing",
+            "unknown",
+        },
+        "capture_active": phase in {"starting", "recording", "unknown"},
+        "interrupted": phase == "interrupted",
+        "finalizing": phase == "finalizing",
+    }
+
+
 def get_preview_source() -> dict:
     """Return internal source data used by the authenticated preview route."""
     with recording_lock:

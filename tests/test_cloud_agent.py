@@ -161,6 +161,123 @@ class CloudAgentTests(unittest.TestCase):
         self.assertEqual(saved["completed_command_ids"], [command_id])
         self.assertEqual(saved["pending_command_results"], [])
 
+    def test_signed_update_start_is_opt_in_bounded_and_acknowledged(self):
+        command_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        client = FakeCloudClient(
+            command={
+                "id": command_id,
+                "command_type": "start_signed_update",
+                "parameters": {},
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            }
+        )
+        starts = []
+        config = CloudAgentConfig(
+            **{**self.config.__dict__, "allow_signed_update": True}
+        )
+        CloudAgent(
+            config,
+            client=client,
+            heartbeat_provider=lambda: self.heartbeat,
+            update_starter=lambda: starts.append(1)
+            or {
+                "job_id": "a" * 32,
+                "state": "queued",
+                "previous_commit": "b" * 40,
+                "message": "must not leave the camera",
+                "target_tag": None,
+            },
+        ).run_once()
+
+        self.assertEqual(starts, [1])
+        result = next(call[1] for call in client.calls if call[0].endswith("/result"))
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIsNone(result["diagnostics"])
+        self.assertEqual(result["signed_update"]["job_id"], "a" * 32)
+        self.assertEqual(result["signed_update"]["state"], "queued")
+        self.assertEqual(
+            result["signed_update"]["release_channel"],
+            "signed-stable",
+        )
+        self.assertEqual(result["signed_update"]["previous_commit"], "b" * 40)
+        self.assertNotIn("message", result["signed_update"])
+        self.assertNotIn("target_tag", result["signed_update"])
+
+    def test_signed_update_is_disabled_for_mac_simulator_by_default(self):
+        now = datetime.now(timezone.utc)
+        client = FakeCloudClient(
+            command={
+                "id": str(uuid.uuid4()),
+                "command_type": "start_signed_update",
+                "parameters": {},
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+            }
+        )
+        starts = []
+        CloudAgent(
+            self.config,
+            client=client,
+            heartbeat_provider=lambda: self.heartbeat,
+            update_starter=lambda: starts.append(1) or {},
+        ).run_once()
+
+        result = next(call[1] for call in client.calls if call[0].endswith("/result"))
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "signed_update_disabled")
+        self.assertEqual(starts, [])
+
+    def test_signed_update_result_retry_does_not_start_update_twice(self):
+        command_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        command = {
+            "id": command_id,
+            "command_type": "start_signed_update",
+            "parameters": {},
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        }
+
+        class FailFirstResultClient(FakeCloudClient):
+            def __init__(self):
+                super().__init__(command=command)
+                self.fail_result = True
+
+            def post(self, path: str, payload: dict, token: str) -> dict:
+                if path.endswith("/result") and self.fail_result:
+                    self.calls.append((path, payload, token))
+                    self.fail_result = False
+                    raise CloudAgentError("simulated network failure")
+                return super().post(path, payload, token)
+
+        starts = []
+        client = FailFirstResultClient()
+        config = CloudAgentConfig(
+            **{**self.config.__dict__, "allow_signed_update": True}
+        )
+        agent = CloudAgent(
+            config,
+            client=client,
+            heartbeat_provider=lambda: self.heartbeat,
+            update_starter=lambda: starts.append(1)
+            or {
+                "job_id": "c" * 32,
+                "state": "queued",
+                "previous_commit": None,
+            },
+        )
+        with self.assertRaisesRegex(CloudAgentError, "network failure"):
+            agent.run_once()
+        agent.run_once()
+
+        self.assertEqual(starts, [1])
+        self.assertEqual(
+            sum(call[0].endswith("/result") for call in client.calls),
+            2,
+        )
+
     def test_failed_result_upload_is_retried_without_reexecution(self):
         command_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -232,6 +349,13 @@ class CloudAgentTests(unittest.TestCase):
                 "parameters": {},
                 "created_at": (now - timedelta(minutes=2)).isoformat(),
                 "expires_at": (now - timedelta(seconds=1)).isoformat(),
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "command_type": "start_signed_update",
+                "parameters": {"tag": "medicam-v999.0.0"},
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=2)).isoformat(),
             },
         )
         for command in commands:

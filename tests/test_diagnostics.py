@@ -1,3 +1,4 @@
+import fcntl
 import io
 import json
 import os
@@ -78,6 +79,28 @@ class DiagnosticsTests(unittest.TestCase):
             with self.assertRaises(diagnostics.SelfTestBusyError) as context:
                 diagnostics.run_self_test()
         self.assertEqual(str(context.exception), "recording_in_progress")
+
+    def test_hardware_operation_lock_is_shared_between_processes(self):
+        lock_file = Path(self.tmp.name) / "hardware-operation.lock"
+        descriptor = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(
+                diagnostics,
+                "HARDWARE_OPERATION_LOCK_FILE",
+                lock_file,
+            ):
+                self.assertFalse(diagnostics.begin_recording_start())
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with patch.object(
+                diagnostics,
+                "HARDWARE_OPERATION_LOCK_FILE",
+                lock_file,
+            ):
+                self.assertTrue(diagnostics.begin_recording_start())
+                diagnostics.end_recording_start()
+        finally:
+            os.close(descriptor)
 
     def test_bundle_redacts_tokens_passwords_private_keys_and_ssid(self):
         log = Path(self.tmp.name) / "ffmpeg.log"

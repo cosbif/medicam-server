@@ -1,7 +1,7 @@
-"""Outbound Medicam cloud enrollment, heartbeat, and diagnostics agent.
+"""Outbound Medicam cloud enrollment, heartbeat, and bounded command agent.
 
-The only accepted command is a fixed diagnostics snapshot. There is no shell,
-path, log, video, or arbitrary command surface in this protocol.
+Accepted commands have fixed empty parameter schemas. There is no shell, path,
+log, video, release URL, branch, commit, or arbitrary command surface.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import ssl
 import stat
@@ -23,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from app import camera, storage_manager, utils, version_info
+from app import camera, storage_manager, update_control, utils, version_info
 
 
 DEFAULT_STATE_FILE = Path("/var/lib/medicam/cloud-state.json")
@@ -45,6 +46,7 @@ class CloudAgentConfig:
     bootstrap_token: str
     state_file: Path
     ca_file: Path | None
+    allow_signed_update: bool = False
     request_timeout_seconds: float = 15.0
     heartbeat_seconds: int = 30
 
@@ -79,6 +81,10 @@ class CloudAgentConfig:
                 )
             ),
             ca_file=Path(ca_value) if ca_value else None,
+            allow_signed_update=_environment_bool(
+                "MEDICAM_CLOUD_ALLOW_SIGNED_UPDATE",
+                False,
+            ),
             request_timeout_seconds=_environment_float(
                 "MEDICAM_CLOUD_REQUEST_TIMEOUT_SECONDS",
                 15.0,
@@ -120,6 +126,15 @@ def _environment_int(name: str, default: int, *, minimum: int, maximum: int) -> 
     if not minimum <= value <= maximum:
         raise CloudAgentError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _environment_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    raise CloudAgentError(f"{name} must be a boolean")
 
 
 def _environment_float(
@@ -270,7 +285,7 @@ class CloudHttpClient:
 
 def collect_heartbeat() -> dict:
     version = version_info.get_version_info()
-    recording = camera.get_recording_status()
+    recording = camera.get_persisted_recording_status()
     storage = storage_manager.get_storage_info()
     protocols = version.get("protocols", {})
     server = version.get("server", {})
@@ -407,6 +422,29 @@ def _normalize_diagnostics(payload: object) -> dict:
     }
 
 
+def _normalize_signed_update_start(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise CloudAgentError("invalid signed update result")
+    job_id = payload.get("job_id")
+    if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        raise CloudAgentError("invalid signed update job_id")
+    if payload.get("state") != "queued":
+        raise CloudAgentError("invalid signed update state")
+    previous_commit = payload.get("previous_commit")
+    if previous_commit is not None and (
+        not isinstance(previous_commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", previous_commit)
+    ):
+        raise CloudAgentError("invalid signed update previous_commit")
+    return {
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+        "job_id": job_id,
+        "state": "queued",
+        "release_channel": "signed-stable",
+        "previous_commit": previous_commit,
+    }
+
+
 class CloudAgent:
     def __init__(
         self,
@@ -415,6 +453,7 @@ class CloudAgent:
         client: CloudHttpClient | None = None,
         heartbeat_provider: Callable[[], dict] = collect_heartbeat,
         diagnostics_provider: Callable[[], dict] | None = None,
+        update_starter: Callable[[], dict] = update_control.start_signed_update,
     ):
         config.validate()
         self.config = config
@@ -423,6 +462,7 @@ class CloudAgent:
         self.diagnostics_provider = diagnostics_provider or (
             lambda: collect_diagnostics(self.heartbeat_provider)
         )
+        self.update_starter = update_starter
 
     def _state(self) -> dict:
         state = _read_state(self.config.state_file)
@@ -496,10 +536,13 @@ class CloudAgent:
         }
         if set(command) != expected:
             raise CloudAgentError("cloud command has unexpected fields")
-        if command["command_type"] != "collect_diagnostics":
+        if command["command_type"] not in {
+            "collect_diagnostics",
+            "start_signed_update",
+        }:
             raise CloudAgentError("unsupported cloud command")
         if command["parameters"] != {}:
-            raise CloudAgentError("diagnostics command parameters must be empty")
+            raise CloudAgentError("cloud command parameters must be empty")
         created_at = _parse_cloud_datetime(command["created_at"], "created_at")
         expires_at = _parse_cloud_datetime(command["expires_at"], "expires_at")
         ttl = expires_at - created_at
@@ -515,19 +558,59 @@ class CloudAgent:
             return {
                 "status": "failed",
                 "diagnostics": None,
+                "signed_update": None,
                 "error_code": "invalid_command",
             }
+        if command["command_type"] == "collect_diagnostics":
+            try:
+                diagnostics = _normalize_diagnostics(self.diagnostics_provider())
+            except Exception:
+                return {
+                    "status": "failed",
+                    "diagnostics": None,
+                    "signed_update": None,
+                    "error_code": "diagnostics_unavailable",
+                }
+            return {
+                "status": "succeeded",
+                "diagnostics": diagnostics,
+                "signed_update": None,
+                "error_code": None,
+            }
+        if not self.config.allow_signed_update:
+            return {
+                "status": "failed",
+                "diagnostics": None,
+                "signed_update": None,
+                "error_code": "signed_update_disabled",
+            }
         try:
-            diagnostics = _normalize_diagnostics(self.diagnostics_provider())
+            signed_update = _normalize_signed_update_start(self.update_starter())
+        except update_control.UpdateStartBlockedError as error:
+            allowed_codes = {
+                "recording_in_progress",
+                "update_in_progress",
+                "device_busy",
+            }
+            return {
+                "status": "failed",
+                "diagnostics": None,
+                "signed_update": None,
+                "error_code": (
+                    error.code if error.code in allowed_codes else "update_start_failed"
+                ),
+            }
         except Exception:
             return {
                 "status": "failed",
                 "diagnostics": None,
-                "error_code": "diagnostics_unavailable",
+                "signed_update": None,
+                "error_code": "update_start_failed",
             }
         return {
             "status": "succeeded",
-            "diagnostics": diagnostics,
+            "diagnostics": None,
+            "signed_update": signed_update,
             "error_code": None,
         }
 

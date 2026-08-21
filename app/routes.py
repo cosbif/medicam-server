@@ -16,6 +16,7 @@ from app import (
     diagnostics,
     preview,
     storage_manager,
+    update_control,
     updater,
     utils,
     version_info,
@@ -113,6 +114,12 @@ def start_recording(_ok: bool = Depends(require_api_auth)):
         )
         raise HTTPException(status_code=409, detail={"code": code})
     try:
+        update = updater.get_update_status()
+        if update.get("state") in updater.ACTIVE_STATES:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "update_in_progress"},
+            )
         return camera.start_recording()
     finally:
         diagnostics.end_recording_start()
@@ -770,24 +777,21 @@ async def update_status(_ok: bool = Depends(require_update_auth)):
 
 @router.post("/update/apply")
 async def update_apply(_ok: bool = Depends(require_update_auth)):
-    recording = camera.get_recording_status()
-    if recording.get("capture_active") or recording.get("state") in {
-        "starting",
-        "recording",
-        "finalizing",
-    }:
+    try:
+        return update_control.start_signed_update()
+    except update_control.UpdateStartBlockedError as error:
+        messages = {
+            "recording_in_progress": (
+                "Stop or recover the current recording before updating"
+            ),
+            "update_in_progress": "An update is already running",
+            "device_busy": "Another camera hardware operation is running",
+        }
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "recording_in_progress",
-                "state": recording["state"],
-                "message": "Stop or recover the current recording before updating",
+                "code": error.code,
+                "state": error.state,
+                "message": messages.get(error.code, "Update cannot be started"),
             },
-        )
-    try:
-        return updater.start_update()
-    except updater.UpdateBusyError as error:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": error.code, "message": error.message},
         ) from error

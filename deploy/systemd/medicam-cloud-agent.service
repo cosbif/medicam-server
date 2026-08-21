@@ -10,6 +10,7 @@ Group=radxa
 WorkingDirectory=/home/radxa/medicam-server
 Environment=PATH=/home/radxa/medicam-server/medicam-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=MEDICAM_CLOUD_STATE_FILE=/var/lib/medicam/cloud-state.json
+Environment=MEDICAM_CLOUD_ALLOW_SIGNED_UPDATE=1
 EnvironmentFile=-/etc/medicam/medicam.env
 ExecStart=/home/radxa/medicam-server/medicam-venv/bin/python -m app.cloud_agent
 Restart=on-failure
@@ -26,7 +27,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
 CapabilityBoundingSet=
-ReadWritePaths=/var/lib/medicam
+ReadWritePaths=/home/radxa/medicam-server /var/lib/medicam /var/lib/medicam-ota
 
 [Install]
 WantedBy=multi-user.target

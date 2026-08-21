@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import platform
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -48,6 +50,7 @@ LOG_FILES = {
 }
 
 _HARDWARE_OPERATION_LOCK = threading.Lock()
+_HARDWARE_OPERATION_DESCRIPTOR: int | None = None
 _SELF_TEST_ACTIVE = threading.Event()
 _SENSITIVE_VALUE_RE = re.compile(
     r"(?i)(api[_-]?token|x-medicam-token|authorization|password|passwd|psk|secret)"
@@ -59,6 +62,16 @@ _AUTH_HEADER_RE = re.compile(
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
     re.DOTALL,
+)
+HARDWARE_OPERATION_LOCK_FILE = Path(
+    os.environ.get(
+        "MEDICAM_HARDWARE_OPERATION_LOCK_FILE",
+        (
+            "/var/lib/medicam/hardware-operation.lock"
+            if platform.system() == "Linux"
+            else str(Path(tempfile.gettempdir()) / "medicam-hardware-operation.lock")
+        ),
+    )
 )
 _USB_ERROR_RE = re.compile(
     r"(?i)(no such device|vidioc_dqbuf|input/output error|usb disconnect|"
@@ -337,16 +350,53 @@ def is_self_test_running() -> bool:
     return _SELF_TEST_ACTIVE.is_set()
 
 
+def _begin_hardware_operation() -> bool:
+    global _HARDWARE_OPERATION_DESCRIPTOR
+
+    if not _HARDWARE_OPERATION_LOCK.acquire(blocking=False):
+        return False
+    descriptor = None
+    try:
+        HARDWARE_OPERATION_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(HARDWARE_OPERATION_LOCK_FILE, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("hardware_operation_lock_not_regular")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _HARDWARE_OPERATION_DESCRIPTOR = descriptor
+        return True
+    except (BlockingIOError, OSError):
+        if descriptor is not None:
+            os.close(descriptor)
+        _HARDWARE_OPERATION_LOCK.release()
+        return False
+
+
+def _end_hardware_operation() -> None:
+    global _HARDWARE_OPERATION_DESCRIPTOR
+
+    descriptor = _HARDWARE_OPERATION_DESCRIPTOR
+    _HARDWARE_OPERATION_DESCRIPTOR = None
+    if descriptor is not None:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    if _HARDWARE_OPERATION_LOCK.locked():
+        _HARDWARE_OPERATION_LOCK.release()
+
+
 def begin_recording_start() -> bool:
     """Reserve UVC/ALSA while the recorder opens both devices."""
     if _SELF_TEST_ACTIVE.is_set():
         return False
-    return _HARDWARE_OPERATION_LOCK.acquire(blocking=False)
+    return _begin_hardware_operation()
 
 
 def end_recording_start() -> None:
-    if _HARDWARE_OPERATION_LOCK.locked():
-        _HARDWARE_OPERATION_LOCK.release()
+    _end_hardware_operation()
 
 
 def _test_result(name: str, outcome: str, started: float, **fields) -> dict:
@@ -507,7 +557,7 @@ def get_last_self_test() -> dict | None:
 
 
 def run_self_test() -> dict:
-    if not _HARDWARE_OPERATION_LOCK.acquire(blocking=False):
+    if not _begin_hardware_operation():
         raise SelfTestBusyError("hardware_busy")
     _SELF_TEST_ACTIVE.set()
     started = time.monotonic()
@@ -541,7 +591,7 @@ def run_self_test() -> dict:
         if preview_paused:
             preview.resume()
         _SELF_TEST_ACTIVE.clear()
-        _HARDWARE_OPERATION_LOCK.release()
+        _end_hardware_operation()
 
 
 def sanitize_text(value: str, secrets: list[str] | None = None) -> str:

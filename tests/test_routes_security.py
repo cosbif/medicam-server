@@ -231,7 +231,7 @@ class RouteSecurityTests(unittest.TestCase):
 
     def test_update_is_rejected_while_recording(self):
         with patch(
-            "app.routes.camera.get_recording_status",
+            "app.routes.camera.get_persisted_recording_status",
             return_value={"recording": True, "state": "recording"},
         ):
             with patch("app.routes.updater.start_update") as apply_mock:
@@ -256,6 +256,24 @@ class RouteSecurityTests(unittest.TestCase):
         self.assertEqual(context.exception.detail["code"], "self_test_in_progress")
         start_mock.assert_not_called()
 
+    def test_recording_start_is_rejected_while_update_is_active(self):
+        with patch(
+            "app.routes.diagnostics.begin_recording_start",
+            return_value=True,
+        ), patch(
+            "app.routes.diagnostics.end_recording_start"
+        ) as release, patch(
+            "app.routes.updater.get_update_status",
+            return_value={"state": "checking"},
+        ), patch("app.routes.camera.start_recording") as start_mock:
+            with self.assertRaises(HTTPException) as context:
+                routes.start_recording(_ok=True)
+
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(context.exception.detail["code"], "update_in_progress")
+        start_mock.assert_not_called()
+        release.assert_called_once_with()
+
     def test_storage_cleanup_is_rejected_while_recording(self):
         with patch(
             "app.routes.camera.get_recording_status",
@@ -275,7 +293,7 @@ class RouteSecurityTests(unittest.TestCase):
 
     def test_update_can_repair_an_interrupted_recording(self):
         with patch(
-            "app.routes.camera.get_recording_status",
+            "app.routes.camera.get_persisted_recording_status",
             return_value={
                 "recording": True,
                 "capture_active": False,
