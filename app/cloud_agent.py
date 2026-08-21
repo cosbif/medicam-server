@@ -1,8 +1,7 @@
-"""Outbound Medicam cloud enrollment and heartbeat agent.
+"""Outbound Medicam cloud enrollment, heartbeat, and diagnostics agent.
 
-The agent deliberately has no command execution surface. Its first protocol
-revision only enrolls one device credential and publishes a bounded technical
-status payload over HTTPS.
+The only accepted command is a fixed diagnostics snapshot. There is no shell,
+path, log, video, or arbitrary command surface in this protocol.
 """
 
 from __future__ import annotations
@@ -18,8 +17,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +30,8 @@ DEFAULT_STATE_FILE = Path("/var/lib/medicam/cloud-state.json")
 DEFAULT_BOOTSTRAP_TOKEN_FILE = Path("/etc/medicam/cloud-bootstrap-token")
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_STATE_BYTES = 16 * 1024
+MAX_PENDING_COMMAND_RESULTS = 8
+MAX_COMPLETED_COMMAND_IDS = 128
 
 
 class CloudAgentError(RuntimeError):
@@ -292,6 +294,119 @@ def collect_heartbeat() -> dict:
     }
 
 
+def collect_diagnostics(heartbeat_provider: Callable[[], dict] = collect_heartbeat) -> dict:
+    heartbeat = heartbeat_provider()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "server_commit": heartbeat.get("server_commit"),
+        "server_release": heartbeat.get("server_release"),
+        "image_version": heartbeat.get("image_version"),
+        "app_protocol": heartbeat.get("app_protocol"),
+        "ble_protocol": heartbeat.get("ble_protocol"),
+        "uptime_seconds": heartbeat.get("uptime_seconds"),
+        "recording": heartbeat.get("recording"),
+        "storage": heartbeat.get("storage"),
+    }
+
+
+def _parse_cloud_datetime(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or len(value) > 40:
+        raise CloudAgentError(f"invalid command {field}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise CloudAgentError(f"invalid command {field}") from error
+    if parsed.tzinfo is None:
+        raise CloudAgentError(f"invalid command {field}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _bounded_optional_string(value: object, field: str, maximum: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > maximum:
+        raise CloudAgentError(f"invalid diagnostics {field}")
+    return value
+
+
+def _bounded_integer(value: object, field: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CloudAgentError(f"invalid diagnostics {field}")
+    if not minimum <= value <= maximum:
+        raise CloudAgentError(f"invalid diagnostics {field}")
+    return value
+
+
+def _normalize_diagnostics(payload: object) -> dict:
+    expected = {
+        "generated_at",
+        "server_commit",
+        "server_release",
+        "image_version",
+        "app_protocol",
+        "ble_protocol",
+        "uptime_seconds",
+        "recording",
+        "storage",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise CloudAgentError("invalid diagnostics fields")
+
+    generated_at = _parse_cloud_datetime(payload["generated_at"], "generated_at")
+    uptime = payload["uptime_seconds"]
+    if isinstance(uptime, bool) or not isinstance(uptime, (int, float)) or uptime < 0:
+        raise CloudAgentError("invalid diagnostics uptime_seconds")
+
+    recording = payload["recording"]
+    if not isinstance(recording, dict) or set(recording) != {"active", "state"}:
+        raise CloudAgentError("invalid diagnostics recording")
+    if not isinstance(recording["active"], bool):
+        raise CloudAgentError("invalid diagnostics recording.active")
+    recording_state = recording["state"]
+    if not isinstance(recording_state, str) or len(recording_state) > 40:
+        raise CloudAgentError("invalid diagnostics recording.state")
+
+    storage = payload["storage"]
+    if not isinstance(storage, dict) or set(storage) != {
+        "free_bytes",
+        "critical_space",
+    }:
+        raise CloudAgentError("invalid diagnostics storage")
+    free_bytes = storage["free_bytes"]
+    if isinstance(free_bytes, bool) or not isinstance(free_bytes, int) or free_bytes < 0:
+        raise CloudAgentError("invalid diagnostics storage.free_bytes")
+    if not isinstance(storage["critical_space"], bool):
+        raise CloudAgentError("invalid diagnostics storage.critical_space")
+
+    return {
+        "generated_at": generated_at.isoformat(),
+        "server_commit": _bounded_optional_string(
+            payload["server_commit"], "server_commit", 64
+        ),
+        "server_release": _bounded_optional_string(
+            payload["server_release"], "server_release", 80
+        ),
+        "image_version": _bounded_optional_string(
+            payload["image_version"], "image_version", 120
+        ),
+        "app_protocol": _bounded_integer(
+            payload["app_protocol"], "app_protocol", 1, 10000
+        ),
+        "ble_protocol": _bounded_integer(
+            payload["ble_protocol"], "ble_protocol", 1, 10000
+        ),
+        "uptime_seconds": float(uptime),
+        "recording": {
+            "active": recording["active"],
+            "state": recording_state,
+        },
+        "storage": {
+            "free_bytes": free_bytes,
+            "critical_space": storage["critical_space"],
+        },
+    }
+
+
 class CloudAgent:
     def __init__(
         self,
@@ -299,20 +414,30 @@ class CloudAgent:
         *,
         client: CloudHttpClient | None = None,
         heartbeat_provider: Callable[[], dict] = collect_heartbeat,
+        diagnostics_provider: Callable[[], dict] | None = None,
     ):
         config.validate()
         self.config = config
         self.client = client or CloudHttpClient(config)
         self.heartbeat_provider = heartbeat_provider
+        self.diagnostics_provider = diagnostics_provider or (
+            lambda: collect_diagnostics(self.heartbeat_provider)
+        )
 
-    def _device_token(self) -> str:
+    def _state(self) -> dict:
         state = _read_state(self.config.state_file)
         if not state:
-            return ""
+            return {}
         if state.get("device_id") != self.config.device_id:
             raise CloudAgentError("cloud state belongs to another device")
         if state.get("server_url") != self.config.server_url:
             raise CloudAgentError("cloud state belongs to another server")
+        return state
+
+    def _device_token(self) -> str:
+        state = self._state()
+        if not state:
+            return ""
         token = state.get("device_token")
         if not isinstance(token, str) or len(token) < 32:
             raise CloudAgentError("cloud state has no valid device credential")
@@ -345,13 +470,155 @@ class CloudAgent:
         )
         return device_token
 
+    @staticmethod
+    def _command_id(command: object) -> str:
+        if not isinstance(command, dict):
+            raise CloudAgentError("cloud command is not an object")
+        command_id = command.get("id")
+        if not isinstance(command_id, str) or len(command_id) != 36:
+            raise CloudAgentError("cloud command has an invalid ID")
+        try:
+            parsed = uuid.UUID(command_id)
+        except ValueError as error:
+            raise CloudAgentError("cloud command has an invalid ID") from error
+        if str(parsed) != command_id:
+            raise CloudAgentError("cloud command has a non-canonical ID")
+        return command_id
+
+    @staticmethod
+    def _validate_command(command: dict) -> None:
+        expected = {
+            "id",
+            "command_type",
+            "parameters",
+            "created_at",
+            "expires_at",
+        }
+        if set(command) != expected:
+            raise CloudAgentError("cloud command has unexpected fields")
+        if command["command_type"] != "collect_diagnostics":
+            raise CloudAgentError("unsupported cloud command")
+        if command["parameters"] != {}:
+            raise CloudAgentError("diagnostics command parameters must be empty")
+        created_at = _parse_cloud_datetime(command["created_at"], "created_at")
+        expires_at = _parse_cloud_datetime(command["expires_at"], "expires_at")
+        ttl = expires_at - created_at
+        if not timedelta(seconds=30) <= ttl <= timedelta(minutes=15):
+            raise CloudAgentError("cloud command has an invalid TTL")
+        if expires_at <= datetime.now(timezone.utc):
+            raise CloudAgentError("cloud command has expired")
+
+    def _execute_command(self, command: dict) -> dict:
+        try:
+            self._validate_command(command)
+        except CloudAgentError:
+            return {
+                "status": "failed",
+                "diagnostics": None,
+                "error_code": "invalid_command",
+            }
+        try:
+            diagnostics = _normalize_diagnostics(self.diagnostics_provider())
+        except Exception:
+            return {
+                "status": "failed",
+                "diagnostics": None,
+                "error_code": "diagnostics_unavailable",
+            }
+        return {
+            "status": "succeeded",
+            "diagnostics": diagnostics,
+            "error_code": None,
+        }
+
+    @staticmethod
+    def _completed_command_ids(state: dict) -> list[str]:
+        values = state.get("completed_command_ids", [])
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            raise CloudAgentError("invalid completed command journal")
+        return values[-MAX_COMPLETED_COMMAND_IDS:]
+
+    @staticmethod
+    def _pending_command_results(state: dict) -> list[dict]:
+        values = state.get("pending_command_results", [])
+        if not isinstance(values, list) or any(
+            not isinstance(value, dict)
+            or set(value) != {"id", "payload"}
+            or not isinstance(value.get("id"), str)
+            or not isinstance(value.get("payload"), dict)
+            for value in values
+        ):
+            raise CloudAgentError("invalid pending command journal")
+        if len(values) > MAX_PENDING_COMMAND_RESULTS:
+            raise CloudAgentError("pending command journal is too large")
+        return values
+
+    def _record_pending_result(
+        self,
+        command_id: str,
+        payload: dict,
+    ) -> None:
+        state = self._state()
+        pending = self._pending_command_results(state)
+        if any(receipt["id"] == command_id for receipt in pending):
+            return
+        if len(pending) >= MAX_PENDING_COMMAND_RESULTS:
+            raise CloudAgentError("pending command journal is full")
+        state["pending_command_results"] = [
+            *pending,
+            {"id": command_id, "payload": payload},
+        ]
+        _write_state(self.config.state_file, state)
+
+    def _submit_pending_results(self, token: str) -> None:
+        while True:
+            state = self._state()
+            pending = self._pending_command_results(state)
+            if not pending:
+                return
+            receipt = pending[0]
+            command_id = self._command_id(receipt)
+            self.client.post(
+                f"/api/v1/device/commands/{command_id}/result",
+                receipt["payload"],
+                token,
+            )
+            completed = self._completed_command_ids(state)
+            if command_id not in completed:
+                completed.append(command_id)
+            state["completed_command_ids"] = completed[-MAX_COMPLETED_COMMAND_IDS:]
+            state["pending_command_results"] = pending[1:]
+            _write_state(self.config.state_file, state)
+
+    def _process_one_command(self, token: str) -> None:
+        # A result is persisted before transmission. Retrying it first makes a
+        # network failure unable to trigger a second diagnostics collection.
+        self._submit_pending_results(token)
+        response = self.client.post("/api/v1/device/commands/poll", {}, token)
+        if set(response) != {"command", "server_time"}:
+            raise CloudAgentError("invalid cloud command poll response")
+        command = response["command"]
+        if command is None:
+            return
+        command_id = self._command_id(command)
+        state = self._state()
+        if command_id in self._completed_command_ids(state):
+            return
+        result = self._execute_command(command)
+        self._record_pending_result(command_id, result)
+        self._submit_pending_results(token)
+
     def run_once(self) -> dict:
         token = self._device_token() or self.enroll()
-        return self.client.post(
+        heartbeat_response = self.client.post(
             "/api/v1/device/heartbeat",
             self.heartbeat_provider(),
             token,
         )
+        self._process_one_command(token)
+        return heartbeat_response
 
     def run_forever(self) -> None:
         failures = 0

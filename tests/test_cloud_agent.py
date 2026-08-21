@@ -5,6 +5,8 @@ import os
 import stat
 import tempfile
 import unittest
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.cloud_agent import (
@@ -16,8 +18,9 @@ from app.cloud_agent import (
 
 
 class FakeCloudClient:
-    def __init__(self):
+    def __init__(self, command=None):
         self.calls = []
+        self.command = command
 
     def post(self, path: str, payload: dict, token: str) -> dict:
         self.calls.append((path, payload, token))
@@ -26,6 +29,13 @@ class FakeCloudClient:
                 "device_id": payload["device_id"],
                 "device_token": "device-token-" + "x" * 32,
             }
+        if path == "/api/v1/device/commands/poll":
+            return {
+                "command": self.command,
+                "server_time": "2026-08-21T10:00:00Z",
+            }
+        if path.endswith("/result"):
+            return {"state": payload["status"]}
         return {
             "accepted_at": "2026-01-01T00:00:00Z",
             "next_heartbeat_seconds": 30,
@@ -70,7 +80,11 @@ class CloudAgentTests(unittest.TestCase):
         self.assertEqual(result["next_heartbeat_seconds"], 30)
         self.assertEqual(
             [call[0] for call in client.calls],
-            ["/api/v1/device/enroll", "/api/v1/device/heartbeat"],
+            [
+                "/api/v1/device/enroll",
+                "/api/v1/device/heartbeat",
+                "/api/v1/device/commands/poll",
+            ],
         )
         saved = _read_state(self.state_file)
         self.assertEqual(saved["device_id"], "ABCD1234")
@@ -100,8 +114,140 @@ class CloudAgentTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0] for call in second_client.calls],
-            ["/api/v1/device/heartbeat"],
+            ["/api/v1/device/heartbeat", "/api/v1/device/commands/poll"],
         )
+
+    def test_diagnostics_command_is_bounded_and_acknowledged(self):
+        command_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        client = FakeCloudClient(
+            command={
+                "id": command_id,
+                "command_type": "collect_diagnostics",
+                "parameters": {},
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+            }
+        )
+        diagnostics_calls = []
+        diagnostics = {
+            "generated_at": now.isoformat(),
+            "server_commit": "a" * 40,
+            "server_release": "medicam-v1.2.29",
+            "image_version": "mac-simulator",
+            "app_protocol": 4,
+            "ble_protocol": 4,
+            "uptime_seconds": 1.0,
+            "recording": {"active": False, "state": "idle"},
+            "storage": {"free_bytes": 1000, "critical_space": False},
+        }
+        agent = CloudAgent(
+            self.config,
+            client=client,
+            heartbeat_provider=lambda: self.heartbeat,
+            diagnostics_provider=lambda: diagnostics_calls.append(1) or diagnostics,
+        )
+        agent.run_once()
+
+        self.assertEqual(diagnostics_calls, [1])
+        result_call = next(call for call in client.calls if call[0].endswith("/result"))
+        self.assertEqual(
+            result_call[0],
+            f"/api/v1/device/commands/{command_id}/result",
+        )
+        self.assertEqual(result_call[1]["status"], "succeeded")
+        self.assertEqual(set(result_call[1]["diagnostics"]), set(diagnostics))
+        saved = _read_state(self.state_file)
+        self.assertEqual(saved["completed_command_ids"], [command_id])
+        self.assertEqual(saved["pending_command_results"], [])
+
+    def test_failed_result_upload_is_retried_without_reexecution(self):
+        command_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        command = {
+            "id": command_id,
+            "command_type": "collect_diagnostics",
+            "parameters": {},
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=2)).isoformat(),
+        }
+
+        class FailFirstResultClient(FakeCloudClient):
+            def __init__(self):
+                super().__init__(command=command)
+                self.fail_result = True
+
+            def post(self, path: str, payload: dict, token: str) -> dict:
+                if path.endswith("/result") and self.fail_result:
+                    self.calls.append((path, payload, token))
+                    self.fail_result = False
+                    raise CloudAgentError("simulated network failure")
+                return super().post(path, payload, token)
+
+        client = FailFirstResultClient()
+        diagnostics_calls = []
+        agent = CloudAgent(
+            self.config,
+            client=client,
+            heartbeat_provider=lambda: self.heartbeat,
+            diagnostics_provider=lambda: diagnostics_calls.append(1)
+            or {
+                "generated_at": now.isoformat(),
+                "server_commit": None,
+                "server_release": None,
+                "image_version": "mac-simulator",
+                "app_protocol": 4,
+                "ble_protocol": 4,
+                "uptime_seconds": 1.0,
+                "recording": {"active": False, "state": "idle"},
+                "storage": {"free_bytes": 1000, "critical_space": False},
+            },
+        )
+        with self.assertRaisesRegex(CloudAgentError, "network failure"):
+            agent.run_once()
+        self.assertEqual(len(_read_state(self.state_file)["pending_command_results"]), 1)
+
+        agent.run_once()
+        self.assertEqual(diagnostics_calls, [1])
+        self.assertEqual(_read_state(self.state_file)["pending_command_results"], [])
+        self.assertEqual(
+            sum(call[0].endswith("/result") for call in client.calls),
+            2,
+        )
+
+    def test_arbitrary_and_expired_commands_are_never_executed(self):
+        now = datetime.now(timezone.utc)
+        diagnostics_calls = []
+        commands = (
+            {
+                "id": str(uuid.uuid4()),
+                "command_type": "run_shell",
+                "parameters": {"command": "cat /etc/shadow"},
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "command_type": "collect_diagnostics",
+                "parameters": {},
+                "created_at": (now - timedelta(minutes=2)).isoformat(),
+                "expires_at": (now - timedelta(seconds=1)).isoformat(),
+            },
+        )
+        for command in commands:
+            state_file = Path(self.temporary.name) / f"{command['id']}.json"
+            config = CloudAgentConfig(**{**self.config.__dict__, "state_file": state_file})
+            client = FakeCloudClient(command=command)
+            CloudAgent(
+                config,
+                client=client,
+                heartbeat_provider=lambda: self.heartbeat,
+                diagnostics_provider=lambda: diagnostics_calls.append(1) or {},
+            ).run_once()
+            result = next(call[1] for call in client.calls if call[0].endswith("/result"))
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error_code"], "invalid_command")
+        self.assertEqual(diagnostics_calls, [])
 
     def test_state_cannot_be_reused_for_another_server(self):
         client = FakeCloudClient()
