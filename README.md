@@ -43,6 +43,12 @@ medicam-venv/bin/python scripts/run_cloud_simulator.py \
   --once
 ```
 
+Файл bootstrap создаётся операторским инструментом облака с правами `0600`.
+Первый запуск эмулятора выполняет тот же one-time enrollment, который позже
+выполнит Radxa, и сохраняет постоянный device credential в указанном state-файле.
+Повторный запуск можно выполнить уже без `--bootstrap-token-file`: секрет из
+state-файла будет использован автоматически, а bootstrap повторно не передаётся.
+
 На Radxa параметры задаются в `/etc/medicam/medicam.env`:
 
 ```ini
