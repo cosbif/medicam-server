@@ -68,6 +68,14 @@ class AudioLevelTests(unittest.TestCase):
         self.assertAlmostEqual(stats["peak_dbfs"], expected_dbfs, places=1)
         self.assertTrue(stats["signal_detected"])
 
+    def test_quiet_signal_with_clear_peak_is_detected(self):
+        samples = [0] * 999 + [1_000]
+        stats = audio.calculate_pcm_s16le_stats(self._pcm(*samples))
+
+        self.assertLess(stats["rms_dbfs"], audio.SIGNAL_RMS_THRESHOLD_DBFS)
+        self.assertGreater(stats["peak_dbfs"], audio.SIGNAL_PEAK_THRESHOLD_DBFS)
+        self.assertTrue(stats["signal_detected"])
+
     def test_clipping_percentage_is_reported(self):
         stats = audio.calculate_pcm_s16le_stats(
             self._pcm(32_767, -32_768, 1_000, -1_000)

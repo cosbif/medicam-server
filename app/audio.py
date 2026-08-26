@@ -19,6 +19,8 @@ LEVEL_BUSY_ATTEMPTS = 4
 LEVEL_BUSY_RETRY_DELAY = 0.25
 AUDIO_BUFFER_TIME_US = 2_000_000
 AUDIO_PERIOD_TIME_US = 250_000
+SIGNAL_RMS_THRESHOLD_DBFS = -55.0
+SIGNAL_PEAK_THRESHOLD_DBFS = -50.0
 
 _ARECORD_DEVICE_RE = re.compile(
     r"^card\s+(?P<card_index>\d+):\s+"
@@ -192,7 +194,10 @@ def calculate_pcm_s16le_stats(data: bytes) -> dict:
         "rms_dbfs": round(rms_dbfs, 1),
         "peak_dbfs": round(peak_dbfs, 1),
         "clipped_percent": round(clipped * 100 / sample_count, 3),
-        "signal_detected": rms_dbfs >= -55.0,
+        "signal_detected": (
+            rms_dbfs >= SIGNAL_RMS_THRESHOLD_DBFS
+            or peak_dbfs >= SIGNAL_PEAK_THRESHOLD_DBFS
+        ),
     }
 
 
