@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from scripts import medicam_ota_activate as activate
 
@@ -243,6 +243,40 @@ publish-addresses=yes
         self.assertIn(("32e4", "0415"), activate.USB_POWER_IDS)
         self.assertIn('ATTR{idVendor}=="32e4"', rules)
         self.assertIn('ATTR{idProduct}=="0415"', rules)
+
+    def test_known_writable_vendor_unit_is_hardened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unit = Path(directory) / "rkaiq_3A.service"
+            unit.write_bytes(activate.RKAIQ_SYSTEMD_UNIT_CONTENT)
+            unit.chmod(0o666)
+            metadata = unit.stat()
+            with patch.object(activate, "RKAIQ_SYSTEMD_UNIT", unit), patch.object(
+                activate.os,
+                "fstat",
+                return_value=Mock(st_mode=metadata.st_mode, st_uid=0, st_gid=0),
+            ):
+                activate.harden_vendor_systemd_permissions()
+
+            self.assertEqual(unit.stat().st_mode & 0o777, 0o644)
+
+    def test_unexpected_writable_vendor_unit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unit = Path(directory) / "rkaiq_3A.service"
+            unit.write_text("[Service]\nExecStart=/tmp/untrusted\n", encoding="utf-8")
+            unit.chmod(0o666)
+            metadata = unit.stat()
+            with patch.object(activate, "RKAIQ_SYSTEMD_UNIT", unit), patch.object(
+                activate.os,
+                "fstat",
+                return_value=Mock(st_mode=metadata.st_mode, st_uid=0, st_gid=0),
+            ):
+                with self.assertRaisesRegex(
+                    activate.ActivationError,
+                    "unexpected writable vendor unit",
+                ):
+                    activate.harden_vendor_systemd_permissions()
+
+            self.assertEqual(unit.stat().st_mode & 0o777, 0o666)
 
     def test_root_restore_preserves_content_mode_and_ownership_metadata(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(

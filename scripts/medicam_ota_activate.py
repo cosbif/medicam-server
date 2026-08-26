@@ -52,6 +52,20 @@ AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
 AVAHI_DAEMON_CONFIG = Path("/etc/avahi/avahi-daemon.conf")
 USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
 USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
+RKAIQ_SYSTEMD_UNIT = Path("/usr/lib/systemd/system/rkaiq_3A.service")
+RKAIQ_SYSTEMD_UNIT_CONTENT = b"""[Unit]
+Description=Enable Rockchip camera engine rkaiq
+DefaultDependencies=no
+Before=rockchip.service
+
+[Service]
+Type=forking
+ExecStart=/etc/init.d/rkaiq_3A.sh start
+ExecStop=/etc/init.d/rkaiq_3A.sh stop
+
+[Install]
+WantedBy=sysinit.target
+"""
 USB_POWER_IDS = {
     ("eba4", "6579"),
     ("32e4", "0415"),
@@ -923,6 +937,37 @@ def install_usb_power_policy(release_root: Path) -> None:
             continue
 
 
+def harden_vendor_systemd_permissions() -> None:
+    """Repair the unsafe mode shipped for the known Radxa camera-engine unit."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(RKAIQ_SYSTEMD_UNIT, flags)
+    except FileNotFoundError:
+        return
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid) != (
+            0,
+            0,
+        ):
+            raise ActivationError(f"unsafe vendor systemd unit: {RKAIQ_SYSTEMD_UNIT}")
+        if not stat.S_IMODE(metadata.st_mode) & 0o022:
+            return
+        content = b""
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            content += chunk
+        if content != RKAIQ_SYSTEMD_UNIT_CONTENT:
+            raise ActivationError(
+                f"refusing unexpected writable vendor unit: {RKAIQ_SYSTEMD_UNIT}"
+            )
+        os.fchmod(descriptor, 0o644)
+    finally:
+        os.close(descriptor)
+
+
 def normalize_git_runtime_ownership() -> None:
     """Keep backend-owned Git cache files writable after root verification."""
     uid, gid = _radxa_ids()
@@ -984,6 +1029,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     install_ble_runtime(release_root)
     install_network_security(release_root)
     install_usb_power_policy(release_root)
+    harden_vendor_systemd_permissions()
     SYSTEM_SIGNERS.parent.mkdir(parents=True, exist_ok=True)
     INSTALLED_HELPER.parent.mkdir(parents=True, exist_ok=True)
     DROP_IN.parent.mkdir(parents=True, exist_ok=True)
