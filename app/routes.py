@@ -180,7 +180,7 @@ async def preview_stream(_ok: bool = Depends(require_api_auth)):
             "X-Content-Type-Options": "nosniff",
             "X-Medicam-Preview": (
                 "display=640x360;fps=10;format=mjpeg;framing=be32;"
-                "source=dynamic"
+                "idle-capture=1280x720;source=dynamic"
             ),
         },
     )

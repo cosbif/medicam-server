@@ -74,7 +74,7 @@ class PreviewCommandTests(unittest.TestCase):
         command = preview._idle_capture_command("/dev/video0")
 
         self.assertIn(
-            "--set-fmt-video=width=640,height=360,pixelformat=MJPG",
+            "--set-fmt-video=width=1280,height=720,pixelformat=MJPG",
             command,
         )
         self.assertIn("--set-parm=10", command)
@@ -82,6 +82,15 @@ class PreviewCommandTests(unittest.TestCase):
         self.assertIn("--stream-to=-", command)
         self.assertNotIn("ffmpeg", command)
         self.assertEqual(command[:4], ["nice", "-n", "19", "v4l2-ctl"])
+
+    def test_status_distinguishes_display_and_native_idle_capture_sizes(self):
+        status = preview.PreviewManager(enabled=True).status()
+
+        self.assertEqual((status["width"], status["height"]), (640, 360))
+        self.assertEqual(
+            (status["idle_capture_width"], status["idle_capture_height"]),
+            (1280, 720),
+        )
 
     def test_recording_preview_has_no_transcode_command(self):
         self.assertFalse(hasattr(preview, "_recording_transcode_command"))

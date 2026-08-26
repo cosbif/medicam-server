@@ -225,6 +225,10 @@ class RouteSecurityTests(unittest.TestCase):
             response, prefix, jpeg = asyncio.run(consume_one())
 
         self.assertEqual(response.media_type, "application/x-medicam-preview")
+        self.assertIn(
+            "idle-capture=1280x720",
+            response.headers["x-medicam-preview"],
+        )
         self.assertEqual(int.from_bytes(prefix, "big"), len(frame))
         self.assertEqual(jpeg, frame)
         unsubscribe_mock.assert_called_once_with()

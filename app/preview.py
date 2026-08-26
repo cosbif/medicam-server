@@ -18,6 +18,8 @@ from typing import BinaryIO, Callable
 
 PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 360
+PREVIEW_IDLE_CAPTURE_WIDTH = 1280
+PREVIEW_IDLE_CAPTURE_HEIGHT = 720
 PREVIEW_IDLE_FPS = 10
 PREVIEW_OUTPUT_FPS = 10
 PREVIEW_MAX_JPEG_BYTES = 8 * 1024 * 1024
@@ -45,7 +47,8 @@ def _idle_capture_command(camera_device: str) -> list[str]:
         "v4l2-ctl",
         "-d", camera_device,
         (
-            f"--set-fmt-video=width={PREVIEW_WIDTH},height={PREVIEW_HEIGHT},"
+            f"--set-fmt-video=width={PREVIEW_IDLE_CAPTURE_WIDTH},"
+            f"height={PREVIEW_IDLE_CAPTURE_HEIGHT},"
             "pixelformat=MJPG"
         ),
         f"--set-parm={PREVIEW_IDLE_FPS}",
@@ -399,6 +402,8 @@ class PreviewManager:
                 "subscribers": self._subscribers,
                 "width": PREVIEW_WIDTH,
                 "height": PREVIEW_HEIGHT,
+                "idle_capture_width": PREVIEW_IDLE_CAPTURE_WIDTH,
+                "idle_capture_height": PREVIEW_IDLE_CAPTURE_HEIGHT,
                 "fps": PREVIEW_OUTPUT_FPS,
                 "format": "mjpeg",
                 "transport": "compressed_passthrough",
