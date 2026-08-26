@@ -96,6 +96,37 @@ class RemoteVideoValidationTests(unittest.TestCase):
 
 
 class RemoteVideoLoopbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_already_terminal_cloud_state_does_not_block_future_polls(self):
+        class AlreadyClosedCloud:
+            def post(self, path, payload, token):
+                raise CloudAgentError(
+                    "cloud API returned HTTP 409",
+                    status_code=409,
+                )
+
+        service = object.__new__(RemoteVideoService)
+        service.client = AlreadyClosedCloud()
+        service._pending_terminal = (str(uuid.uuid4()), "closed", None)
+
+        await service._flush_pending_terminal("device-token")
+
+        self.assertIsNone(service._pending_terminal)
+
+    async def test_transient_terminal_report_failure_is_retained(self):
+        class UnavailableCloud:
+            def post(self, path, payload, token):
+                raise CloudAgentError("cloud API is unavailable")
+
+        pending = (str(uuid.uuid4()), "failed", "network_lost")
+        service = object.__new__(RemoteVideoService)
+        service.client = UnavailableCloud()
+        service._pending_terminal = pending
+
+        with self.assertRaisesRegex(RemoteVideoError, "unavailable"):
+            await service._flush_pending_terminal("device-token")
+
+        self.assertEqual(service._pending_terminal, pending)
+
     async def test_synthetic_track_reaches_authenticated_webrtc_peer(self):
         viewer = RTCPeerConnection()
         device = None

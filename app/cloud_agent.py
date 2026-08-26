@@ -36,7 +36,9 @@ MAX_COMPLETED_COMMAND_IDS = 128
 
 
 class CloudAgentError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -276,7 +278,10 @@ class CloudHttpClient:
                     raise CloudAgentError("cloud response is not an object")
                 return result
         except urllib.error.HTTPError as error:
-            raise CloudAgentError(f"cloud API returned HTTP {error.code}") from error
+            raise CloudAgentError(
+                f"cloud API returned HTTP {error.code}",
+                status_code=error.code,
+            ) from error
         except urllib.error.URLError as error:
             raise CloudAgentError("cloud API is unavailable") from error
         except (TimeoutError, json.JSONDecodeError) as error:

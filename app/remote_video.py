@@ -51,7 +51,9 @@ TURN_URL_RE = re.compile(
 
 
 class RemoteVideoError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -377,7 +379,10 @@ class RemoteVideoService:
         try:
             return await asyncio.to_thread(self.client.post, path, payload, token)
         except CloudAgentError as error:
-            raise RemoteVideoError(str(error)) from error
+            raise RemoteVideoError(
+                str(error),
+                status_code=error.status_code,
+            ) from error
 
     async def _report_state(
         self,
@@ -418,7 +423,15 @@ class RemoteVideoService:
         pending = self._pending_terminal
         if pending is None:
             return
-        await self._report_state(*pending, token)
+        try:
+            await self._report_state(*pending, token)
+        except RemoteVideoError as error:
+            # The viewer can close or revoke the cloud session before the
+            # device observes its peer closing. The terminal state is already
+            # durable in that case, so a retryable local report must not block
+            # every subsequent video-session poll forever.
+            if error.status_code not in {404, 409}:
+                raise
         self._pending_terminal = None
 
     async def _start_session(self, delivery: dict, token: str) -> None:
