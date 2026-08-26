@@ -400,7 +400,7 @@ class BleManagerTests(unittest.TestCase):
         self.assertFalse(should_run_ble(True, True, False, False))
         self.assertTrue(should_run_ble(True, True, False, False, True))
 
-    def test_development_units_explicitly_enable_open_access(self):
+    def test_production_units_require_explicit_open_access_override(self):
         deploy = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
         for name in (
             "medicam.service",
@@ -408,9 +408,14 @@ class BleManagerTests(unittest.TestCase):
             "medicam-ble-manager.service",
         ):
             with self.subTest(unit=name):
-                self.assertIn(
+                content = (deploy / name).read_text(encoding="utf-8")
+                self.assertNotIn(
                     "Environment=MEDICAM_DEVELOPMENT_OPEN_ACCESS=1",
-                    (deploy / name).read_text(encoding="utf-8"),
+                    content,
+                )
+                self.assertIn(
+                    "EnvironmentFile=-/etc/medicam/medicam.env",
+                    content,
                 )
 
     def test_manager_stops_and_disables_legacy_ble_service(self):
