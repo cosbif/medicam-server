@@ -213,8 +213,8 @@ publish-addresses=yes
             sysfs = root / "sysfs"
             camera = sysfs / "1-1.2"
             (camera / "power").mkdir(parents=True)
-            (camera / "idVendor").write_text("eba4\n", encoding="ascii")
-            (camera / "idProduct").write_text("6579\n", encoding="ascii")
+            (camera / "idVendor").write_text("32e4\n", encoding="ascii")
+            (camera / "idProduct").write_text("0415\n", encoding="ascii")
             (camera / "power" / "control").write_text("auto\n", encoding="ascii")
 
             with patch.object(activate, "USB_POWER_RULES_FILE", destination), patch.object(
@@ -231,6 +231,18 @@ publish-addresses=yes
             run.assert_called_once_with(
                 ["/usr/bin/udevadm", "control", "--reload-rules"]
             )
+
+    def test_deployed_usb_policy_covers_the_production_camera(self):
+        rules = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "udev"
+            / "99-medicam-usb-power.rules"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(("32e4", "0415"), activate.USB_POWER_IDS)
+        self.assertIn('ATTR{idVendor}=="32e4"', rules)
+        self.assertIn('ATTR{idProduct}=="0415"', rules)
 
     def test_root_restore_preserves_content_mode_and_ownership_metadata(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(

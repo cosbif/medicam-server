@@ -1,6 +1,7 @@
 # Medicam FullHD/30 capture must not be runtime-suspended. The composite UVC
 # camera also carries USB audio, so one USB reset interrupts both streams.
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="eba4", ATTR{idProduct}=="6579", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="32e4", ATTR{idProduct}=="0415", TEST=="power/control", ATTR{power/control}="on"
 
 # Protect both USB 2 and USB 3 sides of the supported VIA Type-C hub. A powered
 # hub or direct OTG adapter is still recommended for production hardware.

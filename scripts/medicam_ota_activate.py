@@ -54,6 +54,7 @@ USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
 USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
 USB_POWER_IDS = {
     ("eba4", "6579"),
+    ("32e4", "0415"),
     ("2109", "2817"),
     ("2109", "0817"),
 }
