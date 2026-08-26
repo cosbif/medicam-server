@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, mock_open, patch
+from unittest.mock import Mock, call, mock_open, patch
 
 from app import camera
 
@@ -73,6 +73,88 @@ class CameraSettingsTests(unittest.TestCase):
                 "audio_device": "plughw:CARD=Mic,DEV=0",
             },
         )
+
+
+class CameraExposureControlTests(unittest.TestCase):
+    @patch("app.camera._set_v4l2_control")
+    @patch(
+        "app.camera._read_v4l2_controls",
+        return_value={"auto_exposure": 3, "exposure_time_absolute": 156},
+    )
+    @patch("app.camera._camera_usb_identity", return_value=("32e4", "0415"))
+    def test_production_camera_locks_current_exposure_for_fullhd30(
+        self,
+        _identity,
+        _read_controls,
+        set_control,
+    ):
+        state = camera._lock_recording_exposure(
+            "/dev/video0",
+            "1920x1080",
+            "30",
+        )
+
+        self.assertTrue(state["required"])
+        self.assertTrue(state["applied"])
+        self.assertEqual(state["original_exposure_time_absolute"], 156)
+        self.assertEqual(
+            set_control.call_args_list,
+            [
+                call("/dev/video0", "auto_exposure", 1),
+                call(
+                    "/dev/video0", "exposure_time_absolute", 156
+                ),
+            ],
+        )
+
+    @patch("app.camera._set_v4l2_control")
+    @patch("app.camera._is_character_device", return_value=True)
+    def test_exposure_restore_returns_original_manual_value_then_auto_mode(
+        self,
+        _is_device,
+        set_control,
+    ):
+        restored = camera._restore_recording_exposure(
+            {
+                "applied": True,
+                "device": "/dev/video0",
+                "original_auto_exposure": 3,
+                "original_exposure_time_absolute": 156,
+            }
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(
+            set_control.call_args_list,
+            [
+                call("/dev/video0", "auto_exposure", 1),
+                call(
+                    "/dev/video0", "exposure_time_absolute", 156
+                ),
+                call("/dev/video0", "auto_exposure", 3),
+            ],
+        )
+
+    @patch("app.camera._set_v4l2_control")
+    @patch(
+        "app.camera._read_v4l2_controls",
+        return_value={"auto_exposure": 3, "exposure_time_absolute": 156},
+    )
+    @patch("app.camera._camera_usb_identity", return_value=("eba4", "6579"))
+    def test_other_camera_revisions_keep_their_native_controls(
+        self,
+        _identity,
+        _read_controls,
+        set_control,
+    ):
+        state = camera._lock_recording_exposure(
+            "/dev/video0",
+            "1920x1080",
+            "30",
+        )
+
+        self.assertIsNone(state)
+        set_control.assert_not_called()
 
 
 class CameraCommandTests(unittest.TestCase):
@@ -287,6 +369,7 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_started_at_monotonic = None
         camera.recording_started_at_utc = None
         camera.recording_camera_device = None
+        camera.recording_camera_control_state = None
         camera.recording_video_size = None
         camera.recording_fps = None
         camera.recording_capture_format = None
@@ -309,6 +392,7 @@ class CameraLifecycleTests(unittest.TestCase):
         camera.recording_started_at_monotonic = None
         camera.recording_started_at_utc = None
         camera.recording_camera_device = None
+        camera.recording_camera_control_state = None
         camera.recording_video_size = None
         camera.recording_fps = None
         camera.recording_capture_format = None
@@ -419,17 +503,28 @@ class CameraLifecycleTests(unittest.TestCase):
                     "started_at": "2026-01-01T00:00:00+00:00",
                     "video_size": "1920x1080",
                     "fps": "30",
+                    "camera_control_state": {
+                        "applied": True,
+                        "device": "/dev/video0",
+                        "original_auto_exposure": 3,
+                        "original_exposure_time_absolute": 156,
+                    },
                 },
                 state,
             )
         camera.recovery_state_loaded = False
 
-        status = camera.get_recording_status()
+        with patch(
+            "app.camera._restore_recording_exposure",
+            return_value=True,
+        ) as restore_exposure:
+            status = camera.get_recording_status()
 
         self.assertEqual(status["state"], "interrupted")
         self.assertTrue(status["recording"])
         self.assertTrue(status["recoverable"])
         self.assertEqual(status["last_error"]["code"], "backend_restarted")
+        restore_exposure.assert_called_once()
 
     @patch("app.camera._probe_recording")
     @patch("app.camera.subprocess.run")

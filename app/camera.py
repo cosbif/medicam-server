@@ -43,6 +43,8 @@ MIN_RECORDING_FREE_BYTES = int(
 WATCHDOG_INTERVAL_SECONDS = 0.5
 HEALTHY_FRAME_DELIVERY_RATIO = 0.995
 HEALTHY_AVG_FPS = 29.5
+V4L2_CONTROL_TIMEOUT = 5.0
+FULLHD30_EXPOSURE_LOCK_CAMERAS = {("32e4", "0415")}
 
 camera_settings = {
     "resolution": "FHD",
@@ -82,6 +84,7 @@ recording_phase = "idle"
 recording_started_at_monotonic = None
 recording_started_at_utc = None
 recording_camera_device = None
+recording_camera_control_state = None
 recording_video_size = None
 recording_fps = None
 recording_capture_format = None
@@ -187,6 +190,174 @@ def find_camera_device(timeout: float = CAMERA_DISCOVERY_TIMEOUT):
     if platform.system() == "Windows":
         return "video=AT025"
     return None
+
+
+def _camera_usb_identity(camera_device: str) -> tuple[str, str] | None:
+    try:
+        result = subprocess.run(
+            [
+                "udevadm",
+                "info",
+                "--query=property",
+                f"--name={os.path.realpath(camera_device)}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=V4L2_CONTROL_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key] = value.strip().lower()
+    vendor_id = properties.get("ID_VENDOR_ID")
+    model_id = properties.get("ID_MODEL_ID")
+    return (vendor_id, model_id) if vendor_id and model_id else None
+
+
+def _read_v4l2_controls(camera_device: str) -> dict[str, int] | None:
+    try:
+        result = subprocess.run(
+            [
+                "v4l2-ctl",
+                "-d",
+                camera_device,
+                "--get-ctrl=auto_exposure,exposure_time_absolute",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=V4L2_CONTROL_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    controls = {}
+    for line in result.stdout.splitlines():
+        name, separator, raw_value = line.partition(":")
+        value = raw_value.strip().split(maxsplit=1)[0] if separator else ""
+        try:
+            controls[name.strip()] = int(value)
+        except ValueError:
+            continue
+    required = {"auto_exposure", "exposure_time_absolute"}
+    return controls if required.issubset(controls) else None
+
+
+def _set_v4l2_control(camera_device: str, name: str, value: int) -> None:
+    result = subprocess.run(
+        [
+            "v4l2-ctl",
+            "-d",
+            camera_device,
+            f"--set-ctrl={name}={int(value)}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=V4L2_CONTROL_TIMEOUT,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OSError(result.stderr.strip() or f"failed to set {name}")
+
+
+def _lock_recording_exposure(
+    camera_device: str,
+    video_size: str,
+    fps: str,
+) -> dict | None:
+    identity = _camera_usb_identity(camera_device)
+    if (
+        identity not in FULLHD30_EXPOSURE_LOCK_CAMERAS
+        or video_size != "1920x1080"
+        or str(fps) != "30"
+    ):
+        return None
+    state = {
+        "required": True,
+        "applied": False,
+        "device": camera_device,
+        "vendor_id": identity[0],
+        "model_id": identity[1],
+        "mode": "locked_current_exposure",
+    }
+    controls = _read_v4l2_controls(camera_device)
+    if controls is None:
+        state["error"] = "camera_exposure_controls_unavailable"
+        return state
+    state.update(
+        {
+            "original_auto_exposure": controls["auto_exposure"],
+            "original_exposure_time_absolute": controls[
+                "exposure_time_absolute"
+            ],
+        }
+    )
+    try:
+        _set_v4l2_control(camera_device, "auto_exposure", 1)
+        state["applied"] = True
+        _set_v4l2_control(
+            camera_device,
+            "exposure_time_absolute",
+            controls["exposure_time_absolute"],
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        state["error"] = f"camera_exposure_lock_failed: {error}"
+        _restore_recording_exposure(state)
+        state["applied"] = False
+        return state
+    return state
+
+
+def _restore_recording_exposure(state: dict | None) -> bool:
+    if not isinstance(state, dict) or not state.get("applied"):
+        return False
+    camera_device = str(state.get("device") or "")
+    real_device = os.path.realpath(camera_device)
+    original_auto = state.get("original_auto_exposure")
+    original_exposure = state.get("original_exposure_time_absolute")
+    if (
+        not real_device.startswith("/dev/video")
+        or not _is_character_device(camera_device)
+        or original_auto not in {1, 3}
+        or not isinstance(original_exposure, int)
+        or not 1 <= original_exposure <= 8188
+    ):
+        return False
+    try:
+        _set_v4l2_control(camera_device, "auto_exposure", 1)
+        _set_v4l2_control(
+            camera_device,
+            "exposure_time_absolute",
+            original_exposure,
+        )
+        _set_v4l2_control(camera_device, "auto_exposure", original_auto)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _public_camera_control_state(state: dict | None) -> dict | None:
+    if not isinstance(state, dict):
+        return None
+    return {
+        key: state[key]
+        for key in ("required", "applied", "mode", "vendor_id", "model_id", "error")
+        if key in state
+    }
+
+
+def _release_recording_camera_controls() -> None:
+    global recording_camera_control_state
+
+    _restore_recording_exposure(recording_camera_control_state)
+    recording_camera_control_state = None
 
 
 def count_mjpeg_frames(path: str) -> int:
@@ -389,8 +560,10 @@ def _clear_recording_state():
     global recording_remux_command, recording_phase
     global recording_started_at_monotonic, recording_started_at_utc
     global recording_camera_device, recording_video_size, recording_fps
+    global recording_camera_control_state
     global recording_capture_format, recording_generation
 
+    _release_recording_camera_controls()
     capture_process = None
     audio_process = None
     ffmpeg_process = None
@@ -404,6 +577,7 @@ def _clear_recording_state():
     recording_started_at_monotonic = None
     recording_started_at_utc = None
     recording_camera_device = None
+    recording_camera_control_state = None
     recording_video_size = None
     recording_fps = None
     recording_capture_format = None
@@ -569,6 +743,7 @@ def _persist_recording_state_locked():
         "audio_lead_seconds": recording_audio_lead_seconds,
         "started_at": recording_started_at_utc,
         "camera_device": recording_camera_device,
+        "camera_control_state": recording_camera_control_state,
         "video_size": recording_video_size,
         "fps": recording_fps,
         "capture_format": recording_capture_format,
@@ -589,6 +764,7 @@ def _restore_recording_state_locked():
     global recording_audio_device, recording_audio_lead_seconds
     global recording_remux_command, recording_started_at_utc
     global recording_camera_device, recording_video_size, recording_fps
+    global recording_camera_control_state
     global recording_capture_format, last_recording_error
 
     if recovery_state_loaded:
@@ -607,6 +783,11 @@ def _restore_recording_state_locked():
     saved_error = saved.get("last_error")
     if isinstance(saved_error, dict):
         last_recording_error = dict(saved_error)
+
+    saved_camera_control_state = saved.get("camera_control_state")
+    if isinstance(saved_camera_control_state, dict):
+        recording_camera_control_state = dict(saved_camera_control_state)
+        _release_recording_camera_controls()
 
     output_file = saved.get("output_file")
     if not _path_is_within(output_file, utils.VIDEOS_DIR):
@@ -799,6 +980,7 @@ def _refresh_recording_state_locked():
             "Video capture process disappeared unexpectedly",
         )
         _stop_capture_process(audio_process)
+        _release_recording_camera_controls()
         return
     video_return_code = video_process.poll()
     if video_return_code is not None:
@@ -807,6 +989,7 @@ def _refresh_recording_state_locked():
             f"Video capture exited unexpectedly with code {video_return_code}",
         )
         _stop_capture_process(audio_process)
+        _release_recording_camera_controls()
         return
     try:
         disk_free = shutil.disk_usage(utils.VIDEOS_DIR).free
@@ -822,6 +1005,7 @@ def _refresh_recording_state_locked():
         )
         _stop_capture_process(video_process)
         _stop_capture_process(audio_process)
+        _release_recording_camera_controls()
         return
     if recording_audio_file is not None:
         if audio_process is None:
@@ -830,6 +1014,7 @@ def _refresh_recording_state_locked():
                 "Audio capture process disappeared unexpectedly",
             )
             _stop_capture_process(video_process)
+            _release_recording_camera_controls()
             return
         audio_return_code = audio_process.poll()
         if audio_return_code is not None:
@@ -838,6 +1023,7 @@ def _refresh_recording_state_locked():
                 f"Audio capture exited unexpectedly with code {audio_return_code}",
             )
             _stop_capture_process(video_process)
+            _release_recording_camera_controls()
 
 
 def _watch_recording(generation: int):
@@ -854,6 +1040,8 @@ def _watch_recording(generation: int):
         if processes_to_stop:
             for process in processes_to_stop:
                 _stop_capture_process(process)
+            with recording_lock:
+                _release_recording_camera_controls()
             _preview_call("recording_stopped")
             _preview_call("recording_finished")
             return
@@ -884,6 +1072,7 @@ def start_recording():
     global recording_remux_command, recording_phase
     global recording_started_at_monotonic, recording_started_at_utc
     global recording_camera_device, recording_video_size, recording_fps
+    global recording_camera_control_state
     global recording_capture_format, recording_generation
     global last_recording_error
 
@@ -1022,6 +1211,7 @@ def start_recording():
         recording_audio_device = selected_audio_device
         recording_audio_lead_seconds = 0.0
         recording_camera_device = camera_device
+        recording_camera_control_state = None
         recording_video_size = video_size
         recording_fps = fps
         recording_capture_format = capture_format
@@ -1030,7 +1220,6 @@ def start_recording():
         recording_phase = "starting"
         recording_generation += 1
         last_recording_error = None
-        _persist_recording_state_locked()
         if capture_command:
             # Release the idle SD camera owner before ALSA/UVC startup. The
             # preview branch remains stopped until the first FullHD byte proves
@@ -1041,6 +1230,12 @@ def start_recording():
                 raw_file,
                 float(fps),
             )
+            recording_camera_control_state = _lock_recording_exposure(
+                camera_device,
+                video_size,
+                fps,
+            )
+        _persist_recording_state_locked()
 
         try:
             ffmpeg_log_file = open(FFMPEG_LOG_FILE, "w", encoding="utf-8")
@@ -1208,6 +1403,9 @@ def start_recording():
             "device": camera_device,
             "resolution": video_size,
             "fps": fps,
+            "frame_rate_control": _public_camera_control_state(
+                recording_camera_control_state
+            ),
             "audio": {
                 "enabled": bool(audio_command),
                 "device": selected_audio_device,
@@ -1282,6 +1480,7 @@ def stop_recording():
         )
         capture_return_code = _stop_capture_process(capture)
         audio_return_code = _stop_capture_process(audio_capture)
+        _release_recording_camera_controls()
         if capture is not None and not capture_was_running:
             warning_parts.append(
                 f"Video capture ended before stop (code {capture_return_code})"
@@ -1569,6 +1768,9 @@ def get_recording_status():
         capture_format = recording_capture_format
         error = dict(last_recording_error) if last_recording_error else None
         audio_device = recording_audio_device
+        camera_control_state = _public_camera_control_state(
+            recording_camera_control_state
+        )
         audio_lead = recording_audio_lead_seconds
         audio_enabled_for_recording = recording_audio_file is not None
 
@@ -1606,6 +1808,7 @@ def get_recording_status():
         "camera": {
             "available": available_camera is not None,
             "device": camera_device or available_camera,
+            "frame_rate_control": camera_control_state,
         },
         "last_error": error,
         "audio": {
