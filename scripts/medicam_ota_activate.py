@@ -52,6 +52,12 @@ AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
 AVAHI_DAEMON_CONFIG = Path("/etc/avahi/avahi-daemon.conf")
 USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
 USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
+WIREPLUMBER_LUA_POLICY_FILE = Path(
+    "/etc/wireplumber/main.lua.d/51-medicam-camera-audio.lua"
+)
+WIREPLUMBER_CONF_POLICY_FILE = Path(
+    "/etc/wireplumber/wireplumber.conf.d/51-medicam-camera-audio.conf"
+)
 RKAIQ_SYSTEMD_UNIT = Path("/usr/lib/systemd/system/rkaiq_3A.service")
 RKAIQ_SYSTEMD_UNIT_CONTENT = b"""[Unit]
 Description=Enable Rockchip camera engine rkaiq
@@ -937,6 +943,39 @@ def install_usb_power_policy(release_root: Path) -> None:
             continue
 
 
+def install_audio_ownership_policy(release_root: Path) -> None:
+    policies = (
+        (
+            release_root
+            / "deploy"
+            / "wireplumber"
+            / "51-medicam-camera-audio.lua",
+            WIREPLUMBER_LUA_POLICY_FILE,
+        ),
+        (
+            release_root
+            / "deploy"
+            / "wireplumber"
+            / "51-medicam-camera-audio.conf",
+            WIREPLUMBER_CONF_POLICY_FILE,
+        ),
+    )
+    if not all(source.is_file() for source, _ in policies):
+        # Rollbacks to releases before this policy keep exclusive microphone
+        # ownership rather than allowing a desktop session to seize ALSA.
+        return
+    for source, destination in policies:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _safe_atomic_write(
+            destination,
+            source.read_bytes(),
+            mode=0o644,
+            owner=(0, 0),
+        )
+    # User services immediately reload the system-wide rule on restart.
+    run(["/usr/bin/pkill", "-x", "wireplumber"], check=False)
+
+
 def harden_vendor_systemd_permissions() -> None:
     """Repair the unsafe mode shipped for the known Radxa camera-engine unit."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1029,6 +1068,7 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     install_ble_runtime(release_root)
     install_network_security(release_root)
     install_usb_power_policy(release_root)
+    install_audio_ownership_policy(release_root)
     harden_vendor_systemd_permissions()
     SYSTEM_SIGNERS.parent.mkdir(parents=True, exist_ok=True)
     INSTALLED_HELPER.parent.mkdir(parents=True, exist_ok=True)

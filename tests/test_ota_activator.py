@@ -244,6 +244,52 @@ publish-addresses=yes
         self.assertIn('ATTR{idVendor}=="32e4"', rules)
         self.assertIn('ATTR{idProduct}=="0415"', rules)
 
+    def test_audio_policy_excludes_only_the_production_camera_from_wireplumber(self):
+        deploy = Path(__file__).resolve().parents[1] / "deploy" / "wireplumber"
+        lua = (deploy / "51-medicam-camera-audio.lua").read_text(encoding="utf-8")
+        conf = (deploy / "51-medicam-camera-audio.conf").read_text(encoding="utf-8")
+
+        for content in (lua, conf):
+            self.assertIn("alsa_card.usb-4K_USB_Camera_4K_USB_Camera_01.00.00-", content)
+            self.assertIn("device.disabled", content)
+        self.assertNotIn("alsa_card.*", lua)
+
+    def test_audio_policy_is_installed_for_old_and_new_wireplumber(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "release" / "deploy" / "wireplumber"
+            source.mkdir(parents=True)
+            (source / "51-medicam-camera-audio.lua").write_text(
+                "lua policy\n", encoding="utf-8"
+            )
+            (source / "51-medicam-camera-audio.conf").write_text(
+                "conf policy\n", encoding="utf-8"
+            )
+            lua_destination = root / "etc" / "main.lua.d" / "policy.lua"
+            conf_destination = root / "etc" / "conf.d" / "policy.conf"
+            with patch.object(
+                activate,
+                "WIREPLUMBER_LUA_POLICY_FILE",
+                lua_destination,
+            ), patch.object(
+                activate,
+                "WIREPLUMBER_CONF_POLICY_FILE",
+                conf_destination,
+            ), patch.object(activate.os, "fchown"), patch.object(
+                activate,
+                "run",
+            ) as run:
+                activate.install_audio_ownership_policy(root / "release")
+
+            self.assertEqual(lua_destination.read_text(), "lua policy\n")
+            self.assertEqual(conf_destination.read_text(), "conf policy\n")
+            self.assertEqual(lua_destination.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(conf_destination.stat().st_mode & 0o777, 0o644)
+            run.assert_called_once_with(
+                ["/usr/bin/pkill", "-x", "wireplumber"],
+                check=False,
+            )
+
     def test_known_writable_vendor_unit_is_hardened(self):
         with tempfile.TemporaryDirectory() as directory:
             unit = Path(directory) / "rkaiq_3A.service"
