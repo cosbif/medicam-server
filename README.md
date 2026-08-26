@@ -82,10 +82,18 @@ channel, shell, пути к файлам и доступ к медиатеке �
 medicam-venv/bin/python -m unittest -v tests.test_remote_video
 ```
 
-Unit-файл Radxa включает `MEDICAM_PREVIEW_ENABLED=1`,
-`MEDICAM_REMOTE_VIDEO_ENABLED=1` и production-источник `preview`. Адрес облака
-по-прежнему задаётся отдельно в `/etc/medicam/medicam.env`; без него backend
-fail-closed не запускает удалённый медиаконтур.
+Unit-файл Radxa включает `MEDICAM_PREVIEW_ENABLED=1` и production-источник
+`preview`. Удалённый медиаконтур по умолчанию отключён, поэтому автономный
+локальный сервер запускается без конфигурации облака. После регистрации камеры
+в `/etc/medicam/medicam.env` одновременно задаются URL и явный флаг:
+
+```ini
+MEDICAM_CLOUD_URL=https://api.medicam-cloud.ru
+MEDICAM_REMOTE_VIDEO_ENABLED=1
+```
+
+Неполная конфигурация с включённым remote video, но без облачного URL остаётся
+ошибкой и останавливает backend по принципу fail-closed.
 
 Каждая плата публикует уникальное mDNS-имя вида
 `medicam-XXXXXX.local`, полученное из стабильного device ID и включённое в

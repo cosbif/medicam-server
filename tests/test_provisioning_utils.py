@@ -417,6 +417,11 @@ class BleManagerTests(unittest.TestCase):
                     "EnvironmentFile=-/etc/medicam/medicam.env",
                     content,
                 )
+                if name == "medicam.service":
+                    self.assertNotIn(
+                        "Environment=MEDICAM_REMOTE_VIDEO_ENABLED=1",
+                        content,
+                    )
 
     def test_manager_stops_and_disables_legacy_ble_service(self):
         enabled_result = subprocess.CompletedProcess(
