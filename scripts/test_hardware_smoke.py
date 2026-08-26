@@ -147,7 +147,7 @@ def restore_settings(client, settings):
     )
 
 
-def run(client, duration):
+def run(client, duration, videos_dir):
     original_settings = client.json("GET", "/settings")
     before_entries = video_entries(client, refresh=True)
     before_names = {entry["filename"] for entry in before_entries}
@@ -242,7 +242,7 @@ def run(client, duration):
             range_body = response.read()
         require(range_status == 206 and len(range_body) == 1024, "HTTP Range failed")
 
-        video_path = ROOT / "videos" / created_filename
+        video_path = videos_dir / created_filename
         require(video_path.is_file(), f"recording is missing: {video_path}")
         probe = ffprobe(video_path)
         streams = probe.get("streams") or []
@@ -296,6 +296,12 @@ def main():
     parser.add_argument("--base-url", default="https://127.0.0.1:8000")
     parser.add_argument("--token", default=os.getenv("MEDICAM_API_TOKEN", ""))
     parser.add_argument("--duration", type=float, default=10.0)
+    parser.add_argument(
+        "--videos-dir",
+        type=Path,
+        default=ROOT / "videos",
+        help="filesystem directory used by the backend under test",
+    )
     args = parser.parse_args()
 
     token = args.token or local_token()
@@ -305,7 +311,11 @@ def main():
         raise SystemExit("duration must be at least 5 seconds")
 
     try:
-        report = run(ApiClient(args.base_url, token), args.duration)
+        report = run(
+            ApiClient(args.base_url, token),
+            args.duration,
+            args.videos_dir.resolve(),
+        )
     except Exception as exc:
         print(json.dumps({"passed": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1
