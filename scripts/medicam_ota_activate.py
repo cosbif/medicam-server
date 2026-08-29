@@ -83,6 +83,9 @@ SYSTEMD_ASSETS = {
     "medicam-cloud-agent.service": Path(
         "/etc/systemd/system/medicam-cloud-agent.service"
     ),
+    "medicam-service-tunnel.service": Path(
+        "/etc/systemd/system/medicam-service-tunnel.service"
+    ),
     "medicam-ble.service": Path("/etc/systemd/system/medicam-ble.service"),
     "medicam-ble-manager.service": Path(
         "/etc/systemd/system/medicam-ble-manager.service"
@@ -1112,13 +1115,16 @@ def install_release_assets(release_root: Path, *, harden: bool = True) -> None:
     run(["/bin/systemctl", "enable", "--now", "medicam-ota.path"])
     run(["/bin/systemctl", "enable", "--now", "medicam-ble-refresh.path"])
     run(["/bin/systemctl", "enable", "--now", "medicam-poweroff.path"])
-    if "medicam-cloud-agent.service" in installed_units:
+    if (
+        "medicam-service-tunnel.service" in installed_units
+        and Path("/etc/medicam/service-tunnel/tunnel.env").is_file()
+    ):
         run(
             [
                 "/bin/systemctl",
                 "enable",
                 "--now",
-                "medicam-cloud-agent.service",
+                "medicam-service-tunnel.service",
             ]
         )
 
@@ -1217,7 +1223,7 @@ def restart_services() -> None:
         check=False,
     )
     run(
-        ["/bin/systemctl", "try-restart", "medicam-cloud-agent.service"],
+        ["/bin/systemctl", "try-restart", "medicam-service-tunnel.service"],
         timeout=30,
         check=False,
     )

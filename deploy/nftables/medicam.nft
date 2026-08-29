@@ -17,6 +17,9 @@ table inet medicam_filter {
         meta nfproto ipv6 udp sport 547 udp dport 546 accept
         udp dport 5353 accept
 
+        # Key-only local SSH remains available for manufacturing and recovery.
+        # The privileged maintenance account separately accepts only 127.0.0.1,
+        # which is the source created by the outbound reverse tunnel.
         tcp dport 22 accept
         tcp dport 8000 accept
     }

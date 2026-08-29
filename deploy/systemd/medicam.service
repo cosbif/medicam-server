@@ -14,7 +14,6 @@ Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
 Environment=MEDICAM_PROVISION_LOCK_FILE=/var/lib/medicam/provision.lock
 Environment=MEDICAM_TLS_CERT_FILE=/etc/medicam/tls/cert.pem
 Environment=MEDICAM_PREVIEW_ENABLED=1
-Environment=MEDICAM_REMOTE_VIDEO_SOURCE=preview
 EnvironmentFile=-/etc/medicam/medicam.env
 ExecStart=/home/radxa/medicam-server/medicam-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile /etc/medicam/tls/key.pem --ssl-certfile /etc/medicam/tls/cert.pem
 Restart=always
