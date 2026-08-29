@@ -50,6 +50,7 @@ NFTABLES_FILE = Path("/etc/nftables.conf")
 SSH_DROP_IN = Path("/etc/ssh/sshd_config.d/99-medicam.conf")
 AVAHI_SERVICE_FILE = Path("/etc/avahi/services/medicam.service")
 AVAHI_DAEMON_CONFIG = Path("/etc/avahi/avahi-daemon.conf")
+HOSTS_FILE = Path("/etc/hosts")
 USB_POWER_RULES_FILE = Path("/etc/udev/rules.d/99-medicam-usb-power.rules")
 USB_SYSFS_DIR = Path("/sys/bus/usb/devices")
 WIREPLUMBER_LUA_POLICY_FILE = Path(
@@ -573,12 +574,46 @@ def device_hostname() -> str:
     return f"medicam-{_device_id()[-6:].lower()}"
 
 
+def render_hosts(content: str, hostname: str) -> str:
+    """Make the current device hostname resolvable without losing aliases."""
+    lines = content.splitlines()
+    updated = False
+    for index, line in enumerate(lines):
+        body, separator, comment = line.partition("#")
+        fields = body.split()
+        if fields[:1] != ["127.0.1.1"]:
+            continue
+        if hostname not in fields[1:]:
+            rendered = f"{body.rstrip()} {hostname}"
+            if separator:
+                rendered += f" #{comment}"
+            lines[index] = rendered
+        updated = True
+        break
+    if not updated:
+        if lines and lines[-1]:
+            lines.append("")
+        lines.append(f"127.0.1.1\t{hostname}")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 def install_device_hostname() -> None:
     # A shared `nom.local` is renamed unpredictably by Avahi when any device on
     # the customer's LAN already owns that name. The device-derived suffix is
     # stable across networks and is already part of the generated certificate.
+    hostname = device_hostname()
+    try:
+        hosts = _safe_read_regular(HOSTS_FILE, 1024 * 1024).decode("utf-8")
+    except FileNotFoundError:
+        hosts = "127.0.0.1\tlocalhost\n"
+    _safe_atomic_write(
+        HOSTS_FILE,
+        render_hosts(hosts, hostname).encode("utf-8"),
+        mode=0o644,
+        owner=(0, 0),
+    )
     run(
-        ["/usr/bin/hostnamectl", "set-hostname", device_hostname()],
+        ["/usr/bin/hostnamectl", "set-hostname", hostname],
         timeout=30,
     )
 

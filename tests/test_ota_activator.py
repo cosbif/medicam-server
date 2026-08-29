@@ -16,19 +16,42 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 class OtaActivatorTests(unittest.TestCase):
     def test_device_hostname_is_stable_unique_and_installed(self):
-        with patch.object(activate, "_device_id", return_value="856279C7"), patch.object(
-            activate, "run"
-        ) as run:
-            self.assertEqual(activate.device_hostname(), "medicam-6279c7")
-            activate.install_device_hostname()
+        with tempfile.TemporaryDirectory() as directory:
+            hosts = Path(directory) / "hosts"
+            hosts.write_text("127.0.0.1\tlocalhost\n", encoding="utf-8")
+            with patch.object(
+                activate, "_device_id", return_value="856279C7"
+            ), patch.object(activate, "HOSTS_FILE", hosts), patch.object(
+                activate, "run"
+            ) as run, patch.object(activate.os, "fchown"):
+                self.assertEqual(activate.device_hostname(), "medicam-6279c7")
+                activate.install_device_hostname()
 
-        run.assert_called_once_with(
-            [
-                "/usr/bin/hostnamectl",
-                "set-hostname",
-                "medicam-6279c7",
-            ],
-            timeout=30,
+            run.assert_called_once_with(
+                [
+                    "/usr/bin/hostnamectl",
+                    "set-hostname",
+                    "medicam-6279c7",
+                ],
+                timeout=30,
+            )
+            self.assertIn(
+                "127.0.1.1\tmedicam-6279c7",
+                hosts.read_text(encoding="utf-8"),
+            )
+
+    def test_hosts_keeps_legacy_aliases_and_is_idempotent(self):
+        source = "127.0.0.1 localhost\n127.0.1.1 radxa-zero3 nom # local aliases\n"
+
+        rendered = activate.render_hosts(source, "medicam-6279c7")
+
+        self.assertIn(
+            "127.0.1.1 radxa-zero3 nom medicam-6279c7 # local aliases",
+            rendered,
+        )
+        self.assertEqual(
+            activate.render_hosts(rendered, "medicam-6279c7"),
+            rendered,
         )
 
     def test_avahi_hostname_replaces_legacy_value_without_losing_settings(self):
