@@ -682,7 +682,7 @@ def migrate_provision_state(uid: int, gid: int) -> None:
         _safe_atomic_write(
             PROVISION_FILE,
             provision,
-            mode=0o600,
+            mode=0o640,
             owner=(uid, gid),
         )
 
@@ -697,7 +697,7 @@ def migrate_provision_state(uid: int, gid: int) -> None:
             provision = json.load(value)
         if not isinstance(provision, dict):
             raise ActivationError("provision state is not a JSON object")
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, 0o640)
         os.fchown(descriptor, uid, gid)
     except (ValueError, json.JSONDecodeError) as error:
         raise ActivationError("provision state is invalid JSON") from error

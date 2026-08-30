@@ -105,7 +105,7 @@ class NmcliParsingTests(unittest.TestCase):
 
 
 class ProvisionFileTests(unittest.TestCase):
-    def test_root_created_lock_is_transferred_to_backend_owner(self):
+    def test_root_created_lock_is_shared_with_backend_group(self):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             os.environ,
             {
@@ -121,7 +121,7 @@ class ProvisionFileTests(unittest.TestCase):
                 pass
 
         fchown.assert_called_once()
-        self.assertEqual(fchown.call_args.args[1:], (123, 456))
+        self.assertEqual(fchown.call_args.args[1:], (0, 456))
 
     def test_ble_provisioned_marker_is_non_secret_and_symlink_safe(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -185,7 +185,7 @@ class ProvisionFileTests(unittest.TestCase):
 
         self.assertTrue(data["provisioned"])
         self.assertEqual(data["info"]["ssid"], "New")
-        self.assertEqual(mode, 0o600)
+        self.assertEqual(mode, 0o640)
 
     def test_read_tightens_inherited_provision_file_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,7 +200,7 @@ class ProvisionFileTests(unittest.TestCase):
             with patch("app.utils._provision_path", Mock(return_value=provision_path)):
                 self.assertEqual(utils.get_api_token(), token)
 
-            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o640)
 
     def test_provision_write_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,7 +215,7 @@ class ProvisionFileTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "do-not-touch")
             self.assertFalse(provision_path.is_symlink())
             self.assertTrue(stat.S_ISREG(provision_path.stat().st_mode))
-            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(provision_path.stat().st_mode & 0o777, 0o640)
 
     def test_rotate_api_token_is_atomic_and_rejects_stale_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -432,6 +432,7 @@ class BleManagerTests(unittest.TestCase):
             "CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW",
             unit,
         )
+        self.assertIn("Group=radxa", unit)
 
     def test_ble_runs_for_setup_disconnect_and_recovery_windows(self):
         self.assertTrue(should_run_ble(False, True, False, False))

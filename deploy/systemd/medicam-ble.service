@@ -6,6 +6,7 @@ Wants=bluetooth.service NetworkManager.service
 [Service]
 Type=simple
 User=root
+Group=radxa
 WorkingDirectory=/opt/medicam/ble
 Environment=PYTHONUNBUFFERED=1
 Environment=MEDICAM_PROVISION_FILE=/var/lib/medicam/provision.json
@@ -32,9 +33,9 @@ RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_BLUETOOTH
-# Bluetooth provisioning writes a root-created 0600 token file and transfers
-# it to the unprivileged backend account. ProtectSystem/ReadWritePaths limits
-# CAP_CHOWN to Medicam's private state directory.
+# Bluetooth provisioning shares the owner state only with the backend's radxa
+# group. ProtectSystem/ReadWritePaths limits CAP_CHOWN to the private state
+# directory.
 CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]

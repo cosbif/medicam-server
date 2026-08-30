@@ -17,6 +17,8 @@ import json
 from pathlib import Path
 
 PROVISION_FILENAME = "provision.json"
+PROVISION_FILE_MODE = 0o640
+PROVISION_LOCK_MODE = 0o660
 VIDEOS_DIR = "videos"
 API_TOKEN_BYTES = 32
 VIDEO_METADATA_CACHE_LIMIT = 512
@@ -735,15 +737,21 @@ def _provision_lock(*, exclusive: bool):
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = os.open(path, flags, PROVISION_LOCK_MODE)
     try:
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            owner = _radxa_ids()
-            if owner is not None:
-                os.fchown(descriptor, *owner)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("provision_lock_not_regular")
+        effective_uid = os.geteuid() if hasattr(os, "geteuid") else None
+        if effective_uid == 0:
+            owner = _radxa_ids()
+            if owner is not None:
+                # The constrained root BLE service and the unprivileged
+                # backend share this lock through the radxa group.
+                os.fchown(descriptor, 0, owner[1])
+            os.fchmod(descriptor, PROVISION_LOCK_MODE)
+        elif effective_uid is not None and metadata.st_uid == effective_uid:
+            os.fchmod(descriptor, PROVISION_LOCK_MODE)
         fcntl.flock(
             descriptor,
             fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
@@ -779,12 +787,12 @@ def _read_provision_data_unlocked(path: Path) -> dict:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
                 return {}
-            # Devices upgraded from early Medicam releases may still have a
-            # group/world-readable provision.json. It contains the owner API
-            # token, so tighten inherited permissions through the already
-            # verified, O_NOFOLLOW file descriptor before reading any data.
-            if metadata.st_mode & 0o077:
-                os.fchmod(descriptor, 0o600)
+            # Group read is required by the capability-constrained root BLE
+            # service, whose primary group is radxa. Group write/execute and
+            # every world permission remain forbidden because this file holds
+            # the owner API token.
+            if metadata.st_mode & 0o037:
+                os.fchmod(descriptor, PROVISION_FILE_MODE)
             with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as value:
                 data = json.load(value)
             return data if isinstance(data, dict) else {}
@@ -805,8 +813,13 @@ def _atomic_write_provision_data_unlocked(path: Path, data: dict) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory)
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            PROVISION_FILE_MODE,
+            dir_fd=directory,
+        )
+        os.fchmod(descriptor, PROVISION_FILE_MODE)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             owner = _radxa_ids()
             if owner is not None:
@@ -850,7 +863,8 @@ def _write_ble_provisioned_state(value: bool) -> None:
         os.write(descriptor, b"1\n" if value else b"0\n")
         os.fsync(descriptor)
         # This marker contains no token, SSID, or customer data.  It is
-        # intentionally readable while provision.json remains mode 0600.
+        # intentionally readable while provision.json remains private to the
+        # radxa account and group.
         os.fchmod(descriptor, 0o644)
         os.close(descriptor)
         descriptor = None
@@ -1022,7 +1036,7 @@ def _normalize_provision_file_permissions(path: Path):
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError("provision_file_not_regular")
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, PROVISION_FILE_MODE)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             owner = _radxa_ids()
             if owner is not None:

@@ -165,7 +165,7 @@ publish-addresses=yes
 
             self.assertFalse(legacy.exists())
             self.assertTrue(json.loads(provision.read_text())["provisioned"])
-            self.assertEqual(provision.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(provision.stat().st_mode & 0o777, 0o640)
             self.assertEqual(lock.stat().st_mode & 0o777, 0o660)
 
     def test_provision_migration_keeps_legacy_secret_if_secure_copy_is_invalid(self):
