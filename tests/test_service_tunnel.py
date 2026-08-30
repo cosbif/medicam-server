@@ -30,9 +30,15 @@ class ServiceTunnelDeploymentTests(unittest.TestCase):
         self.assertIn("restrict %s", installer)
         self.assertIn("Expected exactly one OpenSSH Ed25519 public key", installer)
         self.assertIn("visudo -cf", installer)
+        self.assertIn("/usr/sbin/sshd -t", installer)
+        self.assertIn("systemctl reload ssh.service", installer)
         self.assertIn("NOPASSWD: ALL", installer)
         self.assertIn("usermod --password 'x'", installer)
         self.assertNotIn("MAINTENANCE_USER=\"radxa\"", installer)
+        self.assertIn(
+            "AllowUsers radxa medicam-maintenance medicam-maint",
+            (ROOT / "deploy/ssh/medicam.conf").read_text(encoding="utf-8"),
+        )
 
     def test_tunnel_is_outbound_loopback_only_and_pins_server_key(self):
         script = (ROOT / "scripts/medicam_service_tunnel.sh").read_text(

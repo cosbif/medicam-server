@@ -4,6 +4,7 @@ set -euo pipefail
 readonly MAINTENANCE_USER="medicam-maint"
 readonly MAINTENANCE_HOME="/home/$MAINTENANCE_USER"
 readonly SUDOERS_FILE="/etc/sudoers.d/medicam-maint"
+readonly SSH_POLICY_FILE="/etc/ssh/sshd_config.d/99-medicam.conf"
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Run this installer through sudo." >&2
@@ -50,8 +51,14 @@ install -d -m 0700 -o "$MAINTENANCE_USER" -g "$MAINTENANCE_GROUP" \
 
 AUTHORIZED_KEYS_TEMP="$(mktemp)"
 SUDOERS_TEMP="$(mktemp)"
+SSH_POLICY_TEMP="$(mktemp)"
+SSH_POLICY_BACKUP="$(mktemp)"
 cleanup() {
-  rm -f "$AUTHORIZED_KEYS_TEMP" "$SUDOERS_TEMP"
+  rm -f \
+    "$AUTHORIZED_KEYS_TEMP" \
+    "$SUDOERS_TEMP" \
+    "$SSH_POLICY_TEMP" \
+    "$SSH_POLICY_BACKUP"
 }
 trap cleanup EXIT
 
@@ -66,6 +73,35 @@ chmod 0440 "$SUDOERS_TEMP"
 visudo -cf "$SUDOERS_TEMP" >/dev/null
 install -m 0440 -o root -g root "$SUDOERS_TEMP" "$SUDOERS_FILE"
 visudo -cf "$SUDOERS_FILE" >/dev/null
+
+if [[ ! -f "$SSH_POLICY_FILE" || -L "$SSH_POLICY_FILE" ]]; then
+  echo "The managed Medicam SSH policy is missing or unsafe." >&2
+  exit 1
+fi
+cp --preserve=mode,ownership,timestamps "$SSH_POLICY_FILE" "$SSH_POLICY_BACKUP"
+awk -v user="$MAINTENANCE_USER" '
+  BEGIN { found = 0 }
+  /^AllowUsers[[:space:]]/ {
+    present = 0
+    for (i = 2; i <= NF; i++) {
+      if ($i == user) present = 1
+    }
+    print present ? $0 : $0 " " user
+    found = 1
+    next
+  }
+  { print }
+  END {
+    if (!found) print "AllowUsers " user
+  }
+' "$SSH_POLICY_FILE" > "$SSH_POLICY_TEMP"
+install -m 0644 -o root -g root "$SSH_POLICY_TEMP" "$SSH_POLICY_FILE"
+if ! /usr/sbin/sshd -t; then
+  install -m 0644 -o root -g root "$SSH_POLICY_BACKUP" "$SSH_POLICY_FILE"
+  echo "Refusing invalid SSH policy; previous file restored." >&2
+  exit 1
+fi
+systemctl reload ssh.service
 
 echo "Installed key-only maintenance access for $MAINTENANCE_USER."
 echo "Password login and SSH forwarding remain disabled."
