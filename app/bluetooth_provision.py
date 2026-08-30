@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import base64
 import subprocess
 import time
 from pathlib import Path
@@ -11,6 +12,8 @@ import hashlib
 import hmac
 import secrets
 from concurrent.futures import ThreadPoolExecutor
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # подключаем project root, чтобы импортировать app.utils
 project_root = Path(__file__).resolve().parents[1]
@@ -30,7 +33,7 @@ else:
 SERVICE_UUID = "3f7d1000-6f4b-4e21-9a63-7b9c3f1d0001"
 CMD_CHAR_UUID = "3f7d1001-6f4b-4e21-9a63-7b9c3f1d0001"
 RESP_CHAR_UUID = "3f7d1002-6f4b-4e21-9a63-7b9c3f1d0001"
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_COMMAND_BYTES = 8192
 PAIRING_NONCE_TTL_SECONDS = 120
 PAIRING_SESSION_TTL_SECONDS = 300
@@ -52,7 +55,7 @@ TEST_MODE = os.getenv("MEDICAM_BLE_TEST_MODE", "").lower() in {
 
 
 def encode_notification_frames(payload: bytes, frame_id: str | None = None):
-    """Return ATT-safe protocol-4 notifications for one bounded response."""
+    """Return ATT-safe protocol-5 notifications for one bounded response."""
     if len(payload) > MAX_RESPONSE_BYTES:
         payload = b'{"error":"response_too_large"}'
     if len(payload) <= MAX_NOTIFICATION_VALUE_BYTES:
@@ -65,7 +68,7 @@ def encode_notification_frames(payload: bytes, frame_id: str | None = None):
             sequence * NOTIFICATION_BODY_BYTES:
             (sequence + 1) * NOTIFICATION_BODY_BYTES
         ]
-        frame = f"M4|{frame_id}|{sequence}|{total}|".encode("ascii") + body
+        frame = f"M5|{frame_id}|{sequence}|{total}|".encode("ascii") + body
         if len(frame) > MAX_NOTIFICATION_VALUE_BYTES:
             raise ValueError("notification_frame_too_large")
         frames.append(frame)
@@ -595,6 +598,46 @@ class ProvisionService:
             self._session_counter = counter
             return True
 
+    @staticmethod
+    def _secret_command_aad(data):
+        metadata = {
+            key: data.get(key)
+            for key in ("cmd", "session_id", "counter", "request_id")
+        }
+        return json.dumps(
+            metadata,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _decrypt_wifi_credentials(self, data):
+        sealed = data.get("sealed")
+        if not isinstance(sealed, str) or not sealed:
+            raise ValueError("missing_encrypted_credentials")
+        try:
+            padding = "=" * (-len(sealed) % 4)
+            combined = base64.urlsafe_b64decode(sealed + padding)
+            if len(combined) < 12 + 16:
+                raise ValueError("encrypted_credentials_too_short")
+            with self._pairing_lock:
+                session_key = bytes.fromhex(self._session_key)
+            cleartext = AESGCM(session_key).decrypt(
+                combined[:12],
+                combined[12:],
+                self._secret_command_aad(data),
+            )
+            credentials = json.loads(cleartext.decode("utf-8"))
+        except Exception as error:
+            raise ValueError("invalid_encrypted_credentials") from error
+        if not isinstance(credentials, dict):
+            raise ValueError("invalid_encrypted_credentials")
+        ssid = credentials.get("ssid")
+        password = credentials.get("password")
+        if not isinstance(ssid, str) or not ssid or not isinstance(password, str):
+            raise ValueError("invalid_encrypted_credentials")
+        return ssid, password
+
     def _clear_session(self):
         with self._pairing_lock:
             self._session_id = ""
@@ -754,18 +797,23 @@ class ProvisionService:
                     request_id=request_id,
                 )
                 return
-            ssid = data.get("ssid")
-            password = data.get("password")
-            api_token = data.get("api_token")
-            if not isinstance(ssid, str) or not ssid:
+            try:
+                ssid, password = self._decrypt_wifi_credentials(data)
+            except ValueError:
                 self._set_response(
-                    {"error": "ssid_required"},
+                    {"error": "invalid_encrypted_credentials"},
                     request_id=request_id,
                 )
                 return
-            if not utils.is_valid_api_token(api_token):
+            try:
+                api_token = utils.derive_owner_api_token(
+                    self._session_key,
+                    self._session_id,
+                    utils.get_device_id(),
+                )
+            except ValueError:
                 self._set_response(
-                    {"error": "invalid_api_token"},
+                    {"error": "invalid_pairing_session"},
                     request_id=request_id,
                 )
                 return

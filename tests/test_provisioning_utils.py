@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from app import utils
 from app.bluetooth_provision import (
@@ -241,6 +241,18 @@ class ProvisionFileTests(unittest.TestCase):
                 self.assertTrue(token)
                 self.assertTrue(utils.verify_api_token(token))
                 self.assertFalse(utils.verify_api_token("wrong"))
+
+    def test_owner_api_token_derivation_matches_mobile_protocol_vector(self):
+        self.assertEqual(
+            utils.derive_owner_api_token(
+                "ab" * 32,
+                "session-1",
+                "DEVICE01",
+            ),
+            "KL_uP99FE1gFao-aw63q_-eI_5-YdP8B_S6pyxDajMk",
+        )
+        with self.assertRaises(ValueError):
+            utils.derive_owner_api_token("invalid", "session-1", "DEVICE01")
 
     def test_recovery_window_expires_and_successful_provisioning_closes_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,7 +588,7 @@ class BluetoothProvisioningTests(unittest.TestCase):
         bodies = [frame.split(b"|", 4)[4] for frame in frames]
         self.assertEqual(b"".join(bodies), payload)
         for sequence, frame in enumerate(frames):
-            prefix = f"M4|deadbeef|{sequence}|{len(frames)}|".encode()
+            prefix = f"M5|deadbeef|{sequence}|{len(frames)}|".encode()
             self.assertTrue(frame.startswith(prefix))
 
     def test_oversize_ble_response_is_replaced_by_small_error(self):
@@ -750,7 +762,6 @@ class BluetoothProvisioningTests(unittest.TestCase):
                 "request_id": "connect-without-session",
                 "ssid": "Office",
                 "password": "secret-password",
-                "api_token": "A" * 43,
             }
         )
 
@@ -760,6 +771,68 @@ class BluetoothProvisioningTests(unittest.TestCase):
         )
         service._worker_scan_wifi.assert_not_called()
         service._worker_connect_wifi.assert_not_called()
+
+    def test_connect_wifi_derives_owner_token_instead_of_receiving_it(self):
+        service = self._pairing_service()
+        service._session_id = "session"
+        service._session_key = "ab" * 32
+        service._session_expires = __import__("time").monotonic() + 60
+        service._worker_connect_wifi = Mock()
+        command = {
+            "cmd": "CONNECT_WIFI",
+            "request_id": "connect-1",
+            "sealed": "encrypted-wifi-credentials",
+            "session_id": "session",
+            "counter": 1,
+        }
+        command["auth"] = hmac.new(
+            bytes.fromhex(service._session_key),
+            service._canonical_session_command(command),
+            hashlib.sha256,
+        ).hexdigest()
+
+        with patch(
+            "app.bluetooth_provision.utils.derive_owner_api_token",
+            return_value="D" * 43,
+        ) as derive, patch.object(
+            service,
+            "_decrypt_wifi_credentials",
+            return_value=("Office", "secret-password"),
+        ):
+            service._handle_command(command)
+
+        derive.assert_called_once_with("ab" * 32, "session", ANY)
+        service._worker_connect_wifi.assert_called_once_with(
+            "Office",
+            "secret-password",
+            "D" * 43,
+            request_id="connect-1",
+        )
+
+    def test_aes_gcm_wifi_payload_matches_mobile_protocol_vector(self):
+        service = self._pairing_service()
+        service._session_key = (
+            "7539182fd2ab2de792e3910d13b44b25"
+            "ad05006aae27d48f90c7465f7d4bc71a"
+        )
+        payload = {
+            "cmd": "CONNECT_WIFI",
+            "session_id": "session-1",
+            "counter": 1,
+            "request_id": "request-1",
+            "sealed": (
+                "AAECAwQFBgcICQoLzc44SMOlle-qGdQMCDHO-6sPexeyoSqi_uRD95X2"
+                "IFtlZmVs1L0uVWXZq7JT4lvMuvIKPsMfMwRhYSDwnzl-"
+            ),
+        }
+
+        self.assertEqual(
+            service._decrypt_wifi_credentials(payload),
+            ("Clinic WiFi", "secret-pass"),
+        )
+        payload["sealed"] = payload["sealed"][:-1] + "A"
+        with self.assertRaises(ValueError):
+            service._decrypt_wifi_credentials(payload)
 
     def test_wifi_state_write_failure_returns_stable_error_code(self):
         service = self._pairing_service()

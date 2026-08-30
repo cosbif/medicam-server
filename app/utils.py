@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import hmac
 import secrets
 import subprocess
@@ -58,6 +59,7 @@ PAIRING_SESSION_CONTEXT = "medicam-session-v1"
 OWNER_PAIRING_CLIENT_CONTEXT = "medicam-owner-client-v1"
 OWNER_PAIRING_SERVER_CONTEXT = "medicam-owner-server-v1"
 OWNER_PAIRING_SESSION_CONTEXT = "medicam-owner-session-v1"
+OWNER_API_TOKEN_CONTEXT = "medicam-owner-token-v1"
 
 _VIDEO_METADATA_CACHE = {}
 _VIDEO_INDEX_CACHE = None
@@ -1039,6 +1041,31 @@ def is_valid_api_token(token: str | None) -> bool:
         and 32 <= len(token) <= 128
         and re.fullmatch(r"[A-Za-z0-9_-]+", token)
     )
+
+
+def derive_owner_api_token(
+    session_key_hex: str,
+    session_id: str,
+    device_id: str,
+) -> str:
+    """Derive the next owner token without transmitting it over Bluetooth."""
+    try:
+        session_key = bytes.fromhex(session_key_hex)
+    except (TypeError, ValueError):
+        session_key = b""
+    if (
+        len(session_key) != 32
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(device_id, str)
+        or not device_id
+    ):
+        raise ValueError("invalid_pairing_session")
+    message = "\0".join(
+        (OWNER_API_TOKEN_CONTEXT, session_id, device_id)
+    ).encode("utf-8")
+    digest = hmac.new(session_key, message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def get_api_token() -> str:
