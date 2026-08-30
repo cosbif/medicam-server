@@ -105,6 +105,24 @@ class NmcliParsingTests(unittest.TestCase):
 
 
 class ProvisionFileTests(unittest.TestCase):
+    def test_root_created_lock_is_transferred_to_backend_owner(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {
+                "MEDICAM_PROVISION_FILE": str(Path(temporary) / "provision.json"),
+                "MEDICAM_PROVISION_LOCK_FILE": str(
+                    Path(temporary) / ".provision.json.lock"
+                ),
+            },
+        ), patch("app.utils.os.geteuid", return_value=0), patch(
+            "app.utils._radxa_ids", return_value=(123, 456)
+        ), patch("app.utils.os.fchown") as fchown:
+            with utils._provision_lock(exclusive=True):
+                pass
+
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], (123, 456))
+
     def test_ble_provisioned_marker_is_non_secret_and_symlink_safe(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -396,6 +414,10 @@ class BleManagerTests(unittest.TestCase):
         )
         self.assertIn(
             "ExecStopPost=/usr/bin/bluetoothctl pairable off",
+            unit,
+        )
+        self.assertIn(
+            "CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW",
             unit,
         )
 
@@ -738,6 +760,29 @@ class BluetoothProvisioningTests(unittest.TestCase):
         )
         service._worker_scan_wifi.assert_not_called()
         service._worker_connect_wifi.assert_not_called()
+
+    def test_wifi_state_write_failure_returns_stable_error_code(self):
+        service = self._pairing_service()
+        service.connect_wifi = Mock(
+            return_value={"ok": True, "ip": "192.168.1.50"}
+        )
+        service._clear_session = Mock()
+        with patch(
+            "app.bluetooth_provision.utils.set_provisioned",
+            side_effect=PermissionError("operation not permitted"),
+        ):
+            service._worker_connect_wifi(
+                "Office",
+                "",
+                api_token="A" * 43,
+                request_id="connect-1",
+            )
+
+        service._set_response.assert_called_once_with(
+            {"error": "provision_state_write_failed"},
+            request_id="connect-1",
+        )
+        service._clear_session.assert_not_called()
 
     def test_status_advertises_only_protected_pairing_capabilities(self):
         service = self._pairing_service()

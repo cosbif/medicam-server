@@ -626,11 +626,23 @@ class ProvisionService:
             ok = bool(result.get("ok"))
             ip = result.get("ip", "")
             if ok:
-                utils.set_provisioned(
-                    True,
-                    {"ssid": ssid, "ip": ip},
-                    api_token=api_token,
-                )
+                try:
+                    utils.set_provisioned(
+                        True,
+                        {"ssid": ssid, "ip": ip},
+                        api_token=api_token,
+                    )
+                except OSError as error:
+                    print(
+                        "[ERR] worker_connect_wifi: could not persist owner state:",
+                        error,
+                        traceback.format_exc(),
+                    )
+                    self._set_response(
+                        {"error": "provision_state_write_failed"},
+                        request_id=request_id,
+                    )
+                    return
                 self._set_response(
                     {
                         "status": "connected",
@@ -652,7 +664,10 @@ class ProvisionService:
                 )
         except Exception as e:
             print("[ERR] worker_connect_wifi:", e, traceback.format_exc())
-            self._set_response({"error": str(e)}, request_id=request_id)
+            self._set_response(
+                {"error": "wifi_connection_failed"},
+                request_id=request_id,
+            )
 
     # ---------------------------
     # Command handler (fast return)

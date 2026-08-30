@@ -735,6 +735,10 @@ def _provision_lock(*, exclusive: bool):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o600)
     try:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            owner = _radxa_ids()
+            if owner is not None:
+                os.fchown(descriptor, *owner)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("provision_lock_not_regular")

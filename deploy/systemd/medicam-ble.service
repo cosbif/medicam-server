@@ -32,7 +32,10 @@ RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_BLUETOOTH
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Bluetooth provisioning writes a root-created 0600 token file and transfers
+# it to the unprivileged backend account. ProtectSystem/ReadWritePaths limits
+# CAP_CHOWN to Medicam's private state directory.
+CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
