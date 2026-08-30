@@ -75,20 +75,20 @@ class RouteSecurityTests(unittest.TestCase):
         response = asyncio.run(routes.ping())
 
         self.assertEqual(response["status"], "ok")
-        self.assertFalse(response["development_open_access"])
+        self.assertNotIn("development_open_access", response)
 
-    def test_explicit_development_mode_bypasses_owner_token(self):
+    def test_environment_cannot_bypass_owner_token(self):
         self._provision()
         with patch.dict(
             os.environ,
             {"MEDICAM_DEVELOPMENT_OPEN_ACCESS": "1"},
         ):
-            self.assertTrue(routes.require_api_auth(self._request()))
-            status = asyncio.run(routes.provision_status(self._request()))
             ping = asyncio.run(routes.ping())
+            with self.assertRaises(HTTPException) as raised:
+                routes.require_api_auth(self._request())
 
-        self.assertIn("info", status)
-        self.assertTrue(ping["development_open_access"])
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertNotIn("development_open_access", ping)
 
     def test_critical_routes_are_registered_with_auth_dependency(self):
         api_token_paths = {

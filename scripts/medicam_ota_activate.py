@@ -19,7 +19,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -40,6 +40,9 @@ INSTALLED_HELPER = Path("/usr/local/sbin/medicam-ota-activate")
 SUDOERS_FILE = Path("/etc/sudoers.d/medicam")
 DROP_IN = Path("/etc/systemd/system/medicam.service.d/runtime.conf")
 PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
+BLE_RECOVERY_STATE_FILE = MEDICAM_STATE_DIR / "ble-recovery-until.state"
+BLE_REFRESH_REQUEST_FILE = MEDICAM_STATE_DIR / "ble-refresh.request"
+PAIRING_RECOVERY_SECONDS = 10 * 60
 TLS_DIR = Path("/etc/medicam/tls")
 TLS_KEY_FILE = TLS_DIR / "key.pem"
 TLS_CERT_FILE = TLS_DIR / "cert.pem"
@@ -1559,6 +1562,24 @@ def consume_activation_request() -> None:
         raise ActivationError(str(error)) from error
 
 
+def open_pairing_recovery_window() -> str:
+    """Publish a bounded pairing deadline and wake the fixed BLE service."""
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=PAIRING_RECOVERY_SECONDS)
+    _safe_atomic_write(
+        BLE_RECOVERY_STATE_FILE,
+        f"{expires_at.isoformat()}\n".encode("ascii"),
+        mode=0o644,
+    )
+    _safe_atomic_write(
+        BLE_REFRESH_REQUEST_FILE,
+        f"pairing-requested-at={now.isoformat()}\n".encode("ascii"),
+        mode=0o600,
+    )
+    return expires_at.isoformat()
+
+
 def main(arguments: list[str]) -> int:
     if len(arguments) == 2 and arguments[1] == "harden":
         # Establish root-owned trust before removing the temporary migration
@@ -1572,6 +1593,7 @@ def main(arguments: list[str]) -> int:
         return 0
     if len(arguments) == 2 and arguments[1] == "pairing-info":
         ensure_security_identity()
+        open_pairing_recovery_window()
         secret = _safe_read_regular(PAIRING_SECRET_FILE, 256).decode("ascii").strip()
         grouped = "-".join(secret[index:index + 4] for index in range(0, len(secret), 4))
         print(f"Device ID: {_device_id()}")

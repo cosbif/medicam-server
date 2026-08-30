@@ -26,16 +26,6 @@ from app.manage_ble import (
 
 
 class NmcliParsingTests(unittest.TestCase):
-    def test_development_open_access_requires_explicit_environment_flag(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(utils.development_open_access_enabled())
-        with patch.dict(
-            os.environ,
-            {"MEDICAM_DEVELOPMENT_OPEN_ACCESS": "true"},
-            clear=True,
-        ):
-            self.assertTrue(utils.development_open_access_enabled())
-
     def test_split_nmcli_escaped_keeps_colons_inside_ssid(self):
         self.assertEqual(
             utils.split_nmcli_escaped(r"My\:WiFi:82:WPA2"),
@@ -274,6 +264,23 @@ class ProvisionFileTests(unittest.TestCase):
             ):
                 self.assertTrue(utils.is_ble_recovery_active(now))
 
+    def test_newer_root_recovery_marker_overrides_expired_private_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "ble-recovery-until.state"
+            now = datetime.now(timezone.utc)
+            public_deadline = (now + timedelta(minutes=10)).isoformat()
+            marker.write_text(f"{public_deadline}\n", encoding="ascii")
+            marker.chmod(0o644)
+
+            with patch.object(utils, "BLE_RECOVERY_STATE_FILE", marker), patch(
+                "app.utils._read_provision_data",
+                return_value={
+                    "ble_recovery_until": (now - timedelta(minutes=1)).isoformat()
+                },
+            ):
+                self.assertEqual(utils.get_ble_recovery_until(), public_deadline)
+                self.assertTrue(utils.is_ble_recovery_active(now))
+
     def test_recovery_marker_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -398,9 +405,8 @@ class BleManagerTests(unittest.TestCase):
         self.assertTrue(should_run_ble(True, True, True, False))
         self.assertTrue(should_run_ble(True, True, False, True))
         self.assertFalse(should_run_ble(True, True, False, False))
-        self.assertTrue(should_run_ble(True, True, False, False, True))
 
-    def test_production_units_require_explicit_open_access_override(self):
+    def test_production_units_do_not_enable_authorization_bypass(self):
         deploy = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
         for name in (
             "medicam.service",
@@ -538,7 +544,6 @@ class BluetoothProvisioningTests(unittest.TestCase):
         self.assertTrue(should_stop_ble(True, True, False))
         self.assertFalse(should_stop_ble(True, True, True))
         self.assertFalse(should_stop_ble(True, False, False))
-        self.assertFalse(should_stop_ble(True, True, False, True))
 
     def test_large_ble_response_is_framed_with_bounded_values(self):
         payload = json.dumps({"networks": ["x" * 64] * 20}).encode()
@@ -704,57 +709,51 @@ class BluetoothProvisioningTests(unittest.TestCase):
         tampered = {**command, "counter": 2, "auth": "0" * 64}
         self.assertFalse(service._verify_session_command(tampered))
 
-    def test_development_mode_accepts_wifi_commands_without_unlock(self):
+    def test_wifi_commands_without_unlock_are_always_rejected(self):
         service = self._pairing_service()
         service._worker_scan_wifi = Mock()
         service._worker_connect_wifi = Mock()
-        with patch(
-            "app.bluetooth_provision.utils.development_open_access_enabled",
-            return_value=True,
-        ):
-            service._handle_command(
-                {"cmd": "SCAN_WIFI", "request_id": "scan-development"}
-            )
-            service._handle_command(
-                {
-                    "cmd": "CONNECT_WIFI",
-                    "request_id": "connect-development",
-                    "ssid": "Office",
-                    "password": "secret-password",
-                }
-            )
-
-        service._worker_scan_wifi.assert_called_once_with(
-            request_id="scan-development"
+        service._handle_command(
+            {"cmd": "SCAN_WIFI", "request_id": "scan-without-session"}
         )
-        service._worker_connect_wifi.assert_called_once_with(
-            "Office",
-            "secret-password",
-            None,
-            request_id="connect-development",
+        service._set_response.assert_called_with(
+            {"error": "pairing_required"},
+            request_id="scan-without-session",
+        )
+        service._set_response.reset_mock()
+
+        service._handle_command(
+            {
+                "cmd": "CONNECT_WIFI",
+                "request_id": "connect-without-session",
+                "ssid": "Office",
+                "password": "secret-password",
+                "api_token": "A" * 43,
+            }
         )
 
-    def test_status_announces_development_bypass_without_using_pairing_code(self):
+        service._set_response.assert_called_with(
+            {"error": "pairing_required"},
+            request_id="connect-without-session",
+        )
+        service._worker_scan_wifi.assert_not_called()
+        service._worker_connect_wifi.assert_not_called()
+
+    def test_status_advertises_only_protected_pairing_capabilities(self):
         service = self._pairing_service()
         with patch(
-            "app.bluetooth_provision.utils.development_open_access_enabled",
-            return_value=True,
-        ), patch(
             "app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"
         ), patch(
             "app.bluetooth_provision.utils.get_device_name",
             return_value="Medicam-VICE01",
         ), patch(
             "app.bluetooth_provision.utils.is_provisioned", return_value=True
-        ), patch(
-            "app.bluetooth_provision.utils.get_tls_fingerprint",
-            return_value="a" * 64,
         ):
             payload = service._status_payload()
 
-        self.assertTrue(payload["development_open_access"])
-        self.assertIn("development_open_access", payload["capabilities"])
-        self.assertEqual(payload["tls_fingerprint"], "a" * 64)
+        self.assertNotIn("development_open_access", payload)
+        self.assertNotIn("development_open_access", payload["capabilities"])
+        self.assertNotIn("tls_fingerprint", payload)
 
     def test_on_command_dispatches_complete_messages_outside_write_callback(self):
         service = object.__new__(ProvisionService)

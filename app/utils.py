@@ -66,20 +66,6 @@ _VIDEO_INDEX_LOCK = threading.RLock()
 _VIDEO_METADATA_IN_PROGRESS = set()
 
 
-def development_open_access_enabled() -> bool:
-    """Return whether the explicitly deployed development bypass is active.
-
-    Production keeps this environment variable absent/false.  The temporary
-    development systemd units set it to true so HTTP and BLE can be exercised
-    without owner tokens or a physical pairing code.
-    """
-    return os.environ.get("MEDICAM_DEVELOPMENT_OPEN_ACCESS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-
-
 def iterfile(path: str):
     with open(path, mode="rb") as file_like:
         while chunk := file_like.read(1024 * 1024):
@@ -1306,11 +1292,26 @@ def stop_ble_recovery():
 
 
 def get_ble_recovery_until() -> str:
+    """Return the latest valid private or root-published recovery deadline."""
+
     data = _read_provision_data()
-    value = data.get("ble_recovery_until", "")
-    if isinstance(value, str) and value:
-        return value
-    return get_ble_recovery_state_until()
+    private_value = data.get("ble_recovery_until", "")
+    public_value = get_ble_recovery_state_until()
+    deadlines: list[tuple[datetime, str]] = []
+    for value in (private_value, public_value):
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            deadline = datetime.fromisoformat(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            deadlines.append((deadline, value))
+        except ValueError:
+            continue
+    return max(
+        deadlines,
+        default=(datetime.min.replace(tzinfo=timezone.utc), ""),
+    )[1]
 
 
 def is_ble_recovery_active(now: datetime | None = None) -> bool:

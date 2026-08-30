@@ -21,3 +21,6 @@ restart_service.sh
 .github_token
 update_debug.log
 .medicam-cloud-simulator.json
+# local tooling and exported physical pairing credentials
+.tools/
+pairing-output/

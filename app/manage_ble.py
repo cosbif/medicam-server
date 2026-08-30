@@ -28,11 +28,9 @@ def should_run_ble(
     connected: bool,
     recovery_active: bool,
     boot_window_active: bool,
-    development_open_access: bool = False,
 ) -> bool:
     return (
-        development_open_access
-        or (not provisioned)
+        (not provisioned)
         or (not connected)
         or recovery_active
         or boot_window_active
@@ -155,7 +153,6 @@ def main():
         connected = utils.is_wifi_connected()
         recovery_active = utils.is_ble_recovery_active()
         boot_window_active = utils.is_boot_pairing_window_active()
-        development_open_access = utils.development_open_access_enabled()
         status = service_status()
 
         should_ble_run = should_run_ble(
@@ -163,7 +160,6 @@ def main():
             connected,
             recovery_active,
             boot_window_active,
-            development_open_access,
         )
 
         current_state = (
@@ -171,7 +167,6 @@ def main():
             connected,
             recovery_active,
             boot_window_active,
-            development_open_access,
             status,
             should_ble_run,
         )
@@ -187,7 +182,6 @@ def main():
                 f"wifi_connected={connected} "
                 f"recovery_active={recovery_active} "
                 f"boot_window_active={boot_window_active} "
-                f"development_open_access={development_open_access} "
                 f"service={status} required={should_ble_run}"
             )
             try:
@@ -198,7 +192,6 @@ def main():
                         "wifi_connected": connected,
                         "recovery_active": recovery_active,
                         "boot_window_active": boot_window_active,
-                        "development_open_access": development_open_access,
                         "service": status,
                         "required": should_ble_run,
                         "action": action,

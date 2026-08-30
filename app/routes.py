@@ -39,14 +39,10 @@ def _token_from_request(request: Request):
 
 
 def _is_authenticated(request: Request):
-    return utils.development_open_access_enabled() or utils.verify_api_token(
-        _token_from_request(request)
-    )
+    return utils.verify_api_token(_token_from_request(request))
 
 
 def require_api_auth(request: Request):
-    if utils.development_open_access_enabled():
-        return True
     if not utils.is_provisioned():
         raise HTTPException(status_code=403, detail="device_not_provisioned")
     if not _is_authenticated(request):
@@ -92,7 +88,6 @@ async def ping():
         "device_id": utils.get_device_id(),
         "device_name": utils.get_device_name(),
         "tls_fingerprint": utils.get_tls_fingerprint(),
-        "development_open_access": utils.development_open_access_enabled(),
         **version_info.get_ping_version(),
     }
 

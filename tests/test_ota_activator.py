@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -15,6 +16,36 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_pairing_export_opens_bounded_ble_recovery_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recovery = Path(directory) / "ble-recovery-until.state"
+            refresh = Path(directory) / "ble-refresh.request"
+            with patch.object(
+                activate,
+                "BLE_RECOVERY_STATE_FILE",
+                recovery,
+            ), patch.object(
+                activate,
+                "BLE_REFRESH_REQUEST_FILE",
+                refresh,
+            ):
+                expires_at = activate.open_pairing_recovery_window()
+
+            deadline = datetime.fromisoformat(expires_at)
+            remaining = deadline - datetime.now(timezone.utc)
+            self.assertGreater(remaining.total_seconds(), 590)
+            self.assertLessEqual(remaining.total_seconds(), 600)
+            self.assertEqual(
+                recovery.read_text(encoding="ascii").strip(),
+                expires_at,
+            )
+            self.assertEqual(recovery.stat().st_mode & 0o777, 0o644)
+            self.assertIn(
+                "pairing-requested-at=",
+                refresh.read_text(encoding="ascii"),
+            )
+            self.assertEqual(refresh.stat().st_mode & 0o777, 0o600)
+
     def test_device_hostname_is_stable_unique_and_installed(self):
         with tempfile.TemporaryDirectory() as directory:
             hosts = Path(directory) / "hosts"

@@ -118,14 +118,8 @@ def should_stop_ble(
     provisioned: bool,
     connected: bool,
     recovery_active: bool,
-    development_open_access: bool = False,
 ) -> bool:
-    return (
-        provisioned
-        and connected
-        and not recovery_active
-        and not development_open_access
-    )
+    return provisioned and connected and not recovery_active
 
 
 def add_characteristic(periph, **kwargs):
@@ -382,7 +376,6 @@ class ProvisionService:
             return self._pairing_nonce
 
     def _status_payload(self):
-        development_open_access = utils.development_open_access_enabled()
         capabilities = [
             "physical_pairing_code",
             "owner_token_recovery",
@@ -394,9 +387,7 @@ class ProvisionService:
             "wifi_connect",
             "recovery_window",
         ]
-        if development_open_access:
-            capabilities.append("development_open_access")
-        payload = {
+        return {
             "status": "ok",
             "protocol": PROTOCOL_VERSION,
             "device": "Medicam",
@@ -406,11 +397,7 @@ class ProvisionService:
             "pairing_nonce": self._public_pairing_nonce(),
             "pairing_nonce_ttl": PAIRING_NONCE_TTL_SECONDS,
             "capabilities": capabilities,
-            "development_open_access": development_open_access,
         }
-        if development_open_access:
-            payload["tls_fingerprint"] = utils.get_tls_fingerprint()
-        return payload
 
     @staticmethod
     def _canonical_session_command(data):
@@ -639,14 +626,11 @@ class ProvisionService:
             ok = bool(result.get("ok"))
             ip = result.get("ip", "")
             if ok:
-                if utils.development_open_access_enabled():
-                    utils.set_provisioned(True, {"ssid": ssid, "ip": ip})
-                else:
-                    utils.set_provisioned(
-                        True,
-                        {"ssid": ssid, "ip": ip},
-                        api_token=api_token,
-                    )
+                utils.set_provisioned(
+                    True,
+                    {"ssid": ssid, "ip": ip},
+                    api_token=api_token,
+                )
                 self._set_response(
                     {
                         "status": "connected",
@@ -739,10 +723,7 @@ class ProvisionService:
             return
 
         if cmd == "SCAN_WIFI":
-            if (
-                not utils.development_open_access_enabled()
-                and not self._verify_session_command(data)
-            ):
+            if not self._verify_session_command(data):
                 self._set_response(
                     {"error": "pairing_required"},
                     request_id=request_id,
@@ -752,11 +733,7 @@ class ProvisionService:
             return
 
         if cmd == "CONNECT_WIFI":
-            development_open_access = utils.development_open_access_enabled()
-            if (
-                not development_open_access
-                and not self._verify_session_command(data)
-            ):
+            if not self._verify_session_command(data):
                 self._set_response(
                     {"error": "pairing_required"},
                     request_id=request_id,
@@ -771,10 +748,7 @@ class ProvisionService:
                     request_id=request_id,
                 )
                 return
-            if (
-                not development_open_access
-                and not utils.is_valid_api_token(api_token)
-            ):
+            if not utils.is_valid_api_token(api_token):
                 self._set_response(
                     {"error": "invalid_api_token"},
                     request_id=request_id,
@@ -886,7 +860,6 @@ class ProvisionService:
                     utils.is_provisioned(),
                     is_wifi_connected(),
                     utils.is_ble_recovery_active(),
-                    utils.development_open_access_enabled(),
                 ):
                     print("[BLE] Device provisioned and Wi-Fi connected -> stopping BLE")
                     break
