@@ -14,8 +14,6 @@ from app import utils
 from app.bluetooth_provision import (
     ProvisionService,
     encode_notification_frames,
-    should_refresh_ble,
-    should_stop_ble,
 )
 from app.manage_ble import (
     disable_legacy_ble_services,
@@ -434,12 +432,12 @@ class BleManagerTests(unittest.TestCase):
         )
         self.assertIn("Group=radxa", unit)
 
-    def test_ble_runs_for_setup_disconnect_and_recovery_windows(self):
+    def test_ble_is_always_required_for_wifi_recovery(self):
         self.assertTrue(should_run_ble(False, True, False, False))
         self.assertTrue(should_run_ble(True, False, False, False))
         self.assertTrue(should_run_ble(True, True, True, False))
         self.assertTrue(should_run_ble(True, True, False, True))
-        self.assertFalse(should_run_ble(True, True, False, False))
+        self.assertTrue(should_run_ble(True, True, False, False))
 
     def test_production_units_do_not_enable_authorization_bypass(self):
         deploy = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
@@ -494,15 +492,15 @@ class BleManagerTests(unittest.TestCase):
 
         control.assert_not_called()
 
-    def test_active_unneeded_ble_is_stopped(self):
+    def test_active_ble_is_never_stopped(self):
         with patch("app.manage_ble.systemctl", return_value=True) as control:
             action = reconcile_ble_service(
                 should_run=False,
                 status="active",
             )
 
-        control.assert_called_once_with("stop")
-        self.assertEqual(action, "stopped")
+        control.assert_not_called()
+        self.assertEqual(action, "unchanged")
 
     def test_manager_state_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -569,16 +567,6 @@ class BluetoothProvisioningTests(unittest.TestCase):
         finally:
             service._executor.shutdown(wait=False, cancel_futures=True)
             service._notify_executor.shutdown(wait=False, cancel_futures=True)
-
-    def test_new_recovery_marker_refreshes_gatt_once(self):
-        self.assertTrue(should_refresh_ble("old-window", "new-window"))
-        self.assertFalse(should_refresh_ble("new-window", "new-window"))
-        self.assertFalse(should_refresh_ble("new-window", ""))
-
-    def test_connected_device_stays_available_during_recovery(self):
-        self.assertTrue(should_stop_ble(True, True, False))
-        self.assertFalse(should_stop_ble(True, True, True))
-        self.assertFalse(should_stop_ble(True, False, False))
 
     def test_large_ble_response_is_framed_with_bounded_values(self):
         payload = json.dumps({"networks": ["x" * 64] * 20}).encode()
@@ -698,28 +686,33 @@ class BluetoothProvisioningTests(unittest.TestCase):
         self.assertNotIn("api_token", response)
         self.assertEqual(service._session_key, "b" * 64)
 
-    def test_owner_unlock_is_unavailable_during_normal_connected_operation(self):
+    def test_owner_unlock_is_available_during_normal_connected_operation(self):
         service = self._pairing_service()
         with patch(
             "app.bluetooth_provision.utils.is_provisioned", return_value=True
         ), patch(
-            "app.bluetooth_provision.utils.is_ble_recovery_active",
-            return_value=False,
+            "app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"
         ), patch(
-            "app.bluetooth_provision.utils.is_boot_pairing_window_active",
-            return_value=False,
+            "app.bluetooth_provision.utils.get_device_name",
+            return_value="Medicam-VICE01",
         ), patch(
-            "app.bluetooth_provision.utils.is_wifi_connected", return_value=True
+            "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
+        ), patch(
+            "app.bluetooth_provision.utils.verify_owner_pairing_client_proof",
+            return_value=True,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_session_key",
+            return_value="b" * 64,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_server_proof",
+            return_value="c" * 64,
         ):
             service._unlock_owner(
                 {"nonce": "fresh-nonce", "proof": "d" * 64},
                 request_id="owner-unlock-1",
             )
 
-        self.assertEqual(
-            service._set_response.call_args.args[0],
-            {"error": "owner_recovery_unavailable"},
-        )
+        self.assertEqual(service._set_response.call_args.args[0]["status"], "unlocked")
 
     def test_wifi_commands_require_valid_monotonic_session_hmac(self):
         service = self._pairing_service()

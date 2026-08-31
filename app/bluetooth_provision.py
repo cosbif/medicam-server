@@ -112,19 +112,6 @@ def get_wifi_ssid() -> str:
     return utils.get_wifi_ssid()
 
 
-def should_refresh_ble(initial_marker: str, current_marker: str) -> bool:
-    """A newly issued recovery window requires a fresh BlueZ GATT session."""
-    return bool(current_marker and current_marker != initial_marker)
-
-
-def should_stop_ble(
-    provisioned: bool,
-    connected: bool,
-    recovery_active: bool,
-) -> bool:
-    return provisioned and connected and not recovery_active
-
-
 def add_characteristic(periph, **kwargs):
     """Add and return a characteristic across Bluezero API variants.
 
@@ -485,17 +472,12 @@ class ProvisionService:
         )
 
     def _unlock_owner(self, data, request_id=None):
-        """Unlock Wi-Fi recovery using the token already owned by this phone.
+        """Unlock Wi-Fi settings using the token already owned by this phone.
 
-        The token itself never crosses BLE. This route is intentionally
-        unavailable during ordinary connected operation unless an authenticated
-        HTTP request opened the recovery window first.
+        The token itself never crosses BLE. Always-on advertising is safe here
+        because a fresh nonce-bound proof is still mandatory and rate-limited.
         """
-        if not utils.is_provisioned() or not (
-            utils.is_ble_recovery_active()
-            or utils.is_boot_pairing_window_active()
-            or not utils.is_wifi_connected()
-        ):
+        if not utils.is_provisioned():
             self._set_response(
                 {"error": "owner_recovery_unavailable"},
                 request_id=request_id,
@@ -906,7 +888,6 @@ class ProvisionService:
     # ---------------------------
     def run(self):
         print("[BLE] Starting provisioning service...")
-        initial_recovery_marker = utils.get_ble_recovery_until()
 
         try:
             self.periph.publish()
@@ -916,16 +897,6 @@ class ProvisionService:
 
         try:
             while True:
-                recovery_marker = utils.get_ble_recovery_until()
-                if should_refresh_ble(initial_recovery_marker, recovery_marker):
-                    raise RuntimeError("BLE recovery window changed; refreshing GATT")
-                if should_stop_ble(
-                    utils.is_provisioned(),
-                    is_wifi_connected(),
-                    utils.is_ble_recovery_active(),
-                ):
-                    print("[BLE] Device provisioned and Wi-Fi connected -> stopping BLE")
-                    break
                 time.sleep(1)
         except KeyboardInterrupt:
             pass

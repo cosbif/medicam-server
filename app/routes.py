@@ -687,13 +687,12 @@ async def provision_recovery_start(
     _ok: bool = Depends(require_api_auth),
 ):
     expires_at = utils.start_ble_recovery(duration_seconds)
-    utils.request_ble_refresh()
     return {
         "status": "recovery_started",
         "expires_at": expires_at,
-        # The root BLE manager observes the recovery state within ten seconds.
-        # The sandboxed HTTP API never invokes sudo.
-        "ble_start": {"ok": True, "status": "requested"},
+        # BLE is always available; keep this field for older app versions that
+        # opened a bounded recovery window before scanning.
+        "ble_start": {"ok": True, "status": "already_active"},
         "ble_service": _systemctl_status(BLE_SERVICE),
     }
 

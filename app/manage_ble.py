@@ -11,8 +11,6 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from app import utils
-
 BLE_SERVICE = "medicam-ble.service"
 LEGACY_BLE_SERVICES = ("ble-provision.service",)
 BLE_MANAGER_STATE_FILE = Path(
@@ -29,12 +27,12 @@ def should_run_ble(
     recovery_active: bool,
     boot_window_active: bool,
 ) -> bool:
-    return (
-        (not provisioned)
-        or (not connected)
-        or recovery_active
-        or boot_window_active
-    )
+    # Medicam is mains-powered and BLE is the recovery path when Wi-Fi is
+    # unavailable or isolates clients. Authentication, rate limiting and
+    # encrypted credentials protect the GATT commands, so advertising remains
+    # available regardless of the current provisioning/network state.
+    _ = (provisioned, connected, recovery_active, boot_window_active)
+    return True
 
 
 def service_status(unit: str = BLE_SERVICE):
@@ -70,15 +68,11 @@ def systemctl(action: str, unit: str = BLE_SERVICE):
 
 
 def reconcile_ble_service(*, should_run: bool, status: str):
-    """Apply one manager iteration; recovery refresh uses systemd.path."""
-    if not should_run and status == "active":
-        if systemctl("stop"):
-            print("[Auto] Provisioned Wi-Fi active → stop BLE")
-            return "stopped"
-        return "stop_failed"
-    elif should_run and status != "active":
+    """Keep the authenticated BLE recovery service continuously available."""
+    _ = should_run
+    if status != "active":
         if systemctl("start"):
-            print("[Auto] BLE provisioning required → start BLE")
+            print("[Auto] Always-on BLE is inactive → start BLE")
             return "started"
         return "start_failed"
     return "unchanged"
@@ -149,27 +143,9 @@ def main():
     disable_legacy_ble_services()
     previous_state = None
     while True:
-        provisioned = utils.is_ble_provisioned()
-        connected = utils.is_wifi_connected()
-        recovery_active = utils.is_ble_recovery_active()
-        boot_window_active = utils.is_boot_pairing_window_active()
         status = service_status()
-
-        should_ble_run = should_run_ble(
-            provisioned,
-            connected,
-            recovery_active,
-            boot_window_active,
-        )
-
-        current_state = (
-            provisioned,
-            connected,
-            recovery_active,
-            boot_window_active,
-            status,
-            should_ble_run,
-        )
+        should_ble_run = True
+        current_state = (status, should_ble_run)
         action = reconcile_ble_service(
             should_run=should_ble_run,
             status=status,
@@ -177,21 +153,14 @@ def main():
 
         if current_state != previous_state:
             print(
-                "[Auto] BLE state: "
-                f"provisioned={provisioned} "
-                f"wifi_connected={connected} "
-                f"recovery_active={recovery_active} "
-                f"boot_window_active={boot_window_active} "
+                "[Auto] BLE state: policy=always_on "
                 f"service={status} required={should_ble_run}"
             )
             try:
                 write_manager_state(
                     {
                         "observed_at_unix": time.time(),
-                        "provisioned": provisioned,
-                        "wifi_connected": connected,
-                        "recovery_active": recovery_active,
-                        "boot_window_active": boot_window_active,
+                        "policy": "always_on",
                         "service": status,
                         "required": should_ble_run,
                         "action": action,

@@ -338,13 +338,11 @@ class RouteSecurityTests(unittest.TestCase):
     def test_authenticated_owner_can_open_recovery_window(self):
         token = self._provision()
 
-        with patch("app.routes.utils.request_ble_refresh") as refresh:
-            result = asyncio.run(routes.provision_recovery_start(120, _ok=True))
+        result = asyncio.run(routes.provision_recovery_start(120, _ok=True))
 
         self.assertEqual(result["status"], "recovery_started")
-        self.assertEqual(result["ble_start"]["status"], "requested")
+        self.assertEqual(result["ble_start"]["status"], "already_active")
         self.assertTrue(utils.is_ble_recovery_active())
-        refresh.assert_called_once_with()
 
         stopped = asyncio.run(routes.provision_recovery_stop(_ok=True))
         self.assertEqual(stopped["status"], "recovery_stopped")
