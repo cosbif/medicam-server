@@ -28,9 +28,9 @@ def should_run_ble(
     boot_window_active: bool,
 ) -> bool:
     # Medicam is mains-powered and BLE is the recovery path when Wi-Fi is
-    # unavailable or isolates clients. Authentication, rate limiting and
-    # encrypted credentials protect the GATT commands, so advertising remains
-    # available regardless of the current provisioning/network state.
+    # unavailable or isolates clients. The physical QR code and short-lived
+    # command session restrict initial setup, so advertising remains available
+    # regardless of the current provisioning/network state.
     _ = (provisioned, connected, recovery_active, boot_window_active)
     return True
 

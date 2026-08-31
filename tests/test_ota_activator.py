@@ -16,6 +16,53 @@ PREVIOUS_RELEASE = Path("/signed/previous")
 
 
 class OtaActivatorTests(unittest.TestCase):
+    def test_bluetooth_profile_disables_conflicting_client_plugins(self):
+        profile = (
+            Path(__file__).resolve().parents[1]
+            / "deploy/systemd/bluetooth.service.d/medicam.conf"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ExecStart=\n", profile)
+        self.assertIn("/usr/libexec/bluetooth/bluetoothd --noplugin=", profile)
+        self.assertIn("battery", profile)
+        self.assertIn("policy", profile)
+
+    def test_restart_services_applies_bluetooth_profile_before_ble(self):
+        with patch.object(activate, "run") as run:
+            activate.restart_services()
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(
+                    ["/bin/systemctl", "restart", "bluetooth.service"],
+                    timeout=30,
+                ),
+                call(
+                    [
+                        "/bin/systemctl",
+                        "restart",
+                        "medicam.service",
+                        "medicam-ble-manager.service",
+                    ],
+                    timeout=60,
+                ),
+                call(
+                    ["/bin/systemctl", "restart", "medicam-ble.service"],
+                    timeout=30,
+                ),
+                call(
+                    [
+                        "/bin/systemctl",
+                        "try-restart",
+                        "medicam-service-tunnel.service",
+                    ],
+                    timeout=30,
+                    check=False,
+                ),
+            ],
+        )
+
     def test_pairing_export_opens_bounded_ble_recovery_window(self):
         with tempfile.TemporaryDirectory() as directory:
             recovery = Path(directory) / "ble-recovery-until.state"

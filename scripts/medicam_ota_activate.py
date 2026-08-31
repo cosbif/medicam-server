@@ -83,6 +83,9 @@ USB_POWER_IDS = {
     ("2109", "0817"),
 }
 SYSTEMD_ASSETS = {
+    "bluetooth.service.d/medicam.conf": Path(
+        "/etc/systemd/system/bluetooth.service.d/medicam.conf"
+    ),
     "medicam.service": Path("/etc/systemd/system/medicam.service"),
     "medicam-cloud-agent.service": Path(
         "/etc/systemd/system/medicam-cloud-agent.service"
@@ -1246,6 +1249,12 @@ def restore_persistent_files(
 
 
 def restart_services() -> None:
+    # Apply the Medicam bluetoothd profile first. Restarting bluetooth stops
+    # the PartOf=bluetooth.service GATT unit, which is started explicitly below.
+    run(
+        ["/bin/systemctl", "restart", "bluetooth.service"],
+        timeout=30,
+    )
     run(
         [
             "/bin/systemctl",
@@ -1256,9 +1265,8 @@ def restart_services() -> None:
         timeout=60,
     )
     run(
-        ["/bin/systemctl", "try-restart", "medicam-ble.service"],
+        ["/bin/systemctl", "restart", "medicam-ble.service"],
         timeout=30,
-        check=False,
     )
     run(
         ["/bin/systemctl", "try-restart", "medicam-service-tunnel.service"],

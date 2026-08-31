@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import json
-import base64
 import subprocess
 import time
 from pathlib import Path
@@ -8,12 +7,9 @@ import os
 import sys
 import threading
 import traceback
-import hashlib
 import hmac
 import secrets
 from concurrent.futures import ThreadPoolExecutor
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # подключаем project root, чтобы импортировать app.utils
 project_root = Path(__file__).resolve().parents[1]
@@ -33,9 +29,8 @@ else:
 SERVICE_UUID = "3f7d1000-6f4b-4e21-9a63-7b9c3f1d0001"
 CMD_CHAR_UUID = "3f7d1001-6f4b-4e21-9a63-7b9c3f1d0001"
 RESP_CHAR_UUID = "3f7d1002-6f4b-4e21-9a63-7b9c3f1d0001"
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 MAX_COMMAND_BYTES = 8192
-PAIRING_NONCE_TTL_SECONDS = 120
 PAIRING_SESSION_TTL_SECONDS = 300
 PAIRING_FAILURE_LIMIT = 5
 PAIRING_BLOCK_SECONDS = 60
@@ -55,7 +50,7 @@ TEST_MODE = os.getenv("MEDICAM_BLE_TEST_MODE", "").lower() in {
 
 
 def encode_notification_frames(payload: bytes, frame_id: str | None = None):
-    """Return ATT-safe protocol-5 notifications for one bounded response."""
+    """Return ATT-safe framed notifications for one bounded response."""
     if len(payload) > MAX_RESPONSE_BYTES:
         payload = b'{"error":"response_too_large"}'
     if len(payload) <= MAX_NOTIFICATION_VALUE_BYTES:
@@ -233,15 +228,10 @@ class ProvisionService:
         self._command_slots = threading.BoundedSemaphore(MAX_PENDING_COMMANDS)
         self._notify_slots = threading.BoundedSemaphore(MAX_PENDING_RESPONSES)
         self._pairing_lock = threading.Lock()
-        self._pairing_nonce = ""
-        self._pairing_nonce_issued = 0.0
         self._pairing_failures = 0
         self._pairing_blocked_until = 0.0
         self._session_id = ""
-        self._session_key = ""
         self._session_expires = 0.0
-        self._session_counter = -1
-        self._rotate_pairing_nonce_locked()
 
     # ---------------------------
     # Read callback for RESP
@@ -364,31 +354,15 @@ class ProvisionService:
 
         self._executor.submit(run_command)
 
-    def _rotate_pairing_nonce_locked(self):
-        self._pairing_nonce = secrets.token_urlsafe(24)
-        self._pairing_nonce_issued = time.monotonic()
-
-    def _public_pairing_nonce(self):
-        with self._pairing_lock:
-            if (
-                not self._pairing_nonce
-                or time.monotonic() - self._pairing_nonce_issued
-                >= PAIRING_NONCE_TTL_SECONDS
-            ):
-                self._rotate_pairing_nonce_locked()
-            return self._pairing_nonce
-
     def _status_payload(self):
         capabilities = [
             "physical_pairing_code",
             "owner_token_recovery",
-            "mutual_pairing_proof",
-            "session_hmac",
             "client_generated_token",
             "tls_pinning",
             "wifi_scan",
             "wifi_connect",
-            "recovery_window",
+            "always_on_ble",
         ]
         return {
             "status": "ok",
@@ -397,28 +371,11 @@ class ProvisionService:
             "device_id": utils.get_device_id(),
             "device_name": utils.get_device_name(),
             "provisioned": utils.is_provisioned(),
-            "pairing_nonce": self._public_pairing_nonce(),
-            "pairing_nonce_ttl": PAIRING_NONCE_TTL_SECONDS,
             "capabilities": capabilities,
         }
 
-    @staticmethod
-    def _canonical_session_command(data):
-        authenticated = {
-            key: value
-            for key, value in data.items()
-            if key != "auth"
-        }
-        return json.dumps(
-            authenticated,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
     def _unlock_pairing(self, data, request_id=None):
-        nonce = data.get("nonce")
-        proof = data.get("proof")
+        code = data.get("code")
         now = time.monotonic()
         device_id = utils.get_device_id()
         fingerprint = utils.get_tls_fingerprint()
@@ -432,27 +389,26 @@ class ProvisionService:
                     request_id=request_id,
                 )
                 return
-            valid_nonce = (
-                isinstance(nonce, str)
-                and hmac.compare_digest(nonce, self._pairing_nonce)
-                and now - self._pairing_nonce_issued < PAIRING_NONCE_TTL_SECONDS
+            normalized = (
+                code.replace("-", "").strip().upper()
+                if isinstance(code, str)
+                else ""
             )
-            valid_proof = bool(
-                valid_nonce
-                and isinstance(proof, str)
-                and utils.verify_pairing_client_proof(nonce, device_id, proof)
-            )
-            if not valid_proof or not fingerprint:
+            try:
+                expected = utils.get_pairing_secret()
+            except OSError:
+                expected = ""
+            if (
+                not expected
+                or not hmac.compare_digest(normalized, expected)
+                or not fingerprint
+            ):
                 self._pairing_failures += 1
                 if self._pairing_failures >= PAIRING_FAILURE_LIMIT:
                     self._pairing_blocked_until = now + PAIRING_BLOCK_SECONDS
                     self._pairing_failures = 0
-                self._rotate_pairing_nonce_locked()
                 self._set_response(
-                    {
-                        "error": "invalid_pairing_proof",
-                        "pairing_nonce": self._pairing_nonce,
-                    },
+                    {"error": "invalid_pairing_code"},
                     request_id=request_id,
                 )
                 return
@@ -460,15 +416,7 @@ class ProvisionService:
             self._pairing_failures = 0
             self._pairing_blocked_until = 0.0
             self._session_id = secrets.token_urlsafe(18)
-            self._session_key = utils.pairing_session_key(nonce, device_id)
             self._session_expires = now + PAIRING_SESSION_TTL_SECONDS
-            self._session_counter = -1
-            server_proof = utils.pairing_server_proof(
-                nonce,
-                device_id,
-                fingerprint,
-            )
-            self._rotate_pairing_nonce_locked()
 
         self._set_response(
             {
@@ -479,7 +427,6 @@ class ProvisionService:
                 "device_id": device_id,
                 "device_name": utils.get_device_name(),
                 "tls_fingerprint": fingerprint,
-                "server_proof": server_proof,
             },
             request_id=request_id,
         )
@@ -487,8 +434,8 @@ class ProvisionService:
     def _unlock_owner(self, data, request_id=None):
         """Unlock Wi-Fi settings using the token already owned by this phone.
 
-        The token itself never crosses BLE. Always-on advertising is safe here
-        because a fresh nonce-bound proof is still mandatory and rate-limited.
+        The stored owner token is sent directly over the short-range BLE link.
+        This keeps recovery short and repeatable after a Wi-Fi change.
         """
         if not utils.is_provisioned():
             self._set_response(
@@ -497,8 +444,7 @@ class ProvisionService:
             )
             return
 
-        nonce = data.get("nonce")
-        proof = data.get("proof")
+        api_token = data.get("api_token")
         now = time.monotonic()
         device_id = utils.get_device_id()
         fingerprint = utils.get_tls_fingerprint()
@@ -512,31 +458,13 @@ class ProvisionService:
                     request_id=request_id,
                 )
                 return
-            valid_nonce = (
-                isinstance(nonce, str)
-                and hmac.compare_digest(nonce, self._pairing_nonce)
-                and now - self._pairing_nonce_issued < PAIRING_NONCE_TTL_SECONDS
-            )
-            valid_proof = bool(
-                valid_nonce
-                and isinstance(proof, str)
-                and utils.verify_owner_pairing_client_proof(
-                    nonce,
-                    device_id,
-                    proof,
-                )
-            )
-            if not valid_proof or not fingerprint:
+            if not utils.verify_api_token(api_token) or not fingerprint:
                 self._pairing_failures += 1
                 if self._pairing_failures >= PAIRING_FAILURE_LIMIT:
                     self._pairing_blocked_until = now + PAIRING_BLOCK_SECONDS
                     self._pairing_failures = 0
-                self._rotate_pairing_nonce_locked()
                 self._set_response(
-                    {
-                        "error": "invalid_owner_proof",
-                        "pairing_nonce": self._pairing_nonce,
-                    },
+                    {"error": "invalid_owner_proof"},
                     request_id=request_id,
                 )
                 return
@@ -544,15 +472,7 @@ class ProvisionService:
             self._pairing_failures = 0
             self._pairing_blocked_until = 0.0
             self._session_id = secrets.token_urlsafe(18)
-            self._session_key = utils.owner_pairing_session_key(nonce, device_id)
             self._session_expires = now + PAIRING_SESSION_TTL_SECONDS
-            self._session_counter = -1
-            server_proof = utils.owner_pairing_server_proof(
-                nonce,
-                device_id,
-                fingerprint,
-            )
-            self._rotate_pairing_nonce_locked()
 
         self._set_response(
             {
@@ -563,82 +483,40 @@ class ProvisionService:
                 "device_id": device_id,
                 "device_name": utils.get_device_name(),
                 "tls_fingerprint": fingerprint,
-                "server_proof": server_proof,
             },
             request_id=request_id,
         )
 
     def _verify_session_command(self, data):
         session_id = data.get("session_id")
-        counter = data.get("counter")
-        supplied = data.get("auth")
         with self._pairing_lock:
-            if (
-                not self._session_id
-                or time.monotonic() >= self._session_expires
-                or not isinstance(session_id, str)
-                or not hmac.compare_digest(session_id, self._session_id)
-                or not isinstance(counter, int)
-                or counter <= self._session_counter
-                or not isinstance(supplied, str)
-            ):
-                return False
-            expected = hmac.new(
-                bytes.fromhex(self._session_key),
-                self._canonical_session_command(data),
-                hashlib.sha256,
-            ).hexdigest()
-            if not hmac.compare_digest(supplied, expected):
-                return False
-            self._session_counter = counter
-            return True
+            return bool(
+                self._session_id
+                and time.monotonic() < self._session_expires
+                and isinstance(session_id, str)
+                and hmac.compare_digest(session_id, self._session_id)
+            )
 
     @staticmethod
-    def _secret_command_aad(data):
-        metadata = {
-            key: data.get(key)
-            for key in ("cmd", "session_id", "counter", "request_id")
-        }
-        return json.dumps(
-            metadata,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
-    def _decrypt_wifi_credentials(self, data):
-        sealed = data.get("sealed")
-        if not isinstance(sealed, str) or not sealed:
-            raise ValueError("missing_encrypted_credentials")
-        try:
-            padding = "=" * (-len(sealed) % 4)
-            combined = base64.urlsafe_b64decode(sealed + padding)
-            if len(combined) < 12 + 16:
-                raise ValueError("encrypted_credentials_too_short")
-            with self._pairing_lock:
-                session_key = bytes.fromhex(self._session_key)
-            cleartext = AESGCM(session_key).decrypt(
-                combined[:12],
-                combined[12:],
-                self._secret_command_aad(data),
-            )
-            credentials = json.loads(cleartext.decode("utf-8"))
-        except Exception as error:
-            raise ValueError("invalid_encrypted_credentials") from error
-        if not isinstance(credentials, dict):
-            raise ValueError("invalid_encrypted_credentials")
-        ssid = credentials.get("ssid")
-        password = credentials.get("password")
-        if not isinstance(ssid, str) or not ssid or not isinstance(password, str):
-            raise ValueError("invalid_encrypted_credentials")
-        return ssid, password
+    def _wifi_credentials(data):
+        ssid = data.get("ssid")
+        password = data.get("password")
+        api_token = data.get("api_token")
+        if (
+            not isinstance(ssid, str)
+            or not ssid.strip()
+            or len(ssid.encode("utf-8")) > 32
+            or not isinstance(password, str)
+            or len(password) > 64
+            or not utils.is_valid_api_token(api_token)
+        ):
+            raise ValueError("invalid_wifi_credentials")
+        return ssid.strip(), password, api_token
 
     def _clear_session(self):
         with self._pairing_lock:
             self._session_id = ""
-            self._session_key = ""
             self._session_expires = 0.0
-            self._session_counter = -1
 
     # ---------------------------
     # Long-running workers
@@ -793,22 +671,10 @@ class ProvisionService:
                 )
                 return
             try:
-                ssid, password = self._decrypt_wifi_credentials(data)
+                ssid, password, api_token = self._wifi_credentials(data)
             except ValueError:
                 self._set_response(
-                    {"error": "invalid_encrypted_credentials"},
-                    request_id=request_id,
-                )
-                return
-            try:
-                api_token = utils.derive_owner_api_token(
-                    self._session_key,
-                    self._session_id,
-                    utils.get_device_id(),
-                )
-            except ValueError:
-                self._set_response(
-                    {"error": "invalid_pairing_session"},
+                    {"error": "invalid_wifi_credentials"},
                     request_id=request_id,
                 )
                 return
