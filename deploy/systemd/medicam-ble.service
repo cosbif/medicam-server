@@ -2,6 +2,7 @@
 Description=Medicam BLE Wi-Fi Provisioning
 After=bluetooth.service NetworkManager.service
 Wants=bluetooth.service NetworkManager.service
+PartOf=bluetooth.service
 
 [Service]
 Type=simple

@@ -13,6 +13,7 @@ from unittest.mock import ANY, Mock, call, patch
 from app import utils
 from app.bluetooth_provision import (
     ProvisionService,
+    configure_always_on_adapter,
     encode_notification_frames,
 )
 from app.manage_ble import (
@@ -431,6 +432,7 @@ class BleManagerTests(unittest.TestCase):
             unit,
         )
         self.assertIn("Group=radxa", unit)
+        self.assertIn("PartOf=bluetooth.service", unit)
 
     def test_ble_is_always_required_for_wifi_recovery(self):
         self.assertTrue(should_run_ble(False, True, False, False))
@@ -523,6 +525,25 @@ class BleManagerTests(unittest.TestCase):
 
 
 class BluetoothProvisioningTests(unittest.TestCase):
+    def test_adapter_is_permanently_discoverable_but_not_pairable(self):
+        dongle = type(
+            "FakeDongle",
+            (),
+            {
+                "powered": False,
+                "discoverable": False,
+                "discoverabletimeout": 180,
+                "pairable": True,
+            },
+        )()
+
+        configure_always_on_adapter(dongle)
+
+        self.assertTrue(bool(dongle.powered))
+        self.assertTrue(bool(dongle.discoverable))
+        self.assertEqual(int(dongle.discoverabletimeout), 0)
+        self.assertFalse(bool(dongle.pairable))
+
     def test_bluezero_091_none_return_keeps_response_characteristic(self):
         class FakeCharacteristic:
             def __init__(self, uuid):
@@ -535,7 +556,17 @@ class BluetoothProvisioningTests(unittest.TestCase):
         class FakePeripheral:
             def __init__(self, **_kwargs):
                 self.characteristics = []
-                self.dongle = type("FakeDongle", (), {"alias": "nom"})()
+                self.dongle = type(
+                    "FakeDongle",
+                    (),
+                    {
+                        "alias": "nom",
+                        "powered": False,
+                        "discoverable": False,
+                        "discoverabletimeout": 180,
+                        "pairable": True,
+                    },
+                )()
 
             def add_service(self, *_args):
                 return None
@@ -557,6 +588,9 @@ class BluetoothProvisioningTests(unittest.TestCase):
 
         try:
             self.assertEqual(service.periph.dongle.alias, "Medicam-TEST01")
+            self.assertTrue(bool(service.periph.dongle.discoverable))
+            self.assertEqual(int(service.periph.dongle.discoverabletimeout), 0)
+            self.assertFalse(bool(service.periph.dongle.pairable))
             self.assertIs(service.cmd_char, service.periph.characteristics[0])
             self.assertIs(service.resp_char, service.periph.characteristics[1])
             service._notify_value(b'{"status":"ok"}')

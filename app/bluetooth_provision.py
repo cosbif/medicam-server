@@ -112,6 +112,18 @@ def get_wifi_ssid() -> str:
     return utils.get_wifi_ssid()
 
 
+def configure_always_on_adapter(dongle) -> None:
+    """Keep LE advertisements connectable without enabling Bluetooth pairing."""
+    powered_type = type(dongle.powered)
+    timeout_type = type(dongle.discoverabletimeout)
+    pairable_type = type(dongle.pairable)
+    discoverable_type = type(dongle.discoverable)
+    dongle.powered = powered_type(True)
+    dongle.discoverabletimeout = timeout_type(0)
+    dongle.pairable = pairable_type(False)
+    dongle.discoverable = discoverable_type(True)
+
+
 def add_characteristic(periph, **kwargs):
     """Add and return a characteristic across Bluezero API variants.
 
@@ -165,6 +177,7 @@ class ProvisionService:
         # advertisement LocalName. Keep both identities product-specific so a
         # new owner never sees the Linux hostname (for example, "nom").
         self.periph.dongle.alias = device_name
+        configure_always_on_adapter(self.periph.dongle)
 
         print("[BLE] Peripheral created via bluezero")
 
@@ -894,16 +907,15 @@ class ProvisionService:
         except Exception as e:
             print(f"[ERR] publish failed: {e}")
             raise
-
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._notify_executor.shutdown(wait=False, cancel_futures=True)
-            self.stop()
+
+        # Bluezero's publish call owns the D-Bus event loop and should not
+        # return during normal service operation. A clean-looking return would
+        # otherwise leave systemd reporting an active process with no GATT
+        # advertisement, so force the configured on-failure restart.
+        raise RuntimeError("BLE D-Bus event loop stopped unexpectedly")
 
     def stop(self):
         try:
