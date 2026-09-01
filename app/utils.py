@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import hmac
 import secrets
 import subprocess
@@ -54,6 +55,13 @@ POWER_OFF_REQUEST_FILE = Path(
 MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
 PAIRING_SECRET_FILE = Path("/etc/medicam/pairing-secret")
 TLS_CERT_FILE = Path("/etc/medicam/tls/cert.pem")
+PAIRING_CLIENT_CONTEXT = "medicam-client-v1"
+PAIRING_SERVER_CONTEXT = "medicam-server-v1"
+PAIRING_SESSION_CONTEXT = "medicam-session-v1"
+OWNER_PAIRING_CLIENT_CONTEXT = "medicam-owner-client-v1"
+OWNER_PAIRING_SERVER_CONTEXT = "medicam-owner-server-v1"
+OWNER_PAIRING_SESSION_CONTEXT = "medicam-owner-session-v1"
+OWNER_API_TOKEN_CONTEXT = "medicam-owner-token-v1"
 
 _VIDEO_METADATA_CACHE = {}
 _VIDEO_INDEX_CACHE = None
@@ -1049,9 +1057,34 @@ def is_valid_api_token(token: str | None) -> bool:
     )
 
 
+def derive_owner_api_token(
+    session_key_hex: str,
+    session_id: str,
+    device_id: str,
+) -> str:
+    """Derive the next owner token without transmitting it over Bluetooth."""
+    try:
+        session_key = bytes.fromhex(session_key_hex)
+    except (TypeError, ValueError):
+        session_key = b""
+    if (
+        len(session_key) != 32
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(device_id, str)
+        or not device_id
+    ):
+        raise ValueError("invalid_pairing_session")
+    message = "\0".join(
+        (OWNER_API_TOKEN_CONTEXT, session_id, device_id)
+    ).encode("utf-8")
+    digest = hmac.new(session_key, message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
 def get_api_token() -> str:
     token = _read_provision_data().get("api_token", "")
-    return token if isinstance(token, str) else ""
+    return token if isinstance(token, str) and is_valid_api_token(token) else ""
 
 
 def verify_api_token(token: str | None) -> bool:
@@ -1113,6 +1146,87 @@ def get_pairing_secret() -> str:
     if not re.fullmatch(r"[A-Z2-7]{26}", secret):
         raise OSError("invalid_pairing_secret")
     return secret
+
+
+def _pairing_hmac(context: str, nonce: str, *values: str) -> str:
+    secret = get_pairing_secret().encode("ascii")
+    message = "\0".join((context, nonce, *values)).encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def pairing_client_proof(nonce: str, device_id: str) -> str:
+    return _pairing_hmac(PAIRING_CLIENT_CONTEXT, nonce, device_id)
+
+
+def pairing_server_proof(nonce: str, device_id: str, tls_fingerprint: str) -> str:
+    return _pairing_hmac(
+        PAIRING_SERVER_CONTEXT,
+        nonce,
+        device_id,
+        tls_fingerprint,
+    )
+
+
+def pairing_session_key(nonce: str, device_id: str) -> str:
+    return _pairing_hmac(PAIRING_SESSION_CONTEXT, nonce, device_id)
+
+
+def verify_pairing_client_proof(nonce: str, device_id: str, proof: str) -> bool:
+    try:
+        expected = pairing_client_proof(nonce, device_id)
+    except OSError:
+        return False
+    return bool(proof and hmac.compare_digest(proof, expected))
+
+
+def _owner_pairing_hmac(context: str, nonce: str, *values: str) -> str:
+    """Authenticate BLE recovery with the existing owner token.
+
+    The token remains in the iPhone Keychain and in the camera provision file;
+    only a nonce-bound HMAC crosses Bluetooth.
+    """
+    token = get_api_token()
+    if not is_valid_api_token(token):
+        raise OSError("owner_token_unavailable")
+    message = "\0".join((context, nonce, *values)).encode("utf-8")
+    return hmac.new(token.encode("ascii"), message, hashlib.sha256).hexdigest()
+
+
+def owner_pairing_client_proof(nonce: str, device_id: str) -> str:
+    return _owner_pairing_hmac(OWNER_PAIRING_CLIENT_CONTEXT, nonce, device_id)
+
+
+def owner_pairing_server_proof(
+    nonce: str,
+    device_id: str,
+    tls_fingerprint: str,
+) -> str:
+    return _owner_pairing_hmac(
+        OWNER_PAIRING_SERVER_CONTEXT,
+        nonce,
+        device_id,
+        tls_fingerprint,
+    )
+
+
+def owner_pairing_session_key(nonce: str, device_id: str) -> str:
+    return _owner_pairing_hmac(
+        OWNER_PAIRING_SESSION_CONTEXT,
+        nonce,
+        device_id,
+    )
+
+
+def verify_owner_pairing_client_proof(
+    nonce: str,
+    device_id: str,
+    proof: str,
+) -> bool:
+    try:
+        expected = owner_pairing_client_proof(nonce, device_id)
+    except OSError:
+        return False
+    return bool(proof and hmac.compare_digest(proof, expected))
 
 
 def get_tls_fingerprint() -> str:

@@ -9,6 +9,7 @@ bleak==1.1.1
 bluezero==0.9.1
 click==8.4.2
 cffi==2.1.1
+cryptography==50.0.0
 pycparser==3.0
 dbus-fast==2.44.5
 dbus-python==1.4.0

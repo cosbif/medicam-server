@@ -610,50 +610,89 @@ class BluetoothProvisioningTests(unittest.TestCase):
     def _pairing_service():
         service = object.__new__(ProvisionService)
         service._pairing_lock = __import__("threading").Lock()
+        service._pairing_nonce = "fresh-nonce"
+        service._pairing_nonce_issued = __import__("time").monotonic()
         service._pairing_failures = 0
         service._pairing_blocked_until = 0.0
         service._session_id = ""
+        service._session_key = ""
         service._session_expires = 0.0
+        service._session_counter = -1
         service._set_response = Mock()
         return service
 
-    def test_pairing_unlock_accepts_physical_code_and_creates_session(self):
+    def test_pairing_unlock_returns_mutual_proof_and_creates_hmac_session(self):
         service = self._pairing_service()
         with patch("app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"), patch(
             "app.bluetooth_provision.utils.get_device_name", return_value="Medicam-VICE01"
         ), patch(
             "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
         ), patch(
-            "app.bluetooth_provision.utils.get_pairing_secret", return_value="A" * 26
+            "app.bluetooth_provision.utils.verify_pairing_client_proof", return_value=True
+        ), patch(
+            "app.bluetooth_provision.utils.pairing_session_key", return_value="b" * 64
+        ), patch(
+            "app.bluetooth_provision.utils.pairing_server_proof", return_value="c" * 64
         ):
             service._unlock_pairing(
-                {"code": "AAAAA-AAAAA-AAAAA-AAAAA-AAAAAA"},
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
                 request_id="unlock-1",
             )
 
         response = service._set_response.call_args.args[0]
         self.assertEqual(response["status"], "unlocked")
         self.assertEqual(response["auth_method"], "physical_code")
+        self.assertEqual(response["server_proof"], "c" * 64)
         self.assertEqual(response["tls_fingerprint"], "a" * 64)
         self.assertNotIn("api_token", response)
         self.assertTrue(service._session_id)
+        self.assertEqual(service._session_key, "b" * 64)
 
-    def test_pairing_unlock_rejects_wrong_physical_code(self):
+    def test_pairing_unlock_rejects_invalid_proof_and_rotates_nonce(self):
         service = self._pairing_service()
+        original_nonce = service._pairing_nonce
         with patch(
             "app.bluetooth_provision.utils.get_device_id", return_value="DEVICE01"
         ), patch(
             "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
         ), patch(
-            "app.bluetooth_provision.utils.get_pairing_secret", return_value="A" * 26
+            "app.bluetooth_provision.utils.verify_pairing_client_proof", return_value=False
         ):
-            service._unlock_pairing({"code": "B" * 26}, request_id="unlock-1")
+            service._unlock_pairing(
+                {"nonce": "fresh-nonce", "proof": "0" * 64},
+                request_id="unlock-1",
+            )
 
-        service._set_response.assert_called_once_with(
-            {"error": "invalid_pairing_code"},
-            request_id="unlock-1",
-        )
+        response = service._set_response.call_args.args[0]
+        self.assertEqual(response["error"], "invalid_pairing_proof")
+        self.assertNotEqual(response["pairing_nonce"], original_nonce)
         self.assertFalse(service._session_id)
+
+    def test_owner_pairing_proofs_use_existing_token_without_exposing_it(self):
+        token = "A" * 43
+        with patch("app.utils.get_api_token", return_value=token):
+            client_proof = utils.owner_pairing_client_proof(
+                "fresh-nonce",
+                "DEVICE01",
+            )
+            self.assertTrue(
+                utils.verify_owner_pairing_client_proof(
+                    "fresh-nonce",
+                    "DEVICE01",
+                    client_proof,
+                )
+            )
+            self.assertFalse(
+                utils.verify_owner_pairing_client_proof(
+                    "different-nonce",
+                    "DEVICE01",
+                    client_proof,
+                )
+            )
+            self.assertEqual(
+                client_proof,
+                "9b72d508545c57f042a320cc3d1d3ec371db75d85cbe23734526d599a997dfc7",
+            )
 
     def test_owner_unlock_creates_session_without_returning_owner_token(self):
         service = self._pairing_service()
@@ -667,19 +706,26 @@ class BluetoothProvisioningTests(unittest.TestCase):
         ), patch(
             "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
         ), patch(
-            "app.bluetooth_provision.utils.verify_api_token",
+            "app.bluetooth_provision.utils.verify_owner_pairing_client_proof",
             return_value=True,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_session_key",
+            return_value="b" * 64,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_server_proof",
+            return_value="c" * 64,
         ):
             service._unlock_owner(
-                {"api_token": "A" * 43},
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
                 request_id="owner-unlock-1",
             )
 
         response = service._set_response.call_args.args[0]
         self.assertEqual(response["status"], "unlocked")
         self.assertEqual(response["auth_method"], "owner_token")
+        self.assertEqual(response["server_proof"], "c" * 64)
         self.assertNotIn("api_token", response)
-        self.assertTrue(service._session_id)
+        self.assertEqual(service._session_key, "b" * 64)
 
     def test_owner_unlock_is_available_during_normal_connected_operation(self):
         service = self._pairing_service()
@@ -693,33 +739,44 @@ class BluetoothProvisioningTests(unittest.TestCase):
         ), patch(
             "app.bluetooth_provision.utils.get_tls_fingerprint", return_value="a" * 64
         ), patch(
-            "app.bluetooth_provision.utils.verify_api_token",
+            "app.bluetooth_provision.utils.verify_owner_pairing_client_proof",
             return_value=True,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_session_key",
+            return_value="b" * 64,
+        ), patch(
+            "app.bluetooth_provision.utils.owner_pairing_server_proof",
+            return_value="c" * 64,
         ):
             service._unlock_owner(
-                {"api_token": "A" * 43},
+                {"nonce": "fresh-nonce", "proof": "d" * 64},
                 request_id="owner-unlock-1",
             )
 
         self.assertEqual(service._set_response.call_args.args[0]["status"], "unlocked")
 
-    def test_wifi_commands_require_current_session_id(self):
+    def test_wifi_commands_require_valid_monotonic_session_hmac(self):
         service = self._pairing_service()
         service._session_id = "session"
+        service._session_key = "ab" * 32
         service._session_expires = __import__("time").monotonic() + 60
         command = {
             "cmd": "SCAN_WIFI",
             "request_id": "scan-1",
             "session_id": "session",
+            "counter": 1,
         }
+        command["auth"] = hmac.new(
+            bytes.fromhex(service._session_key),
+            service._canonical_session_command(command),
+            hashlib.sha256,
+        ).hexdigest()
 
         self.assertTrue(service._verify_session_command(command))
-        self.assertTrue(service._verify_session_command(command))
-        self.assertFalse(
-            service._verify_session_command({**command, "session_id": "wrong"})
-        )
-        service._session_expires = __import__("time").monotonic() - 1
         self.assertFalse(service._verify_session_command(command))
+
+        tampered = {**command, "counter": 2, "auth": "0" * 64}
+        self.assertFalse(service._verify_session_command(tampered))
 
     def test_wifi_commands_without_unlock_are_always_rejected(self):
         service = self._pairing_service()
@@ -750,25 +807,36 @@ class BluetoothProvisioningTests(unittest.TestCase):
         service._worker_scan_wifi.assert_not_called()
         service._worker_connect_wifi.assert_not_called()
 
-    def test_connect_wifi_passes_plain_credentials_and_stable_owner_token(self):
+    def test_connect_wifi_derives_owner_token_instead_of_receiving_it(self):
         service = self._pairing_service()
         service._session_id = "session"
+        service._session_key = "ab" * 32
         service._session_expires = __import__("time").monotonic() + 60
         service._worker_connect_wifi = Mock()
         command = {
             "cmd": "CONNECT_WIFI",
             "request_id": "connect-1",
             "session_id": "session",
-            "ssid": "Office",
-            "password": "secret-password",
-            "api_token": "D" * 43,
+            "sealed": "encrypted-wifi-credentials",
+            "counter": 1,
         }
+        command["auth"] = hmac.new(
+            bytes.fromhex(service._session_key),
+            service._canonical_session_command(command),
+            hashlib.sha256,
+        ).hexdigest()
 
         with patch(
-            "app.bluetooth_provision.utils.is_valid_api_token", return_value=True
+            "app.bluetooth_provision.utils.derive_owner_api_token",
+            return_value="D" * 43,
+        ) as derive, patch.object(
+            service,
+            "_decrypt_wifi_credentials",
+            return_value=("Office", "secret-password"),
         ):
             service._handle_command(command)
 
+        derive.assert_called_once_with("ab" * 32, "session", ANY)
         service._worker_connect_wifi.assert_called_once_with(
             "Office",
             "secret-password",
@@ -776,22 +844,59 @@ class BluetoothProvisioningTests(unittest.TestCase):
             request_id="connect-1",
         )
 
-    def test_wifi_credentials_reject_invalid_payload(self):
-        payload = {
+    def test_plain_ble_credentials_are_rejected(self):
+        service = self._pairing_service()
+        service._session_id = "session"
+        service._session_key = "ab" * 32
+        service._session_expires = __import__("time").monotonic() + 60
+        service._worker_connect_wifi = Mock()
+        command = {
+            "cmd": "CONNECT_WIFI",
+            "request_id": "connect-1",
+            "session_id": "session",
+            "counter": 1,
             "ssid": "Office",
-            "password": "secret-pass",
-            "api_token": "A" * 43,
+            "password": "secret-password",
+            "api_token": "D" * 43,
         }
-        with patch(
-            "app.bluetooth_provision.utils.is_valid_api_token", return_value=True
-        ):
-            self.assertEqual(
-                ProvisionService._wifi_credentials(payload),
-                ("Office", "secret-pass", "A" * 43),
-            )
-        payload["ssid"] = ""
+        command["auth"] = hmac.new(
+            bytes.fromhex(service._session_key),
+            service._canonical_session_command(command),
+            hashlib.sha256,
+        ).hexdigest()
+
+        service._handle_command(command)
+
+        service._set_response.assert_called_once_with(
+            {"error": "invalid_wifi_credentials"},
+            request_id="connect-1",
+        )
+        service._worker_connect_wifi.assert_not_called()
+
+    def test_aes_gcm_wifi_payload_matches_mobile_protocol_vector(self):
+        service = self._pairing_service()
+        service._session_key = (
+            "7539182fd2ab2de792e3910d13b44b25"
+            "ad05006aae27d48f90c7465f7d4bc71a"
+        )
+        payload = {
+            "cmd": "CONNECT_WIFI",
+            "session_id": "session-1",
+            "counter": 1,
+            "request_id": "request-1",
+            "sealed": (
+                "AAECAwQFBgcICQoLzc44SMOlle-qGdQMCDHO-6sPexeyoSqi_uRD95X2"
+                "IFtlZmVs1L0uVWXZq7JT4lvMuvIKPsMfMwRhYSDwnzl-"
+            ),
+        }
+
+        self.assertEqual(
+            service._decrypt_wifi_credentials(payload),
+            ("Clinic WiFi", "secret-pass"),
+        )
+        payload["sealed"] = payload["sealed"][:-1] + "A"
         with self.assertRaises(ValueError):
-            ProvisionService._wifi_credentials(payload)
+            service._decrypt_wifi_credentials(payload)
 
     def test_wifi_state_write_failure_returns_stable_error_code(self):
         service = self._pairing_service()
@@ -831,6 +936,9 @@ class BluetoothProvisioningTests(unittest.TestCase):
         self.assertNotIn("development_open_access", payload)
         self.assertNotIn("development_open_access", payload["capabilities"])
         self.assertNotIn("tls_fingerprint", payload)
+        self.assertEqual(payload["pairing_nonce"], "fresh-nonce")
+        self.assertIn("mutual_pairing_proof", payload["capabilities"])
+        self.assertIn("session_hmac", payload["capabilities"])
 
     def test_on_command_dispatches_complete_messages_outside_write_callback(self):
         service = object.__new__(ProvisionService)
@@ -855,7 +963,7 @@ class BluetoothProvisioningTests(unittest.TestCase):
         service = object.__new__(ProvisionService)
         service._cmd_buffer = bytearray()
         dispatched = []
-        payload = b'{"cmd":"UNLOCK","code":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}\n'
+        payload = b'{"cmd":"UNLOCK","nonce":"fresh-nonce","proof":"abc"}\n'
 
         service._dispatch_command = dispatched.append
         service._set_response_async = Mock()
@@ -864,7 +972,7 @@ class BluetoothProvisioningTests(unittest.TestCase):
 
         self.assertEqual(
             dispatched,
-            [{"cmd": "UNLOCK", "code": "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}],
+            [{"cmd": "UNLOCK", "nonce": "fresh-nonce", "proof": "abc"}],
         )
         self.assertEqual(service._cmd_buffer, bytearray())
         service._set_response_async.assert_not_called()
