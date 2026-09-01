@@ -70,7 +70,7 @@ sudo ./scripts/install_lab_maintenance_access.sh /path/to/key.pub
    `Medicam-XXXXXX`, в том числе после настройки Wi-Fi.
 2. Для первой привязки приложение подтверждает физический 26-символьный код из
    QR через nonce-bound HMAC proof и получает короткую BLE-сессию. Затем оно
-   выполняет команды `SCAN_WIFI` и `CONNECT_WIFI` протокола v6.
+   выполняет команды `SCAN_WIFI` и `CONNECT_WIFI` протокола v7.
 3. SSID и пароль передаются только как AES-256-GCM `sealed` payload,
    привязанный к `cmd`, `session_id`, `counter` и `request_id`. Owner token не
    передаётся по BLE: приложение и камера независимо выводят его из секретного
