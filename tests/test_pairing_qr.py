@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "export_pairing_qr.py"
+SHELL_EXPORTER = Path(__file__).parents[1] / "tool" / "export_pairing_qr.sh"
 SPEC = importlib.util.spec_from_file_location("export_pairing_qr", SCRIPT)
 pairing_qr = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -13,6 +14,11 @@ SPEC.loader.exec_module(pairing_qr)
 
 
 class PairingQrTests(unittest.TestCase):
+    def test_shell_exporter_does_not_request_a_pty(self):
+        source = SHELL_EXPORTER.read_text(encoding="utf-8")
+        self.assertIn('ssh -T "$CAMERA_HOST"', source)
+        self.assertNotIn('ssh -tt "$CAMERA_HOST"', source)
+
     def setUp(self):
         self.device_id = "856279C7"
         self.code = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"

@@ -27,9 +27,10 @@ fi
 mkdir -p "$OUTPUT_DIR"
 chmod 700 "$OUTPUT_DIR"
 
-# A PTY keeps compatibility with hardened sudo policies. The renderer ignores
-# SSH's terminal closing line and validates all three signed-identity fields.
-ssh -tt "$CAMERA_HOST" \
+# The maintenance key is intentionally restricted and cannot allocate a PTY.
+# The approved helper uses non-interactive sudo, so a plain SSH command keeps
+# QR export compatible with the hardened production access policy.
+ssh -T "$CAMERA_HOST" \
   'sudo -n /usr/local/sbin/medicam-ota-activate pairing-info' \
   | tr -d '\r' \
   | "$VENV_DIR/bin/python" "$PROJECT_ROOT/scripts/export_pairing_qr.py" \
